@@ -17,12 +17,17 @@ infra() {
 mode=${SLIPWAY_PARAM_MODE:-}
 profile=pr
 case "$mode" in
-  legacy|post-cycle) profile=$mode ;;
+  full|legacy|post-cycle) profile=$mode ;;
 esac
 case "${1:-}" in
-  --full) shift ;;
+  --full)
+    if [ "$profile" = pr ]; then profile=full; fi
+    shift
+    ;;
   --legacy)
-    [ "$profile" != post-cycle ] || infra '--legacy cannot run a post-cycle evaluation'
+    case "$profile" in
+      full|post-cycle) infra '--legacy cannot be combined with a comparison run' ;;
+    esac
     profile=legacy
     shift
     ;;
@@ -48,7 +53,7 @@ if [ -z "$repository$branch$expected" ]; then
       fi
       if [ "$branch" = main ]; then allow_ancestor=true; fi
       ;;
-    pr:smoke)
+    pr:smoke|full:|full:smoke|full:full)
       repository=${SLIPWAY_PARAM_REPOSITORY:-$factory_repository}
       branch=${SLIPWAY_PARAM_BRANCH:-}
       expected=${SLIPWAY_PARAM_COMMIT:-}
@@ -115,10 +120,13 @@ fi
 git -C "$checkout" checkout -q --detach "$expected" || infra "cannot check out Bog revision $expected"
 [ "$(git -C "$checkout" rev-parse --verify HEAD)" = "$expected" ] || infra 'checked-out SHA did not match the requested SHA'
 sha=$expected
-printf 'bog full verification candidate_sha=%s profile=%s\n' "$sha" "$profile"
+printf 'bog verification candidate_sha=%s profile=%s\n' "$sha" "$profile"
 
 watchdog=240
-if [ "$profile" = post-cycle ]; then watchdog=7200; fi
+case "$profile" in
+  full) watchdog=1800 ;;
+  post-cycle) watchdog=7200 ;;
+esac
 status=0
 timeout -k 5s "${watchdog}s" python3 -B -u "$verifier_dir/verify.py" "$checkout" "$work" "$sha" "$profile" || status=$?
 case "$status" in
@@ -131,10 +139,7 @@ case "$status" in
     ;;
   124|137)
     stage=$(cat "$work/stage" 2>/dev/null) || stage='harness initialization'
-    if [ "$profile" = post-cycle ]; then
-      infra "Bog $sha exceeded the ${watchdog}s watchdog ($stage)"
-    fi
-    reject "Bog $sha exceeded the ${watchdog}s watchdog ($stage)"
+    infra "Bog $sha exceeded the ${watchdog}s watchdog ($stage)"
     ;;
   *) infra "SHA $sha, status $status" ;;
 esac

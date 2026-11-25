@@ -69,9 +69,10 @@ class GateTest(unittest.TestCase):
             verify.decode_rows(wire.replace(b'"line": "second"', b'"line": "a", "line": "second"'))
 
     def test_readme_only_revision_fails_bootstrap_and_full_entrypoints(self):
-        for args in ((), ("--full",)):
+        cases = [((), {}, "pr"), (("--full",), {}, "full"), ((), {"SLIPWAY_PARAM_MODE": "full"}, "full")]
+        for args, params, profile in cases:
             with self.subTest(args=args):
-                result = entrypoint(*args, **readme_candidate(README_ONLY))
+                result = entrypoint(*args, **readme_candidate(README_ONLY), **params)
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn(f"candidate_sha={README_ONLY}", result.stdout)
                 self.assertIn("rejected in build (suites=0): missing ./cmd/bog", result.stderr)
@@ -80,9 +81,31 @@ class GateTest(unittest.TestCase):
                                          if line.startswith("BOG_RESULT ")))
                 self.assertEqual(report["tested_sha"], README_ONLY)
                 self.assertEqual(report["exit_code"], 1)
-                self.assertEqual(report["profile"], "pr")
+                self.assertEqual(report["profile"], profile)
                 self.assertIn("snapshot-pagination", {suite["name"] for suite in report["suites"]})
                 self.assertTrue(all(suite["status"] == "blocked" for suite in report["suites"]))
+
+    def test_default_gate_and_comparisons_have_distinct_suite_plans(self):
+        def plan(profile):
+            result = verify.new_result("0" * 40, None, profile)
+            return result["baseline_sha"], [suite["name"] for suite in result["suites"]]
+
+        baseline, default = plan("pr")
+        self.assertIsNone(baseline)
+        self.assertEqual(default, list(verify.REQUIRED_SUITES))
+        self.assertEqual(plan("full"), (verify.CYCLE3_BASELINE_SHA,
+                                       default + ["wal-handoff", "small-batch-performance"]))
+        self.assertEqual(plan("post-cycle"), (verify.BASELINE_SHA,
+                                             default + ["wal-handoff", "indexed-performance"]))
+        self.assertEqual(plan("legacy"), (verify.BASELINE_SHA,
+                                          [name for name in default if name != "snapshot-pagination"]))
+
+    def test_timing_sample_cap_preserves_quantiles_from_all_requests(self):
+        times = [0.001] * 97 + [0.010] * 2 + [0.100]
+        metrics = verify.latency_metrics(times, sample_limit=4)
+        self.assertEqual(metrics["sample_count"], 100)
+        self.assertEqual(metrics["samples_ms"], [1.0, 1.0, 1.0, 100.0])
+        self.assertEqual(metrics["p99_ms"], 10.0)
 
     def test_legacy_mode_cannot_bypass_pagination_for_an_unpinned_revision(self):
         for args, params in [(("--legacy",), {}), ((), {"SLIPWAY_PARAM_MODE": "legacy"})]:

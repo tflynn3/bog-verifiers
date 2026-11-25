@@ -38,6 +38,7 @@ STAMP = re.compile(
 WAL_MAGIC = b"BOGWAL01"
 COMMIT_MAGIC = b"BOGCMT01"
 BASELINE_SHA = "25d0c0acc103bd73f0552a8f10240c8d8c1d023d"
+CYCLE3_BASELINE_SHA = "907c3510744f54d6259e0429d876ffd34f5ed6d2"
 NEXT_CURSOR = "Bog-Next-Cursor"
 MAX_FRAME = 4 * 1024 * 1024
 DEFAULT_QUERY_LIMIT = 500
@@ -151,9 +152,11 @@ class Bog:
             except (FileNotFoundError, PermissionError) as exc:
                 raise Rejected(f"unable to launch Bog: {exc}") from exc
 
-    def exchange(self, method, target, body=None, timeout=HTTP_TIMEOUT):
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
-        try:
+    def exchange(self, method, target, body=None, timeout=HTTP_TIMEOUT, *, connection=None):
+        request_connection = (contextlib.nullcontext(connection) if connection is not None
+                              else contextlib.closing(
+                                  http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)))
+        with request_connection as conn:
             if body is None:
                 conn.request(method, target)
             else:
@@ -173,16 +176,14 @@ class Bog:
                     media_type = response.headers.get_content_type()
                     check(media_type == "application/x-ndjson", f"query media type was {media_type}")
                 return response.status, data, response.headers
-        finally:
-            conn.close()
 
     def request(self, method, target, body=None):
         status, data, _ = self.checked_exchange(method, target, body)
         return status, data
 
-    def checked_exchange(self, method, target, body=None):
+    def checked_exchange(self, method, target, body=None, *, connection=None):
         try:
-            return self.exchange(method, target, body)
+            return self.exchange(method, target, body, connection=connection)
         except (OSError, http.client.HTTPException) as exc:
             raise Rejected(f"{method} {target} failed: {exc}; {self.log_tail()}") from exc
 
@@ -252,8 +253,8 @@ class Bog:
     def ingest(self, rows):
         self.ingest_body(encode_rows(rows), len(rows))
 
-    def ingest_body(self, payload, count):
-        status, body = self.request("POST", "/ingest", payload)
+    def ingest_body(self, payload, count, *, connection=None):
+        status, body, _ = self.checked_exchange("POST", "/ingest", payload, connection=connection)
         check(status == 204, f"ingest of {count} rows returned {status}: {body[:200]!r}")
 
     @contextlib.contextmanager
@@ -664,11 +665,16 @@ def pagination_suite(binary, directory):
         active = expect_page(bog, snapshot_args, original, 0, 2, None, "first page before backfill")
         late = [Row(snapshot_start + i, f"backfilled snapshot row {i}") for i in (100, 60, 30, 5, 15, 20)]
         late.append(Row(11, "backfilled row at the cursor's timestamp"))
-        bog.ingest(late)
-        expect_walk(bog, snapshot_args, original, (2,), "active walk after backfill", position=2, cursor=active)
-        expect_walk(bog, args, expected, (1, 1000), "active tied walk after backfill",
-                    position=DEFAULT_QUERY_LIMIT, cursor=saved)
+        pending = [Row(snapshot_start + i, f"concurrent backfill row {i}") for i in (55, 1, 95)]
+        with bog.partial_ingest(pending):
+            bog.ingest(late)
+            expect_walk(bog, snapshot_args, original, (2,), "active walk during backfill", position=2, cursor=active)
+            expect_walk(bog, args, expected, (1, 1000), "active tied walk during backfill",
+                        position=DEFAULT_QUERY_LIMIT, cursor=saved)
+            expect_walk(bog, snapshot_args, oracle(rows + late, snapshot_start, snapshot_end),
+                        (2, 1, 1000), "fresh walk during unfinished backfill")
         rows.extend(late)
+        rows.extend(pending)
         expect_walk(bog, snapshot_args, oracle(rows, snapshot_start, snapshot_end),
                     (2, 1, 1000), "fresh walk after backfill")
         expect_walk(bog, args, oracle(rows, 11, 12), (1000,), "fresh tied walk after backfill")
@@ -685,7 +691,8 @@ def rejection_suite(binary, directory):
     good = [Row(1, "acknowledged before bad ingest")]
     prefix = encode_rows([Row(2, "must never commit")])
     valid_ts = stamp(3).encode()
-    limit_rows = [Row(100 + i, f"body size limit row={i:03} " + "x" * 32_000) for i in range(128)]
+    limit_rows = [Row(100 + i, f"body size limit row={i:03} " + "x" * (256_000 if i == 0 else 30_000))
+                  for i in range(128)]
     padding, extra = divmod(MAX_FRAME - len(encode_rows(limit_rows)), len(limit_rows))
     limit_rows = [dataclasses.replace(row, line=row.line + "x" * (padding + (i < extra)))
                   for i, row in enumerate(limit_rows)]
@@ -786,7 +793,7 @@ def make_batches(name, count, size, spacing=1):
 
 
 def concurrency_suite(binary, directory):
-    writers = 4
+    writers = 8
     batches = [
         [dataclasses.replace(row, ns=0 if index < 4 else row.ns + 1)
          for index, row in enumerate(batch)]
@@ -828,6 +835,8 @@ def concurrency_suite(binary, directory):
                 bog.ingest(batches[batch_id])
                 with lock:
                     acknowledged.add(batch_id)
+                seen = inspect_snapshot(bog.query(0, end), f"query immediately after POST {batch_id}")
+                check(batch_id in seen, f"POST {batch_id} was acknowledged before publishing its batch")
 
         futures = [pool.submit(write, worker) for worker in range(writers)]
         go.wait(timeout=HTTP_TIMEOUT)
@@ -857,6 +866,11 @@ def concurrency_suite(binary, directory):
         check(inspect_snapshot(all_rows, "all concurrent writes") == set(range(len(batches))),
               "final snapshot missed acknowledged batches")
         ties = [row for row in all_rows if row.ns == 0]
+        tie_order = [batch_id for batch_id, _ in itertools.groupby(ties, batch_by_row.get)]
+        for worker in range(writers):
+            observed = [batch_id for batch_id in tie_order if batch_id % writers == worker]
+            check(observed == list(range(worker, len(batches), writers)),
+                  f"writer {worker}: timestamp ties reordered across sequential POSTs")
         expect_rows(bog.query(0, 1, limit=13), ties[:13], "limit within concurrent ties")
         pending = [Row(end, "visible when complete/first"), Row(end + 1, "visible when complete/last")]
         with bog.partial_ingest(pending):
@@ -904,12 +918,14 @@ def shutdown_suite(binary, directory):
 def durability_suite(binary, directory):
     seed = SEEDS["kill-durability"]
     rng = random.Random(seed)
-    phases = ["idle", "partial-upload", "full-upload", "observed-204"] * 6
-    rng.shuffle(phases)
     lower = parse_stamp("0001-01-01T00:00:00Z")
     upper = parse_stamp("9999-12-31T23:59:59.999999999Z")
+    rounds = 24
+    outcomes = ["acknowledged"] * 3 + ["rejected"] * 2 + ["incomplete"] * 2 + ["unknown"] * 4
+    if rounds * 5 * (outcomes.count("acknowledged") + outcomes.count("unknown")) >= MAX_QUERY_LIMIT:
+        raise InfrastructureError("crash ledger exceeds the reconciliation query budget")
     history = []
-    trials = []
+    recovered_unknown = Counter()
     log_dir, _ = PROCESS_LOGS.get()
     ledger = log_dir / "ledger.jsonl"
 
@@ -921,76 +937,99 @@ def durability_suite(binary, directory):
             os.fsync(stream.fileno())
         print("BOG_SIGKILL " + wire, flush=True)
 
-    def probe(bog):
-        # All expected rows fit in one bounded query over the supported time domain.
-        actual = bog.query(lower, upper, limit=MAX_QUERY_LIMIT)
-        check(len(actual) < MAX_QUERY_LIMIT, "SIGKILL reconciliation reached the query limit")
-        return actual
+    for trial in range(1, rounds + 1):
+        delay = rng.choice((0, 0.0002, 0.0006, 0.002, 0.006))
+        tag = f"crash/{seed:04x}/{trial:02}"
+        outcomes_this_round = rng.sample(outcomes, len(outcomes))
+        requests = {}
+        for slot, outcome in enumerate(outcomes_this_round):
+            batch = f"{tag}/{slot:02}"
+            base = -trial * 256 + slot * 16
+            times = rng.sample(range(1, 16), rng.randint(2, 5))
+            times[1] = times[0]  # Preserve row order at ties within a request.
+            padding = rng.randint(128, 512)
+            if outcome == "unknown" and trial % 4 == 0:
+                padding *= 32
+            rows = [Row(base + ns, f"{batch}/row/{i:02} " + "x" * padding)
+                    for i, ns in enumerate(times)]
+            payload = encode_rows(rows)
+            if outcome == "rejected":
+                payload += b'{"ts":'
+            entry = {"batch": batch, "outcome": outcome, "status": None,
+                     "row_count": len(rows), "timestamps_ns": [row.ns for row in rows], "padding": padding,
+                     "declared_bytes": len(payload), "payload_sha256": hashlib.sha256(payload).hexdigest()}
+            requests[batch] = rows, payload, entry
+        entries = [entry for _, _, entry in requests.values()]
+        event = {"trial": trial, "seed": seed, "delay_ms": delay * 1000}
+        record({**event, "event": "plan", "requests": entries})
 
-    for trial, phase in enumerate(phases, 1):
-        tag = f"crash/{seed:04x}/{trial:02}/{phase}"
-        base = trial * 32
-        padding = rng.randrange(256, 4097)
-        row_count = rng.randrange(4, 13)
-        delay = rng.choice((0, 0.0003, 0.001, 0.004))
-        acknowledged = [Row(base, tag + "/pre-ack")]
-        rejected = [Row(base + 1, tag + "/pre-reject")]
-        target = [Row(base + 2 + i, f"{tag}/target/{i:02} " + "x" * padding)
-                  for i in range(row_count)]
-        payload = encode_rows(target)
-        event = {"trial": trial, "phase": phase, "tag": tag, "seed": seed,
-                 "row_count": row_count, "padding": padding, "delay_ms": delay * 1000,
-                 "first_ns": base, "payload_sha256": hashlib.sha256(payload).hexdigest()}
-        record({**event, "event": "plan"})
-        outcome = {"idle": "not-sent", "partial-upload": "incomplete", "full-upload": "unknown",
-                   "observed-204": "acknowledged"}[phase]
-        uploaded, status, response_ready = 0, None, None
+        with run_bog(binary, directory) as bog, contextlib.ExitStack() as sockets, \
+             ThreadPoolExecutor(max_workers=5) as pool:
+            unknown = []
+            for _, payload, entry in requests.values():
+                if entry["outcome"] in ("incomplete", "unknown"):
+                    client = sockets.enter_context(bog.open_ingest(len(payload), expect_continue=True))
+                    if entry["outcome"] == "incomplete":
+                        uploaded = payload.index(b"\n") + 1
+                        client.send(payload[:uploaded])
+                        entry["uploaded_bytes"] = uploaded
+                    else:
+                        unknown.append((client, payload, entry))
+
+            controls = [(payload, entry) for _, payload, entry in requests.values()
+                        if entry["outcome"] in ("acknowledged", "rejected")]
+            start_controls = threading.Barrier(len(controls))
+
+            def observe_response(payload, entry):
+                start_controls.wait(timeout=HTTP_TIMEOUT)
+                status, _ = bog.request("POST", "/ingest", payload)
+                entry.update(uploaded_bytes=len(payload), status=status)
+                expected = 204 if entry["outcome"] == "acknowledged" else 400
+                check(status == expected, f"{entry['batch']}: expected HTTP {expected}, got {status}")
+
+            futures = [pool.submit(observe_response, payload, entry) for payload, entry in controls]
+            for future in futures:
+                future.result()
+
+            start_unknown = threading.Barrier(len(unknown))
+
+            def send_without_reading(client, payload, entry):
+                start_unknown.wait(timeout=HTTP_TIMEOUT)
+                client.send(payload)
+                entry["uploaded_bytes"] = len(payload)
+
+            futures = [pool.submit(send_without_reading, *request) for request in unknown]
+            for future in futures:
+                future.result()
+            if delay:
+                time.sleep(delay)
+            for client, _, entry in unknown:
+                entry["socket_readable_before_kill"] = bool(select.select([client.sock], [], [], 0)[0])
+            bog.kill()
+            record({**event, "event": "killed", "signal": "SIGKILL", "requests": entries})
+
         with run_bog(binary, directory) as bog:
-            bog.ingest(acknowledged)
-            record({"trial": trial, "batch": tag + "/pre-ack", "outcome": "acknowledged", "status": 204})
-            status, _ = bog.request("POST", "/ingest", encode_rows(rejected) + b'{"ts":')
-            record({"trial": trial, "batch": tag + "/pre-reject", "outcome": "rejected", "status": status})
-            check(status == 400, f"{tag}/pre-reject: expected HTTP 400, got {status}")
-            history.extend(acknowledged)
-
-            if phase == "idle":
-                expect_rows(probe(bog), history, f"{tag}: idle state before kill")
-                bog.kill()
-            else:
-                with bog.open_ingest(len(payload), expect_continue=True) as client:
-                    uploaded = payload.index(b"\n") + 1 if phase == "partial-upload" else len(payload)
-                    client.send(payload[:uploaded])
-                    if phase == "partial-upload":
-                        expect_rows(probe(bog), history, f"{tag}: prefix visible before kill")
-                    if delay:
-                        time.sleep(delay)
-                    response_ready = bool(select.select([client.sock], [], [], 0)[0])
-                    if phase == "observed-204":
-                        with client.getresponse() as response:
-                            status = response.status
-                        check(status == 204, f"{tag}: expected HTTP 204 before SIGKILL, got {status}")
-                    bog.kill()
-            record({"trial": trial, "batch": tag + "/target", "outcome": outcome,
-                    "uploaded_bytes": uploaded, "declared_bytes": len(payload),
-                    "socket_readable_before_kill": response_ready, "status": status,
-                    "signal": "SIGKILL"})
-
-        with run_bog(binary, directory) as bog:
-            actual = probe(bog)
+            actual = bog.query(lower, upper, limit=MAX_QUERY_LIMIT)
+            check(len(actual) < MAX_QUERY_LIMIT, f"{tag}: reconciliation reached the query limit")
             counts = Counter(actual)
-            copies = [counts[row] for row in target]
-            allowed = {"not-sent": [[0] * row_count], "incomplete": [[0] * row_count],
-                       "unknown": [[0] * row_count, [1] * row_count],
-                       "acknowledged": [[1] * row_count]}[outcome]
-            check(copies in allowed, f"{tag}: {outcome} batch recovered with row multiplicities {copies}")
-            check(all(counts[row] == 0 for row in rejected), f"{tag}: rejected batch survived")
-            if copies[0]:
-                history.extend(target)
-            expect_rows(actual, history, f"{tag}: missing, duplicated, phantom, or misordered rows after restart")
-        trials.append({**event, "outcome": outcome, "recovered_rows": sum(copies),
-                       "total_recovered_rows": len(history)})
-        record({**trials[-1], "event": "reconciliation"})
-    return {"trials": trials, "phase_counts": dict(Counter(phases)),
+            for rows, _, entry in requests.values():
+                multiplicities = [counts[row] for row in rows]
+                absent, whole = [0] * len(rows), [1] * len(rows)
+                outcome = entry["outcome"]
+                allowed = {"acknowledged": (whole,), "rejected": (absent,),
+                           "incomplete": (absent,), "unknown": (absent, whole)}[outcome]
+                check(multiplicities in allowed,
+                      f"{entry['batch']}: {outcome} batch recovered with row multiplicities {multiplicities}")
+                entry["recovered_rows"] = sum(multiplicities)
+                if outcome == "unknown":
+                    recovered_unknown["whole" if multiplicities == whole else "absent"] += 1
+                if multiplicities == whole:
+                    history.extend(rows)
+            expect_rows(actual, oracle(history, lower, upper),
+                        f"{tag}: missing, duplicated, phantom, or misordered rows after restart")
+            record({**event, "event": "reconciliation", "requests": entries, "total_recovered_rows": len(history)})
+    return {"rounds": rounds, "outcomes": {key: count * rounds for key, count in Counter(outcomes).items()},
+            "recovered_unknown": dict(recovered_unknown), "total_recovered_rows": len(history),
             "ledger": str(ledger.relative_to(log_dir.parent))}
 
 
@@ -1064,6 +1103,8 @@ def recovery_suite(binary, directory):
         ("committed-file-header", {**committed, "bog.wal": corrupt_byte(wal, 0)}),
         ("committed-frame-header", {**committed, "bog.wal": corrupt_byte(wal, len(old_wal))}),
         ("committed-payload", {**committed, "bog.wal": corrupt_byte(wal, len(wal) - 2)}),
+        ("corrupt-prefix-with-uncommitted-suffix",
+         {**earlier, "bog.wal": corrupt_byte(old_wal, len(old_wal) - 2) + suffix}),
         ("committed-truncation", {**committed, "bog.wal": wal[:-1]}),
         ("corrupt-marker", {**committed, "bog.commit": corrupt_byte(committed["bog.commit"], 0)}),
         ("marker-complement", {**committed, "bog.commit": corrupt_byte(committed["bog.commit"], 16)}),
@@ -1074,13 +1115,21 @@ def recovery_suite(binary, directory):
     ]:
         case = directory / label
         write_data_copy(case, files)
+        before = {name: (case / name).stat() for name in files}
         try:
             with run_bog(binary, case, ready=False):
                 pass
             for name in committed:
                 path = case / name
-                observed = path.read_bytes() if path.exists() else None
-                check(observed == files.get(name), f"{label}: refused startup changed {name}")
+                if name not in files:
+                    check(not path.exists(), f"{label}: refused startup created {name}")
+                    continue
+                check(path.is_file() and path.read_bytes() == files[name],
+                      f"{label}: refused startup changed {name}")
+                old, new = before[name], path.stat()
+                check((old.st_ino, old.st_mtime_ns, old.st_ctime_ns) ==
+                      (new.st_ino, new.st_mtime_ns, new.st_ctime_ns),
+                      f"{label}: refused startup rewrote or replaced {name}")
         except Rejected as exc:
             refusals.append(str(exc))
     check(not refusals, ", ".join(refusals))
@@ -1126,11 +1175,25 @@ def historical_surrogate_suite(binary, directory):
     check(data_files(replay)["bog.wal"].startswith(wal), "append rewrote the historical frame")
 
 
-def wal_handoff_suite(baseline, candidate, directory):
+def wal_handoff_suite(baseline, candidate, directory, baseline_sha):
     directory.mkdir()
     verified = []
-    for source, target, name in [(baseline, candidate, "legacy-to-candidate"),
-                                 (candidate, baseline, "candidate-to-legacy")]:
+
+    def concurrent_appends(bog, label, start):
+        batches = [[dataclasses.replace(row, ns=start + row.ns) for row in batch]
+                   for batch in make_batches(label, 8, 8)]
+        barrier = threading.Barrier(len(batches))
+
+        def write(batch):
+            barrier.wait(timeout=HTTP_TIMEOUT)
+            bog.ingest(batch)
+
+        with ThreadPoolExecutor(max_workers=len(batches)) as pool:
+            list(pool.map(write, batches))
+        return list(itertools.chain.from_iterable(batches))
+
+    for source, target, name in [(baseline, candidate, "baseline-to-candidate"),
+                                 (candidate, baseline, "candidate-to-baseline")]:
         case = directory / name
         case.mkdir()
         source_rows = [Row(8, f"{name} original Z"), Row(-1, f"{name} out of order"),
@@ -1142,15 +1205,17 @@ def wal_handoff_suite(baseline, candidate, directory):
             bog.ingest(source_rows)
             bog.ingest(source_rows[-1:])
             source_rows.append(source_rows[-1])
-            expect_query(bog, source_rows, -5, 15, label=f"{name}: original writer")
+            source_rows.extend(concurrent_appends(bog, f"{name}/source", 100))
+            expect_query(bog, source_rows, -5, 300, label=f"{name}: original writer")
             bog.kill()
         original = data_files(case / "source")
         write_data_copy(case / "target", original)
         with run_bog(target, case / "target") as bog:
-            expect_query(bog, source_rows, -5, 15, label=f"{name}: target replay")
+            expect_query(bog, source_rows, -5, 300, label=f"{name}: target replay")
             check(data_files(case / "target") == original, f"{name}: target rewrote the committed files")
             bog.ingest(target_rows)
-            expect_query(bog, source_rows + target_rows, -5, 15, label=f"{name}: target append")
+            target_rows.extend(concurrent_appends(bog, f"{name}/target", 200))
+            expect_query(bog, source_rows + target_rows, -5, 300, label=f"{name}: target append")
             bog.kill()
         extended = data_files(case / "target")
         check(extended["bog.wal"].startswith(original["bog.wal"])
@@ -1158,14 +1223,14 @@ def wal_handoff_suite(baseline, candidate, directory):
               f"{name}: target did not append to the original WAL")
         write_data_copy(case / "return", extended)
         with run_bog(source, case / "return") as bog:
-            expect_query(bog, source_rows + target_rows, -5, 15,
+            expect_query(bog, source_rows + target_rows, -5, 300,
                          label=f"{name}: original writer reopens target append")
             bog.stop()
         check(data_files(case / "return") == extended, f"{name}: source rewrote target's committed files")
         verified.append({"direction": name, "source_rows": len(source_rows), "appended_rows": len(target_rows),
                          "initial_wal_sha256": hashlib.sha256(original["bog.wal"]).hexdigest(),
                          "extended_wal_sha256": hashlib.sha256(extended["bog.wal"]).hexdigest()})
-    return {"baseline_sha": BASELINE_SHA, "directions": verified}
+    return {"baseline_sha": baseline_sha, "directions": verified}
 
 
 def free_bytes(path):
@@ -1228,9 +1293,12 @@ def enospc_suite(binary, directory):
     mount, capacity = bounded_mount()
     print(f"ENOSPC available=true mount={mount} capacity_bytes={capacity}")
     history = [Row(1, "ENOSPC acknowledged history/1"), Row(2, "ENOSPC acknowledged history/2")]
-    interrupted = [Row(3 + i, f"ENOSPC failed row {i}: " + "x" * 16_384) for i in range(32)]
-    payload = encode_rows(interrupted)
-    resumed = [dataclasses.replace(row, line=row.line.replace("failed", "rescue", 1)) for row in interrupted]
+    interrupted = [[Row(3 + i, f"ENOSPC failed row {i}: " + "x" * 16_384) for i in range(start, start + 8)]
+                   for start in range(0, 32, 8)]
+    payloads = [encode_rows(batch) for batch in interrupted]
+    barrier = threading.Barrier(len(payloads))
+    resumed = [dataclasses.replace(row, line=row.line.replace("failed", "rescue", 1))
+               for row in itertools.chain.from_iterable(interrupted)]
     with tempfile.TemporaryDirectory(prefix="bog-enospc-", dir=mount) as tmp:
         store = Path(tmp) / "store"
         with run_bog(binary, store) as bog:
@@ -1238,10 +1306,15 @@ def enospc_suite(binary, directory):
             bog.kill()
         prior = data_files(store)
         filler = Path(tmp) / "filler"
-        with run_bog(binary, store) as bog:
-            constrain_append(filler, capacity, len(payload))
-            status, response = bog.request("POST", "/ingest", payload)
-            check(status == 503, f"ENOSPC append expected HTTP 503, got {status}: {response[:200]!r}")
+        with run_bog(binary, store) as bog, ThreadPoolExecutor(max_workers=len(payloads)) as pool:
+            constrain_append(filler, capacity, min(map(len, payloads)))
+
+            def write(payload):
+                barrier.wait(timeout=HTTP_TIMEOUT)
+                return bog.request("POST", "/ingest", payload)
+
+            for status, response in pool.map(write, payloads):
+                check(status == 503, f"ENOSPC append expected HTTP 503, got {status}: {response[:200]!r}")
             expect_rows(bog.query(0, 41), history, "ENOSPC failed batch was not published")
             bog.kill()
         filler.unlink()
@@ -1252,7 +1325,8 @@ def enospc_suite(binary, directory):
             bog.kill()
         with run_bog(binary, store) as bog:
             expect_rows(bog.query(0, 41), history + resumed, "ENOSPC new durable write after second restart")
-    return {"available": True, "capacity_bytes": capacity, "kernel_errno": errno.ENOSPC}
+    return {"available": True, "capacity_bytes": capacity, "kernel_errno": errno.ENOSPC,
+            "rejected_writers": len(payloads)}
 
 
 def require_full_blocks(path):
@@ -1334,10 +1408,15 @@ def milliseconds(seconds):
     return round(seconds * 1000, 3)
 
 
-def latency_metrics(seconds):
+def latency_metrics(seconds, *, sample_limit=None):
     ordered = sorted(seconds)
+    samples = seconds
+    if sample_limit is not None and len(seconds) > sample_limit:
+        samples = [seconds[index * (len(seconds) - 1) // (sample_limit - 1)]
+                   for index in range(sample_limit)]
     return {
-        "samples_ms": [milliseconds(value) for value in seconds],
+        "sample_count": len(seconds),
+        "samples_ms": [milliseconds(value) for value in samples],
         **{f"p{p}_ms": milliseconds(ordered[math.ceil(p * len(ordered) / 100) - 1])
            for p in (50, 95, 99)},
     }
@@ -1359,6 +1438,9 @@ BENCH_PROFILES = {"steady": 1, "burst": 4, "backfill": 4}
 BENCH_SEEDS = tuple(SEEDS["performance-smoke"] + i for i in range(4))
 BENCH_REPEATS = 4
 BENCH_LARGE_ROWS = 1_000_000
+CYCLE3_BATCH_ROWS = 8
+CYCLE3_PROFILES = {"steady": 1, "burst": 8, "backfill": 8}
+CYCLE3_COMPARE_ROWS = 32_768
 RARE_INTERVAL = 8191
 RARE_LITERAL = " bog-verifier/rare "
 ABSENT_LITERAL = " bog-verifier/absent "
@@ -1376,24 +1458,25 @@ INDEXED_TARGETS = {
 class Benchmark:
     """One seeded set of HTTP bodies and expected results shared by both binaries."""
 
-    def __init__(self, path, count, profile, seed, corpus):
+    def __init__(self, path, count, profile, seed, corpus, *, batch_rows, writers):
         self.path = path
         self.count = count
         self.profile = profile
         self.seed = seed
-        self.writers = BENCH_PROFILES[profile]
+        self.writers = writers
+        self.batch_rows = batch_rows
         rng = random.Random(seed)
         self.lines = [row.line for row in corpus if len(row.line.encode()) <= 128]
         rng.shuffle(self.lines)
 
-        starts = list(range(0, count, BENCH_BATCH_ROWS))
+        starts = list(range(0, count, batch_rows))
         if profile == "backfill":
             rng.shuffle(starts)
         digest = hashlib.sha256()
         self.batches = []
         with path.open("wb") as stream:
             for start in starts:
-                indices = range(start, min(start + BENCH_BATCH_ROWS, count))
+                indices = range(start, min(start + batch_rows, count))
                 payload = encode_rows(self.rows(indices))
                 self.batches.append((stream.tell(), len(payload), len(indices)))
                 stream.write(payload)
@@ -1441,19 +1524,21 @@ class Benchmark:
         for left in range(0, self.count, step):
             right = min(left + step, self.count)
             expect_rows(bog.query(left * SECOND, right * SECOND, limit=MAX_QUERY_LIMIT),
-                        self.rows(range(left, right)), f"smoke {phase}, row interval [{left}, {right})")
+                        self.rows(range(left, right)), f"benchmark {phase}, row interval [{left}, {right})")
         beginning = parse_stamp("0001-01-01T00:00:00Z")
         end = parse_stamp("9999-12-31T23:59:59.999999999Z")
-        expect_rows(bog.query(beginning, 0), [], f"smoke {phase}, before corpus")
-        expect_rows(bog.query(self.count * SECOND, end), [], f"smoke {phase}, after corpus")
+        expect_rows(bog.query(beginning, 0), [], f"benchmark {phase}, before corpus")
+        expect_rows(bog.query(self.count * SECOND, end), [], f"benchmark {phase}, after corpus")
 
 
-def measure_benchmark(binary, directory, workload, *, reconcile=False):
+def measure_benchmark(binary, directory, workload, *, reconcile=False, keep_alive=False):
     start_writers = threading.Barrier(workload.writers + 1)
     with run_bog(binary, directory) as bog, ThreadPoolExecutor(max_workers=workload.writers) as pool:
         def write(worker):
             durations = []
-            with workload.path.open("rb") as fixture:
+            connection = (contextlib.closing(http.client.HTTPConnection("127.0.0.1", bog.port, timeout=HTTP_TIMEOUT))
+                          if keep_alive else contextlib.nullcontext())
+            with workload.path.open("rb") as fixture, connection as client:
                 start_writers.wait(timeout=HTTP_TIMEOUT)
                 for position, size, rows in workload.batches[worker::workload.writers]:
                     fixture.seek(position)
@@ -1461,7 +1546,7 @@ def measure_benchmark(binary, directory, workload, *, reconcile=False):
                     if len(payload) != size:
                         raise InfrastructureError("benchmark fixture truncated")
                     started = time.monotonic()
-                    bog.ingest_body(payload, rows)
+                    bog.ingest_body(payload, rows, connection=client)
                     durations.append(time.monotonic() - started)
             return durations
 
@@ -1487,11 +1572,14 @@ def measure_benchmark(binary, directory, workload, *, reconcile=False):
         restart_rss = peak_rss_kib(bog.process)
         bog.stop()
     return {
-        "rows": workload.count, "batch_rows": BENCH_BATCH_ROWS, "writers": workload.writers,
+        "rows": workload.count, "batches": len(workload.batches),
+        "batch_rows": workload.batch_rows, "writers": workload.writers, "keep_alive": keep_alive,
         "profile": workload.profile, "seed": workload.seed, "workload_sha256": workload.digest,
         "rows_per_second": round(workload.count / elapsed, 2),
+        "batches_per_second": round(len(workload.batches) / elapsed, 2),
         "mib_per_second": round(workload.size / (1024 ** 2 * elapsed), 2),
-        "ingest_elapsed_ms": milliseconds(elapsed), "post": latency_metrics(post_times),
+        "ingest_elapsed_ms": milliseconds(elapsed),
+        "post": latency_metrics(post_times, sample_limit=128 if keep_alive else None),
         "live_query": live_queries, "restart_query": restart_queries,
         "empty_ready_ms": empty_ready_ms, "restart_ready_ms": restart_ms,
         "live_peak_rss_kib": live_rss, "restart_peak_rss_kib": restart_rss,
@@ -1503,17 +1591,22 @@ def measure_benchmark(binary, directory, workload, *, reconcile=False):
 def performance_suite(binary, directory):
     directory.mkdir()
     _, corpus = load_corpus()
-    workload = Benchmark(directory / "workload.ndjson", 100_000, "backfill", BENCH_SEEDS[0], corpus)
-    return measure_benchmark(binary, directory / "store", workload, reconcile=True)
+    workload = Benchmark(directory / "workload.ndjson", 8_192, "backfill", BENCH_SEEDS[0], corpus,
+                         batch_rows=CYCLE3_BATCH_ROWS, writers=CYCLE3_PROFILES["backfill"])
+    return measure_benchmark(binary, directory / "store", workload, reconcile=True, keep_alive=True)
 
 
-def paired_ratios(baseline, candidate):
-    if baseline["workload_sha256"] != candidate["workload_sha256"]:
-        raise InfrastructureError("benchmark pair used different fixture bytes")
+def paired_ratios(baseline, candidate, *, small_batches=False):
+    for key in ("workload_sha256", "profile", "seed", "rows", "batch_rows", "writers", "keep_alive"):
+        if baseline[key] != candidate[key]:
+            raise InfrastructureError(f"benchmark pair used different workload input: {key}")
 
     def measurements(result):
         metrics = {"durable_rows_per_second": result["rows_per_second"],
                    "peak_rss_kib": result["peak_rss_kib"], "restart_ready_ms": result["restart_ready_ms"]}
+        if small_batches:
+            metrics.update(durable_batches_per_second=result["batches_per_second"],
+                           post_p95=result["post"]["p95_ms"], post_p99=result["post"]["p99_ms"])
         for phase in ("live", "restart"):
             for sample, category in (("broad", "wide"), ("narrow", "narrow"), ("rare_or_absent", "rare_or_absent")):
                 metrics[f"{category}_query_p95/{phase}"] = result[f"{phase}_query"][sample]["p95_ms"]
@@ -1537,25 +1630,32 @@ def indexed_targets(pairs):
     return targets
 
 
-def indexed_performance_suite(baseline, candidate, directory):
+def paired_performance_suite(baseline, candidate, directory, *, indexed):
     directory.mkdir()
     _, corpus = load_corpus()
     log_dir, _ = PROCESS_LOGS.get()
     ledger = log_dir / "pairs.jsonl"
+    scenarios = BENCH_PROFILES if indexed else CYCLE3_PROFILES
+    seeds = BENCH_SEEDS if indexed else BENCH_SEEDS[:2]
+    repeats = BENCH_REPEATS if indexed else 2
+    rows = BENCH_LARGE_ROWS if indexed else CYCLE3_COMPARE_ROWS
+    batch_rows = BENCH_BATCH_ROWS if indexed else CYCLE3_BATCH_ROWS
     profiles, failures = {}, []
-    for profile in BENCH_PROFILES:
+    for profile, writers in scenarios.items():
         pairs = []
-        for seed in BENCH_SEEDS:
-            workload = Benchmark(directory / "workload.ndjson", BENCH_LARGE_ROWS, profile, seed, corpus)
-            for repeat in range(BENCH_REPEATS):
+        for seed in seeds:
+            workload = Benchmark(directory / "workload.ndjson", rows, profile, seed, corpus,
+                                 batch_rows=batch_rows, writers=writers)
+            for repeat in range(repeats):
                 order = ["baseline", "candidate"] if len(pairs) % 2 == 0 else ["candidate", "baseline"]
                 binaries = {"baseline": baseline, "candidate": candidate}
                 results = {}
                 for role in order:
                     prefix = f"{profile}-{seed}-{repeat + 1}-{role}-"
                     with tempfile.TemporaryDirectory(prefix=prefix, dir=directory) as store:
-                        results[role] = measure_benchmark(binaries[role], Path(store), workload)
-                ratios = paired_ratios(results["baseline"], results["candidate"])
+                        results[role] = measure_benchmark(binaries[role], Path(store), workload,
+                                                          keep_alive=not indexed, reconcile=not indexed)
+                ratios = paired_ratios(results["baseline"], results["candidate"], small_batches=not indexed)
                 pairs.append(ratios)
                 record = {"profile": profile, "seed": seed, "repeat": repeat + 1, "order": order,
                           "ratios": ratios, **results}
@@ -1565,11 +1665,19 @@ def indexed_performance_suite(baseline, candidate, directory):
                            "ratios": ratios, "workload_sha256": workload.digest}
                 print("BOG_PERFORMANCE_PAIR " + json.dumps(summary, sort_keys=True))
             workload.path.unlink()
-        targets = indexed_targets(pairs)
-        profiles[profile] = {"pairs": len(pairs), "targets": targets}
-        failures.extend(f"{profile}/{key}" for key, value in targets.items() if not value["passed"])
-    return {"baseline_sha": BASELINE_SHA, "rows_per_run": BENCH_LARGE_ROWS,
-            "profiles": profiles, "failed_targets": failures, "ledger": str(ledger.relative_to(log_dir.parent))}
+        profiles[profile] = {"pairs": len(pairs), "writers": writers,
+                             "median_ratios": {key: statistics.median(pair[key] for pair in pairs)
+                                               for key in pairs[0]}}
+        if indexed:
+            targets = indexed_targets(pairs)
+            profiles[profile]["targets"] = targets
+            failures.extend(f"{profile}/{key}" for key, value in targets.items() if not value["passed"])
+    result = {"baseline_sha": BASELINE_SHA if indexed else CYCLE3_BASELINE_SHA,
+              "rows_per_run": rows, "batch_rows": batch_rows,
+              "profiles": profiles, "ledger": str(ledger.relative_to(log_dir.parent))}
+    if indexed:
+        result["failed_targets"] = failures
+    return result
 
 
 SUITES = (
@@ -1583,7 +1691,6 @@ SUITES = (
     ("kill-durability", durability_suite),
     ("wal-recovery", recovery_suite),
     ("historical-surrogates", historical_surrogate_suite),
-    ("wal-handoff", wal_handoff_suite),
     ("enospc-recovery", enospc_suite),
     ("full-disk-restart", full_disk_restart_suite),
     ("performance-smoke", performance_suite),
@@ -1599,20 +1706,19 @@ REQUIRED_SUITES = (
     "kill-durability",
     "wal-recovery",
     "historical-surrogates",
-    "wal-handoff",
     "enospc-recovery",
     "full-disk-restart",
     "performance-smoke",
 )
-LEGACY_OMISSIONS = {"snapshot-pagination", "wal-handoff"}
-POST_CYCLE_SUITE = ("indexed-performance", indexed_performance_suite)
+WAL_HANDOFF = ("wal-handoff", wal_handoff_suite)
+COMPARISON_SUITES = {"full": "small-batch-performance", "post-cycle": "indexed-performance"}
 
 
 def suite_plan(suites, profile):
     if profile == "legacy":
-        return tuple((name, run) for name, run in suites if name not in LEGACY_OMISSIONS)
-    if profile == "post-cycle":
-        return (*suites, POST_CYCLE_SUITE)
+        return tuple((name, run) for name, run in suites if name != "snapshot-pagination")
+    if profile in COMPARISON_SUITES:
+        return (*suites, WAL_HANDOFF, (COMPARISON_SUITES[profile], paired_performance_suite))
     return suites
 
 
@@ -1636,25 +1742,25 @@ def build(source, work, log):
     return binary
 
 
-def build_baseline(source, work, evidence):
-    ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", BASELINE_SHA, "HEAD"], cwd=source,
+def build_baseline(source, work, evidence, baseline_sha):
+    ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", baseline_sha, "HEAD"], cwd=source,
                               capture_output=True, timeout=15)
-    check(ancestor.returncode == 0, f"candidate checkout does not descend from pinned Cycle 1 SHA {BASELINE_SHA}")
+    check(ancestor.returncode == 0, f"candidate checkout does not descend from comparison SHA {baseline_sha}")
     baseline_dir = work / "baseline"
     baseline_dir.mkdir()
     checkout = baseline_dir / "source"
-    fetched = subprocess.run(["git", "worktree", "add", "--detach", str(checkout), BASELINE_SHA],
+    fetched = subprocess.run(["git", "worktree", "add", "--detach", str(checkout), baseline_sha],
                              cwd=source, capture_output=True, text=True, timeout=30)
     if fetched.returncode:
-        raise InfrastructureError(f"cannot check out pinned Cycle 1 SHA {BASELINE_SHA}: {fetched.stderr}")
+        raise InfrastructureError(f"cannot check out comparison SHA {baseline_sha}: {fetched.stderr}")
     log = evidence / "baseline-build.log"
     try:
         binary = build(checkout, baseline_dir, log)
     except Rejected as exc:
-        raise InfrastructureError(f"pinned Cycle 1 baseline build failed: {exc}") from exc
+        raise InfrastructureError(f"comparison baseline build failed: {exc}") from exc
     finally:
         if log.exists():
-            print("BOG_BUILD " + json.dumps({"role": "baseline", "sha": BASELINE_SHA,
+            print("BOG_BUILD " + json.dumps({"role": "baseline", "sha": baseline_sha,
                                              "log_tail": log_tail(log, 4096)}))
     return binary
 
@@ -1686,7 +1792,9 @@ def new_result(requested_sha, tested_sha, profile="pr"):
     required = suite_plan(tuple((name, None) for name in REQUIRED_SUITES), profile)
     return {
         "schema_version": 1, "requested_sha": requested_sha, "tested_sha": tested_sha,
-        "profile": profile, "baseline_sha": BASELINE_SHA,
+        "profile": profile,
+        "baseline_sha": {"full": CYCLE3_BASELINE_SHA, "legacy": BASELINE_SHA,
+                         "post-cycle": BASELINE_SHA}.get(profile),
         "corpus_sha256": CORPUS_SHA256, "apache_fixture_sha256": APACHE_SHA256, "seeds": SEEDS,
         "run_name": os.environ.get("SLIPWAY_RUN_NAME"), "run_uid": os.environ.get("SLIPWAY_RUN_UID"),
         "step": os.environ.get("SLIPWAY_STEP_NAME"),
@@ -1771,8 +1879,10 @@ def main(source, work, sha, profile="pr"):
     rejected = []
     errors = []
     baseline = None
+    comparison_stage = COMPARISON_SUITES.get(profile)
+    baseline_sha = result["baseline_sha"]
     for (stage, run), suite in zip(suites, result["suites"]):
-        if stage == POST_CYCLE_SUITE[0] and (rejected or errors):
+        if stage == comparison_stage and (rejected or errors):
             suite.update(status="blocked", diagnostic="correctness or smoke prerequisite failed")
             continue
         log_dir = evidence / stage
@@ -1785,16 +1895,17 @@ def main(source, work, sha, profile="pr"):
         token = PROCESS_LOGS.set((log_dir, suite["processes"]))
         try:
             if stage == "wal-handoff":
-                baseline = build_baseline(source, work, evidence)
-                result["baseline_build"] = {"sha": BASELINE_SHA, "binary_sha256": file_sha256(baseline),
+                baseline = build_baseline(source, work, evidence, baseline_sha)
+                result["baseline_build"] = {"sha": baseline_sha, "binary_sha256": file_sha256(baseline),
                                             "log": "baseline-build.log"}
-            if stage in ("wal-handoff", POST_CYCLE_SUITE[0]):
-                metrics = run(baseline, binary, work / stage)
+                metrics = run(baseline, binary, work / stage, baseline_sha)
+            elif stage == comparison_stage:
+                metrics = run(baseline, binary, work / stage, indexed=profile == "post-cycle")
             else:
                 metrics = run(binary, work / stage)
             if metrics is not None:
                 suite["metrics"] = metrics
-            if stage == POST_CYCLE_SUITE[0]:
+            if profile == "post-cycle" and stage == comparison_stage:
                 failed = metrics["failed_targets"]
                 check(not failed, f"indexed performance missed {len(failed)} targets: {', '.join(failed)}")
             if not any(case.get("ready_ms") is not None for case in suite["processes"]):
