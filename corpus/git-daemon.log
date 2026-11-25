@@ -1,0 +1,203 @@
+2026-11-25T18:32:51.137669000Z	[32310] Ready to rumble
+2026-11-25T18:32:51.149648000Z	[32312] Connection from 127.0.0.1:54021
+2026-11-25T18:32:51.149713000Z	[32312] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.149719000Z	[32312] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.149723000Z	[32312] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.155345000Z	[32310] [32312] Disconnected
+2026-11-25T18:32:51.165530000Z	[32315] Connection from 127.0.0.1:54022
+2026-11-25T18:32:51.165571000Z	[32315] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.165577000Z	[32315] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.165580000Z	[32315] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.172115000Z	[32310] [32315] Disconnected
+2026-11-25T18:32:51.182695000Z	[32318] Connection from 127.0.0.1:54023
+2026-11-25T18:32:51.182728000Z	[32318] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.182733000Z	[32318] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.182736000Z	[32318] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.187901000Z	[32310] [32318] Disconnected
+2026-11-25T18:32:51.197815000Z	[32321] Connection from 127.0.0.1:54024
+2026-11-25T18:32:51.197853000Z	[32321] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.197858000Z	[32321] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.197862000Z	[32321] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.202924000Z	[32310] [32321] Disconnected
+2026-11-25T18:32:51.213454000Z	[32324] Connection from 127.0.0.1:54025
+2026-11-25T18:32:51.213509000Z	[32324] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.213517000Z	[32324] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.213524000Z	[32324] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.218770000Z	[32310] [32324] Disconnected
+2026-11-25T18:32:51.229650000Z	[32327] Connection from 127.0.0.1:54026
+2026-11-25T18:32:51.229687000Z	[32327] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.229693000Z	[32327] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.229697000Z	[32327] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.235025000Z	[32310] [32327] Disconnected
+2026-11-25T18:32:51.245923000Z	[32330] Connection from 127.0.0.1:54027
+2026-11-25T18:32:51.245962000Z	[32330] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.245983000Z	[32330] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.245987000Z	[32330] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.251535000Z	[32310] [32330] Disconnected
+2026-11-25T18:32:51.262204000Z	[32334] Connection from 127.0.0.1:54028
+2026-11-25T18:32:51.262245000Z	[32334] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.262250000Z	[32334] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.262253000Z	[32334] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.267779000Z	[32310] [32334] Disconnected
+2026-11-25T18:32:51.278074000Z	[32337] Connection from 127.0.0.1:54029
+2026-11-25T18:32:51.278122000Z	[32337] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.278127000Z	[32337] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.278131000Z	[32337] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.283883000Z	[32310] [32337] Disconnected
+2026-11-25T18:32:51.294033000Z	[32340] Connection from 127.0.0.1:54030
+2026-11-25T18:32:51.294069000Z	[32340] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.294074000Z	[32340] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.294077000Z	[32340] Request upload-pack for '/team/missing.git'
+2026-11-25T18:32:51.294083000Z	[32340] '/srv/qa-origins/team/missing.git' does not appear to be a git repository
+2026-11-25T18:32:51.294318000Z	[32310] [32340] Disconnected (with error)
+2026-11-25T18:32:51.305740000Z	[32342] Connection from 127.0.0.1:54031
+2026-11-25T18:32:51.305797000Z	[32342] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.305802000Z	[32342] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.305805000Z	[32342] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.313253000Z	[32310] [32342] Disconnected
+2026-11-25T18:32:51.323638000Z	[32345] Connection from 127.0.0.1:54032
+2026-11-25T18:32:51.323672000Z	[32345] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.323677000Z	[32345] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.323681000Z	[32345] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.329148000Z	[32310] [32345] Disconnected
+2026-11-25T18:32:51.339398000Z	[32348] Connection from 127.0.0.1:54033
+2026-11-25T18:32:51.339431000Z	[32348] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.339435000Z	[32348] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.339440000Z	[32348] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.345146000Z	[32310] [32348] Disconnected
+2026-11-25T18:32:51.355727000Z	[32351] Connection from 127.0.0.1:54034
+2026-11-25T18:32:51.355842000Z	[32351] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.355882000Z	[32351] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.355892000Z	[32351] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.361595000Z	[32310] [32351] Disconnected
+2026-11-25T18:32:51.372341000Z	[32354] Connection from 127.0.0.1:54035
+2026-11-25T18:32:51.372377000Z	[32354] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.372382000Z	[32354] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.372385000Z	[32354] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.377890000Z	[32310] [32354] Disconnected
+2026-11-25T18:32:51.388700000Z	[32357] Connection from 127.0.0.1:54036
+2026-11-25T18:32:51.388795000Z	[32357] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.388801000Z	[32357] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.388804000Z	[32357] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.395285000Z	[32310] [32357] Disconnected
+2026-11-25T18:32:51.406326000Z	[32360] Connection from 127.0.0.1:54037
+2026-11-25T18:32:51.406367000Z	[32360] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.406372000Z	[32360] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.406376000Z	[32360] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.412884000Z	[32310] [32360] Disconnected
+2026-11-25T18:32:51.423718000Z	[32363] Connection from 127.0.0.1:54038
+2026-11-25T18:32:51.423758000Z	[32363] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.423763000Z	[32363] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.423766000Z	[32363] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.429081000Z	[32310] [32363] Disconnected
+2026-11-25T18:32:51.440162000Z	[32366] Connection from 127.0.0.1:54039
+2026-11-25T18:32:51.440222000Z	[32366] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.440231000Z	[32366] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.440237000Z	[32366] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.445681000Z	[32310] [32366] Disconnected
+2026-11-25T18:32:51.456727000Z	[32369] Connection from 127.0.0.1:54040
+2026-11-25T18:32:51.456768000Z	[32369] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.456775000Z	[32369] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.456779000Z	[32369] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.463121000Z	[32310] [32369] Disconnected
+2026-11-25T18:32:51.474201000Z	[32372] Connection from 127.0.0.1:54041
+2026-11-25T18:32:51.474249000Z	[32372] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.474283000Z	[32372] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.474292000Z	[32372] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.480188000Z	[32310] [32372] Disconnected
+2026-11-25T18:32:51.491794000Z	[32375] Connection from 127.0.0.1:54042
+2026-11-25T18:32:51.491881000Z	[32375] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.491915000Z	[32375] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.491926000Z	[32375] Request upload-pack for '/team/missing.git'
+2026-11-25T18:32:51.491951000Z	[32375] '/srv/qa-origins/team/missing.git' does not appear to be a git repository
+2026-11-25T18:32:51.492085000Z	[32310] [32375] Disconnected (with error)
+2026-11-25T18:32:51.505360000Z	[32377] Connection from 127.0.0.1:54043
+2026-11-25T18:32:51.505465000Z	[32377] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.505472000Z	[32377] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.505475000Z	[32377] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.512992000Z	[32310] [32377] Disconnected
+2026-11-25T18:32:51.524439000Z	[32380] Connection from 127.0.0.1:54044
+2026-11-25T18:32:51.524495000Z	[32380] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.524508000Z	[32380] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.524529000Z	[32380] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.530226000Z	[32310] [32380] Disconnected
+2026-11-25T18:32:51.542883000Z	[32383] Connection from 127.0.0.1:54045
+2026-11-25T18:32:51.542938000Z	[32383] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.542945000Z	[32383] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.542950000Z	[32383] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.549042000Z	[32310] [32383] Disconnected
+2026-11-25T18:32:51.562009000Z	[32386] Connection from 127.0.0.1:54046
+2026-11-25T18:32:51.562044000Z	[32386] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.562049000Z	[32386] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.562053000Z	[32386] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.567895000Z	[32310] [32386] Disconnected
+2026-11-25T18:32:51.581711000Z	[32389] Connection from 127.0.0.1:54047
+2026-11-25T18:32:51.581786000Z	[32389] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.581793000Z	[32389] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.581797000Z	[32389] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.587814000Z	[32310] [32389] Disconnected
+2026-11-25T18:32:51.599633000Z	[32392] Connection from 127.0.0.1:54048
+2026-11-25T18:32:51.599671000Z	[32392] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.599676000Z	[32392] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.599679000Z	[32392] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.605203000Z	[32310] [32392] Disconnected
+2026-11-25T18:32:51.617566000Z	[32397] Connection from 127.0.0.1:54049
+2026-11-25T18:32:51.617601000Z	[32397] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.617606000Z	[32397] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.617609000Z	[32397] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.624472000Z	[32310] [32397] Disconnected
+2026-11-25T18:32:51.635431000Z	[32400] Connection from 127.0.0.1:54050
+2026-11-25T18:32:51.635467000Z	[32400] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.635473000Z	[32400] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.635476000Z	[32400] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.640942000Z	[32310] [32400] Disconnected
+2026-11-25T18:32:51.651686000Z	[32403] Connection from 127.0.0.1:54051
+2026-11-25T18:32:51.651741000Z	[32403] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.651747000Z	[32403] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.651751000Z	[32403] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.657679000Z	[32310] [32403] Disconnected
+2026-11-25T18:32:51.668734000Z	[32406] Connection from 127.0.0.1:54052
+2026-11-25T18:32:51.668798000Z	[32406] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.668827000Z	[32406] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.668836000Z	[32406] Request upload-pack for '/team/Missing-Catalog.git'
+2026-11-25T18:32:51.668869000Z	[32406] '/srv/qa-origins/team/Missing-Catalog.git' does not appear to be a git repository
+2026-11-25T18:32:51.669039000Z	[32310] [32406] Disconnected (with error)
+2026-11-25T18:32:51.681269000Z	[32408] Connection from 127.0.0.1:54053
+2026-11-25T18:32:51.681339000Z	[32408] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.681344000Z	[32408] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.681349000Z	[32408] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.687086000Z	[32310] [32408] Disconnected
+2026-11-25T18:32:51.698250000Z	[32411] Connection from 127.0.0.1:54054
+2026-11-25T18:32:51.698290000Z	[32411] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.698295000Z	[32411] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.698299000Z	[32411] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.703971000Z	[32310] [32411] Disconnected
+2026-11-25T18:32:51.714962000Z	[32414] Connection from 127.0.0.1:54055
+2026-11-25T18:32:51.715002000Z	[32414] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.715007000Z	[32414] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.715011000Z	[32414] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.721577000Z	[32310] [32414] Disconnected
+2026-11-25T18:32:51.732600000Z	[32417] Connection from 127.0.0.1:54056
+2026-11-25T18:32:51.732632000Z	[32417] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.732638000Z	[32417] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.732641000Z	[32417] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.738286000Z	[32310] [32417] Disconnected
+2026-11-25T18:32:51.750283000Z	[32420] Connection from 127.0.0.1:54057
+2026-11-25T18:32:51.750326000Z	[32420] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.750335000Z	[32420] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.750339000Z	[32420] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.756197000Z	[32310] [32420] Disconnected
+2026-11-25T18:32:51.769484000Z	[32423] Connection from 127.0.0.1:54058
+2026-11-25T18:32:51.769569000Z	[32423] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.769574000Z	[32423] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.769577000Z	[32423] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.775741000Z	[32310] [32423] Disconnected
+2026-11-25T18:32:51.786834000Z	[32426] Connection from 127.0.0.1:54059
+2026-11-25T18:32:51.786869000Z	[32426] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.786875000Z	[32426] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.786878000Z	[32426] Request upload-pack for '/team/catalog.git'
+2026-11-25T18:32:51.792542000Z	[32310] [32426] Disconnected
+2026-11-25T18:32:51.803889000Z	[32429] Connection from 127.0.0.1:54060
+2026-11-25T18:32:51.803957000Z	[32429] Extended attribute "host": 127.0.0.1:54020
+2026-11-25T18:32:51.803965000Z	[32429] Extended attribute "protocol": version=2
+2026-11-25T18:32:51.803969000Z	[32429] Request upload-pack for '/team/catalog.git'

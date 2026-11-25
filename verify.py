@@ -38,7 +38,7 @@ STAMP = re.compile(
 WAL_MAGIC = b"BOGWAL01"
 COMMIT_MAGIC = b"BOGCMT01"
 BASELINE_SHA = "25d0c0acc103bd73f0552a8f10240c8d8c1d023d"
-CYCLE3_BASELINE_SHA = "907c3510744f54d6259e0429d876ffd34f5ed6d2"
+COMPARISON_BASELINE_SHA = "4ff49aae9672cf5aec8e3fbd20ffe0a84ae15bc0"
 NEXT_CURSOR = "Bog-Next-Cursor"
 MAX_FRAME = 4 * 1024 * 1024
 DEFAULT_QUERY_LIMIT = 500
@@ -52,9 +52,11 @@ CORPUS_SOURCES = {"access": 513, "error": 36, "app": 1009, "seed": 1000}
 APACHE_PATH = CORPUS_DIR / "apache-access.log"
 APACHE_SHA256 = "29e286fd748b06450152c4efcfe9c4f2a668a8b3223720f7fba052ffd902b14e"
 APACHE_STAMP = re.compile(r"^\S+ \S+ \S+ \[([^\]]+)\] ")
+GIT_DAEMON_PATH = CORPUS_DIR / "git-daemon.log"
+GIT_DAEMON_SHA256 = "8dcd8aba73ae74db1bc3adb9c32b2a06feee7aa92386ec61005b0d3dd3c07704"
 SEEDS = {
     "query-oracle": 0xB061, "kill-durability": 0xB067, "performance-smoke": 0xB070,
-    "apache-replay": 0xB091, "snapshot-pagination": 0xB102,
+    "apache-replay": 0xB091, "snapshot-pagination": 0xB102, "git-daemon-replay": 0xB119,
 }
 PROCESS_LOGS = contextvars.ContextVar("process_logs")
 
@@ -462,6 +464,55 @@ def check_apache_queries(bog, rows, start, end, tied, phase):
                      label=f"Apache {phase} [{left}, {right}), literal {literal!r}, limit {limit}")
 
 
+def load_git_daemon():
+    raw = GIT_DAEMON_PATH.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != GIT_DAEMON_SHA256:
+        raise InfrastructureError(f"Git daemon fixture digest mismatch: {digest}")
+    records = raw.split(b"\n")
+    if records.pop() != b"" or len(records) != 203:
+        raise InfrastructureError("expected 203 LF-terminated Git daemon log lines")
+    rows = []
+    for record in records:
+        timestamp, line = record.decode("utf-8").split("\t", 1)
+        rows.append(Row(parse_stamp(timestamp), line))
+    return rows
+
+
+def replay_git_daemon(binary, directory):
+    rng = random.Random(SEEDS["git-daemon-replay"])
+    capture = load_git_daemon()
+    rare = "Request upload-pack for '/team/Missing-Catalog.git'"
+    absent = "Request upload-pack for '/team/MISSING-CATALOG.git'"
+    common = "upload-pack"
+    if [sum(literal in row.line for row in capture) for literal in (rare, absent, common)] != [1, 0, 40]:
+        raise InfrastructureError("Git daemon fixture does not cover the expected literal frequencies")
+    start, end = min(row.ns for row in capture), max(row.ns for row in capture) + 1
+    rows = capture.copy()
+    rng.shuffle(rows)
+    batches = [rows[index:index + 19] for index in range(0, len(rows), 19)]
+    queries = [(start, end, text, limit, 0)
+               for text in ("", rare, absent, common, "/", "'/team/") for limit in (7, 500)]
+    for anchor in rng.sample(capture, 24):
+        text = rng.choice(("", rare, absent, common, "/", "["))
+        offset = rng.choice((0, -450, 345))
+        # Include an actual record in a one-nanosecond window, then use it as the exclusive end.
+        queries.append((anchor.ns, anchor.ns + 1, "", 3, offset))
+        queries.append((anchor.ns - 1, anchor.ns, "", 3, offset))
+        queries.append((max(start, anchor.ns - 20_000_000), min(end, anchor.ns + 20_000_000),
+                        text, rng.choice((1, 17, 500)), offset))
+    for replay in (False, True):
+        with run_bog(binary, directory) as bog:
+            if not replay:
+                for batch in batches:
+                    bog.ingest(batch)
+            phase = "after restart" if replay else "before restart"
+            for left, right, text, limit, offset in queries:
+                expect_query(bog, rows, left, right, contains=text, limit=limit, offset=offset,
+                             label=f"Git daemon {phase} [{left}, {right}), literal {text!r}, limit {limit}")
+            bog.kill()
+
+
 def reconcile_corpus(bog, rows, label, contains=""):
     expected = sorted(rows, key=lambda row: row.ns)
     # Adjacent windows share one endpoint and never split a timestamp group.
@@ -485,6 +536,7 @@ def reconcile_corpus(bog, rows, label, contains=""):
 def replay_corpus_suite(binary, directory):
     directory.mkdir()
     replay_apache(binary, directory / "apache")
+    replay_git_daemon(binary, directory / "git-daemon")
     try:
         records, rows = load_corpus()
     except Rejected as exc:
@@ -661,6 +713,7 @@ def pagination_suite(binary, directory):
 
         snapshot_end = snapshot_start + 101
         snapshot_args = query_args(snapshot_start, snapshot_end)
+        snapshot_shifted = query_args(snapshot_start, snapshot_end, offset=-450)
         original = oracle(rows, snapshot_start, snapshot_end)
         active = expect_page(bog, snapshot_args, original, 0, 2, None, "first page before backfill")
         late = [Row(snapshot_start + i, f"backfilled snapshot row {i}") for i in (100, 60, 30, 5, 15, 20)]
@@ -668,11 +721,15 @@ def pagination_suite(binary, directory):
         pending = [Row(snapshot_start + i, f"concurrent backfill row {i}") for i in (55, 1, 95)]
         with bog.partial_ingest(pending):
             bog.ingest(late)
-            expect_walk(bog, snapshot_args, original, (2,), "active walk during backfill", position=2, cursor=active)
-            expect_walk(bog, args, expected, (1, 1000), "active tied walk during backfill",
+            expect_walk(bog, snapshot_shifted, original, (1, 3), "active walk during backfill",
+                        position=2, cursor=active)
+            expect_walk(bog, shifted, expected, (1, 1000), "active tied walk during backfill",
                         position=DEFAULT_QUERY_LIMIT, cursor=saved)
-            expect_walk(bog, snapshot_args, oracle(rows + late, snapshot_start, snapshot_end),
-                        (2, 1, 1000), "fresh walk during unfinished backfill")
+            interim = oracle(rows + late, snapshot_start, snapshot_end)
+            second_cursor = expect_page(bog, snapshot_shifted, interim, 0, 3, None,
+                                        "first page during unfinished backfill")
+        expect_walk(bog, snapshot_args, interim, (1, 4), "walk across completion of backfill",
+                    position=3, cursor=second_cursor)
         rows.extend(late)
         rows.extend(pending)
         expect_walk(bog, snapshot_args, oracle(rows, snapshot_start, snapshot_end),
@@ -683,6 +740,8 @@ def pagination_suite(binary, directory):
     with run_bog(binary, directory) as bog:
         expect_bad_query(bog, continuation, "cursor from the previous process")
         expect_bad_query(bog, {**snapshot_args, "cursor": active}, "backfill cursor from the previous process")
+        expect_bad_query(bog, {**snapshot_args, "cursor": second_cursor},
+                         "cursor opened during backfill from the previous process")
         expect_walk(bog, query_args(beginning, end_of_time), oracle(rows, beginning, end_of_time),
                     (1000,), "fresh full walk after WAL replay")
 
@@ -727,6 +786,7 @@ def rejection_suite(binary, directory):
             ("invalid UTF-8", 400, prefix + b'{"ts":"' + valid_ts + b'","line":"\xff"}\n'),
             ("lone high surrogate", 400, prefix + b'{"ts":"' + valid_ts + b'","line":"\\ud800x"}\n'),
             ("lone low surrogate", 400, prefix + b'{"ts":"' + valid_ts + b'","line":"\\udfff"}\n'),
+            ("reversed surrogate pair", 400, prefix + b'{"ts":"' + valid_ts + b'","line":"\\ude42\\ud83d"}\n'),
             ("surrogate in timestamp", 400, prefix + b'{"ts":"\\ud800","line":"invalid"}\n'),
             ("surrogate in field name", 400, prefix + b'{"ts":"' + valid_ts + b'","\\ud800":"invalid"}\n'),
             ("empty body", 400, b""),
@@ -737,6 +797,12 @@ def rejection_suite(binary, directory):
             check(got == status, f"{label}: expected HTTP {status}, got {got}: {response[:200]!r}")
             # Use a small limit to detect a partial prefix without downloading oversized data.
             expect_query(bog, good, 0, 5, limit=8, label=label)
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1", bog.port, timeout=HTTP_TIMEOUT)) as client:
+            chunks = (at_limit[start:start + 65_536] for start in range(0, len(at_limit), 65_536))
+            client.request("POST", "/ingest", itertools.chain(chunks, (b" ",)), encode_chunked=True,
+                           headers={"Content-Type": "application/x-ndjson"})
+            with client.getresponse() as response:
+                check(response.status == 413, f"chunked request one byte above 4 MiB returned {response.status}")
         for label, args in [
             ("bad start timestamp", {"start": "yesterday"}),
             ("bad end timestamp", {"end": "yesterday"}),
@@ -753,9 +819,9 @@ def rejection_suite(binary, directory):
             params = {key: value for key, value in params.items() if value is not None}
             got, response = bog.request("GET", "/query?" + urllib.parse.urlencode(params))
             check(got == 400, f"{label}: expected HTTP 400, got {got}: {response[:200]!r}")
-        valid = [Row(3, "literal � and \\ud800"), Row(3, "paired 🙂"), Row(4, "")]
+        valid = [Row(3, "literal � and \\ud800"), Row(3, "paired 🙂\x00\t\r\n"), Row(4, "")]
         wire = (encode_rows(valid[:1]).replace(b"\n", b"\r\n") + b"\n"
-                + b'{"ts":"' + valid_ts + b'","line":"paired \\ud83d\\ude42"}\n'
+                + b'{"ts":"' + valid_ts + b'","line":"paired \\uD83d\\udE42\\u0000\\t\\r\\n"}\n'
                 + encode_rows(valid[2:]).rstrip(b"\n"))
         bog.ingest_body(wire, len(valid))
         good.extend(valid)
@@ -795,7 +861,7 @@ def make_batches(name, count, size, spacing=1):
 def concurrency_suite(binary, directory):
     writers = 8
     batches = [
-        [dataclasses.replace(row, ns=0 if index < 4 else row.ns + 1)
+        [dataclasses.replace(row, ns=batch[0].ns if index < 4 else row.ns)
          for index, row in enumerate(batch)]
         for batch in make_batches("snapshot", 24, 16)
     ]
@@ -813,15 +879,9 @@ def concurrency_suite(binary, directory):
     def inspect_snapshot(actual, label):
         check(all(row in batch_by_row for row in actual), f"{label}: contained unknown rows")
         seen = {batch_by_row[row] for row in actual}
-        check(Counter(actual) == Counter(row for i in seen for row in batches[i]),
-              f"{label}: partial or duplicated batch")
-        times = [row.ns for row in actual]
-        check(times == sorted(times), f"{label}: rows out of timestamp order")
-        tied_batches = set()
-        for index, group in itertools.groupby((row for row in actual if row.ns == 0), batch_by_row.get):
-            check(index not in tied_batches, f"{label}: interleaved concurrent ties")
-            tied_batches.add(index)
-            expect_rows(list(group), batches[index][:4], f"{label}: tie order within batch {index}")
+        # Each writer has disjoint timestamp keys. Only serial ingests assert order across tied batches.
+        expected = oracle((row for i in seen for row in batches[i]), 0, end)
+        expect_rows(actual, expected, f"{label}: all rows from visible batches in timestamp and row order")
         return seen
 
     with run_bog(binary, directory) as bog, ThreadPoolExecutor(max_workers=writers) as pool:
@@ -843,7 +903,6 @@ def concurrency_suite(binary, directory):
         for event in first_invoked:
             check(event.wait(HTTP_TIMEOUT), "writer did not reach the first snapshot")
         previous = set()
-        previous_rows = []
         for sample in range(128):
             with lock:
                 must_see = set(acknowledged)
@@ -854,10 +913,7 @@ def concurrency_suite(binary, directory):
             seen = inspect_snapshot(actual, f"snapshot {sample}")
             check(must_see <= seen <= may_see, f"snapshot {sample} violated POST invocation/ack bounds")
             check(previous <= seen, f"snapshot {sample} lost an already visible batch")
-            expect_rows([row for row in actual if batch_by_row[row] in previous], previous_rows,
-                        f"snapshot {sample}, stable concurrent tie order")
             previous = seen
-            previous_rows = actual
             if all(future.done() for future in futures):
                 break
         for future in futures:
@@ -865,13 +921,7 @@ def concurrency_suite(binary, directory):
         all_rows = bog.query(0, end)
         check(inspect_snapshot(all_rows, "all concurrent writes") == set(range(len(batches))),
               "final snapshot missed acknowledged batches")
-        ties = [row for row in all_rows if row.ns == 0]
-        tie_order = [batch_id for batch_id, _ in itertools.groupby(ties, batch_by_row.get)]
-        for worker in range(writers):
-            observed = [batch_id for batch_id in tie_order if batch_id % writers == worker]
-            check(observed == list(range(worker, len(batches), writers)),
-                  f"writer {worker}: timestamp ties reordered across sequential POSTs")
-        expect_rows(bog.query(0, 1, limit=13), ties[:13], "limit within concurrent ties")
+        expect_rows(bog.query(0, 1, limit=2), batches[-1][:2], "limit within row-order ties")
         pending = [Row(end, "visible when complete/first"), Row(end + 1, "visible when complete/last")]
         with bog.partial_ingest(pending):
             readers = [
@@ -884,8 +934,8 @@ def concurrency_suite(binary, directory):
         expect_query(bog, all_rows + pending, 0, end + 2, label="snapshot after completing the POST")
         bog.kill()
     with run_bog(binary, directory) as bog:
-        expect_rows(bog.query(0, end + 2), all_rows + pending, "concurrent tie order after replay")
-        expect_rows(bog.query(0, 1, limit=13), ties[:13], "limit within concurrent ties after replay")
+        expect_rows(bog.query(0, end + 2), all_rows + pending, "all concurrent writes after replay")
+        expect_rows(bog.query(0, 1, limit=2), batches[-1][:2], "limit within row-order ties after replay")
 
 
 def lock_suite(binary, directory):
@@ -931,11 +981,21 @@ def durability_suite(binary, directory):
 
     def record(event):
         wire = json.dumps(event, sort_keys=True)
-        with ledger.open("a") as stream:
-            stream.write(wire + "\n")
+        with ledger.open("ab") as stream:
+            offset = stream.tell()
+            stream.write((wire + "\n").encode())
             stream.flush()
             os.fsync(stream.fileno())
         print("BOG_SIGKILL " + wire, flush=True)
+        return offset
+
+    def read_event(offset, trial, name):
+        with ledger.open("rb") as stream:
+            stream.seek(offset)
+            event = json.loads(stream.readline())
+        if event["trial"] != trial or event["event"] != name:
+            raise InfrastructureError(f"expected {name} for trial {trial} in the crash ledger")
+        return event["requests"]
 
     for trial in range(1, rounds + 1):
         delay = rng.choice((0, 0.0002, 0.0006, 0.002, 0.006))
@@ -990,6 +1050,8 @@ def durability_suite(binary, directory):
             futures = [pool.submit(observe_response, payload, entry) for payload, entry in controls]
             for future in futures:
                 future.result()
+            receipt_offset = record({**event, "event": "receipts",
+                                     "requests": [entry for _, entry in controls]})
 
             start_unknown = threading.Barrier(len(unknown))
 
@@ -1006,16 +1068,26 @@ def durability_suite(binary, directory):
             for client, _, entry in unknown:
                 entry["socket_readable_before_kill"] = bool(select.select([client.sock], [], [], 0)[0])
             bog.kill()
-            record({**event, "event": "killed", "signal": "SIGKILL", "requests": entries})
+            kill_offset = record({**event, "event": "killed", "signal": "SIGKILL", "requests": entries})
 
         with run_bog(binary, directory) as bog:
             actual = bog.query(lower, upper, limit=MAX_QUERY_LIMIT)
             check(len(actual) < MAX_QUERY_LIMIT, f"{tag}: reconciliation reached the query limit")
             counts = Counter(actual)
-            for rows, _, entry in requests.values():
+            receipts = {entry["batch"]: entry["status"] for entry in read_event(receipt_offset, trial, "receipts")}
+            recovered_entries = read_event(kill_offset, trial, "killed")
+            for entry in recovered_entries:
+                rows, _, _ = requests[entry["batch"]]
+                status = receipts.get(entry["batch"])
+                if status is None:
+                    fully_uploaded = entry["uploaded_bytes"] == entry["declared_bytes"]
+                    outcome = "unknown" if fully_uploaded else "incomplete"
+                else:
+                    outcome = {204: "acknowledged", 400: "rejected"}[status]
+                if outcome != entry["outcome"]:
+                    raise InfrastructureError(f"{entry['batch']}: recorded outcome differs from the crash plan")
                 multiplicities = [counts[row] for row in rows]
                 absent, whole = [0] * len(rows), [1] * len(rows)
-                outcome = entry["outcome"]
                 allowed = {"acknowledged": (whole,), "rejected": (absent,),
                            "incomplete": (absent,), "unknown": (absent, whole)}[outcome]
                 check(multiplicities in allowed,
@@ -1027,7 +1099,8 @@ def durability_suite(binary, directory):
                     history.extend(rows)
             expect_rows(actual, oracle(history, lower, upper),
                         f"{tag}: missing, duplicated, phantom, or misordered rows after restart")
-            record({**event, "event": "reconciliation", "requests": entries, "total_recovered_rows": len(history)})
+            record({**event, "event": "reconciliation", "requests": recovered_entries,
+                    "total_recovered_rows": len(history)})
     return {"rounds": rounds, "outcomes": {key: count * rounds for key, count in Counter(outcomes).items()},
             "recovered_unknown": dict(recovered_unknown), "total_recovered_rows": len(history),
             "ledger": str(ledger.relative_to(log_dir.parent))}
@@ -1570,7 +1643,7 @@ def measure_benchmark(binary, directory, workload, *, reconcile=False, keep_aliv
         if reconcile:
             workload.reconcile(bog, "after restart")
         restart_rss = peak_rss_kib(bog.process)
-        bog.stop()
+        bog.kill()
     return {
         "rows": workload.count, "batches": len(workload.batches),
         "batch_rows": workload.batch_rows, "writers": workload.writers, "keep_alive": keep_alive,
@@ -1630,7 +1703,7 @@ def indexed_targets(pairs):
     return targets
 
 
-def paired_performance_suite(baseline, candidate, directory, *, indexed):
+def paired_performance_suite(baseline, candidate, directory, *, indexed, baseline_sha, candidate_sha):
     directory.mkdir()
     _, corpus = load_corpus()
     log_dir, _ = PROCESS_LOGS.get()
@@ -1640,6 +1713,7 @@ def paired_performance_suite(baseline, candidate, directory, *, indexed):
     repeats = BENCH_REPEATS if indexed else 2
     rows = BENCH_LARGE_ROWS if indexed else CYCLE3_COMPARE_ROWS
     batch_rows = BENCH_BATCH_ROWS if indexed else CYCLE3_BATCH_ROWS
+    revisions = {"baseline_sha": baseline_sha, "candidate_sha": candidate_sha}
     profiles, failures = {}, []
     for profile, writers in scenarios.items():
         pairs = []
@@ -1657,11 +1731,11 @@ def paired_performance_suite(baseline, candidate, directory, *, indexed):
                                                           keep_alive=not indexed, reconcile=not indexed)
                 ratios = paired_ratios(results["baseline"], results["candidate"], small_batches=not indexed)
                 pairs.append(ratios)
-                record = {"profile": profile, "seed": seed, "repeat": repeat + 1, "order": order,
+                record = {**revisions, "profile": profile, "seed": seed, "repeat": repeat + 1, "order": order,
                           "ratios": ratios, **results}
                 with ledger.open("a") as stream:
                     stream.write(json.dumps(record, sort_keys=True) + "\n")
-                summary = {"profile": profile, "seed": seed, "repeat": repeat + 1, "order": order,
+                summary = {**revisions, "profile": profile, "seed": seed, "repeat": repeat + 1, "order": order,
                            "ratios": ratios, "workload_sha256": workload.digest}
                 print("BOG_PERFORMANCE_PAIR " + json.dumps(summary, sort_keys=True))
             workload.path.unlink()
@@ -1672,7 +1746,7 @@ def paired_performance_suite(baseline, candidate, directory, *, indexed):
             targets = indexed_targets(pairs)
             profiles[profile]["targets"] = targets
             failures.extend(f"{profile}/{key}" for key, value in targets.items() if not value["passed"])
-    result = {"baseline_sha": BASELINE_SHA if indexed else CYCLE3_BASELINE_SHA,
+    result = {**revisions,
               "rows_per_run": rows, "batch_rows": batch_rows,
               "profiles": profiles, "ledger": str(ledger.relative_to(log_dir.parent))}
     if indexed:
@@ -1687,12 +1761,10 @@ SUITES = (
     ("request-rejection", rejection_suite),
     ("concurrent-snapshots", concurrency_suite),
     ("directory-lock", lock_suite),
-    ("graceful-shutdown", shutdown_suite),
     ("kill-durability", durability_suite),
     ("wal-recovery", recovery_suite),
     ("historical-surrogates", historical_surrogate_suite),
     ("enospc-recovery", enospc_suite),
-    ("full-disk-restart", full_disk_restart_suite),
     ("performance-smoke", performance_suite),
 )
 REQUIRED_SUITES = (
@@ -1702,23 +1774,26 @@ REQUIRED_SUITES = (
     "request-rejection",
     "concurrent-snapshots",
     "directory-lock",
-    "graceful-shutdown",
     "kill-durability",
     "wal-recovery",
     "historical-surrogates",
     "enospc-recovery",
-    "full-disk-restart",
     "performance-smoke",
 )
-WAL_HANDOFF = ("wal-handoff", wal_handoff_suite)
-COMPARISON_SUITES = {"full": "small-batch-performance", "post-cycle": "indexed-performance"}
+EXTENDED_SUITES = (
+    ("graceful-shutdown", shutdown_suite),
+    ("full-disk-restart", full_disk_restart_suite),
+    ("wal-handoff", wal_handoff_suite),
+)
+COMPARISON_SUITES = {"full": "small-batch-performance", "post-cycle": "small-batch-performance",
+                     "indexed": "indexed-performance"}
 
 
 def suite_plan(suites, profile):
     if profile == "legacy":
         return tuple((name, run) for name, run in suites if name != "snapshot-pagination")
     if profile in COMPARISON_SUITES:
-        return (*suites, WAL_HANDOFF, (COMPARISON_SUITES[profile], paired_performance_suite))
+        return (*suites, *EXTENDED_SUITES, (COMPARISON_SUITES[profile], paired_performance_suite))
     return suites
 
 
@@ -1743,9 +1818,10 @@ def build(source, work, log):
 
 
 def build_baseline(source, work, evidence, baseline_sha):
-    ancestor = subprocess.run(["git", "merge-base", "--is-ancestor", baseline_sha, "HEAD"], cwd=source,
-                              capture_output=True, timeout=15)
-    check(ancestor.returncode == 0, f"candidate checkout does not descend from comparison SHA {baseline_sha}")
+    revision = subprocess.run(["git", "rev-parse", "--verify", f"{baseline_sha}^{{commit}}"], cwd=source,
+                              capture_output=True, text=True, timeout=15)
+    if revision.returncode or revision.stdout.strip() != baseline_sha:
+        raise InfrastructureError(f"comparison baseline revision {baseline_sha} is missing from the fetched history")
     baseline_dir = work / "baseline"
     baseline_dir.mkdir()
     checkout = baseline_dir / "source"
@@ -1753,11 +1829,15 @@ def build_baseline(source, work, evidence, baseline_sha):
                              cwd=source, capture_output=True, text=True, timeout=30)
     if fetched.returncode:
         raise InfrastructureError(f"cannot check out comparison SHA {baseline_sha}: {fetched.stderr}")
+    checked_out = subprocess.run(["git", "rev-parse", "--verify", "HEAD"], cwd=checkout,
+                                 capture_output=True, text=True, timeout=15)
+    if checked_out.returncode or checked_out.stdout.strip() != baseline_sha:
+        raise InfrastructureError(f"comparison checkout does not match {baseline_sha}")
     log = evidence / "baseline-build.log"
     try:
         binary = build(checkout, baseline_dir, log)
     except Rejected as exc:
-        raise InfrastructureError(f"comparison baseline build failed: {exc}") from exc
+        raise InfrastructureError(f"comparison baseline {baseline_sha} build failed: {exc}") from exc
     finally:
         if log.exists():
             print("BOG_BUILD " + json.dumps({"role": "baseline", "sha": baseline_sha,
@@ -1790,16 +1870,19 @@ def log_tail(path, size):
 
 def new_result(requested_sha, tested_sha, profile="pr"):
     required = suite_plan(tuple((name, None) for name in REQUIRED_SUITES), profile)
+    baseline_sha = {"full": COMPARISON_BASELINE_SHA, "post-cycle": COMPARISON_BASELINE_SHA,
+                    "legacy": BASELINE_SHA, "indexed": BASELINE_SHA}.get(profile)
     return {
         "schema_version": 1, "requested_sha": requested_sha, "tested_sha": tested_sha,
         "profile": profile,
-        "baseline_sha": {"full": CYCLE3_BASELINE_SHA, "legacy": BASELINE_SHA,
-                         "post-cycle": BASELINE_SHA}.get(profile),
-        "corpus_sha256": CORPUS_SHA256, "apache_fixture_sha256": APACHE_SHA256, "seeds": SEEDS,
+        "baseline_sha": baseline_sha,
+        "corpus_sha256": CORPUS_SHA256, "apache_fixture_sha256": APACHE_SHA256,
+        "git_daemon_fixture_sha256": GIT_DAEMON_SHA256, "seeds": SEEDS,
         "run_name": os.environ.get("SLIPWAY_RUN_NAME"), "run_uid": os.environ.get("SLIPWAY_RUN_UID"),
         "step": os.environ.get("SLIPWAY_STEP_NAME"),
         "image_digest": os.environ.get("BOG_VERIFIER_IMAGE_DIGEST"),
         "build": {"status": "pending"},
+        **({"baseline_build": {"sha": baseline_sha, "status": "pending"}} if profile in COMPARISON_SUITES else {}),
         "suites": [{"name": name, "status": "pending"} for name, _ in required],
         "status": "running",
     }
@@ -1817,7 +1900,10 @@ def publish_result(work, code, reason, requested_sha, tested_sha, profile="pr"):
     result.update(status=status, exit_code=code)
     if reason and "diagnostic" not in result:
         result["diagnostic"] = reason
-    for check_result in [result["build"], *result["suites"]]:
+    builds = [result["build"]]
+    if "baseline_build" in result:
+        builds.append(result["baseline_build"])
+    for check_result in [*builds, *result["suites"]]:
         if check_result["status"] == "pending":
             check_result["status"] = "blocked"
         if check_result["status"] == "running":
@@ -1862,7 +1948,7 @@ def main(source, work, sha, profile="pr"):
         return reject(work, sha, "build", 0, reason)
     finally:
         if build_log.exists():
-            print("BOG_BUILD " + json.dumps({"log_tail": log_tail(build_log, 4096)}))
+            print("BOG_BUILD " + json.dumps({"role": "candidate", "sha": sha, "log_tail": log_tail(build_log, 4096)}))
 
     digest = file_sha256(binary)
     result["build"].update(status="passed", binary_sha256=digest)
@@ -1881,6 +1967,27 @@ def main(source, work, sha, profile="pr"):
     baseline = None
     comparison_stage = COMPARISON_SUITES.get(profile)
     baseline_sha = result["baseline_sha"]
+    if comparison_stage:
+        print(f"bog comparison candidate_sha={sha} baseline_sha={baseline_sha}")
+        (work / "stage").write_text(f"comparison baseline build {baseline_sha}, 0/{len(required)} suites completed")
+        baseline_build = result["baseline_build"]
+        baseline_build.update(status="running")
+        checkpoint()
+        try:
+            baseline = build_baseline(source, work, evidence, baseline_sha)
+        except (InfrastructureError, subprocess.TimeoutExpired) as exc:
+            reason = diagnostic(exc)
+            print(f"ERROR comparison baseline {baseline_sha}: {reason}", file=sys.stderr)
+            baseline_build.update(status="infra_error", diagnostic=reason)
+            finish("infra_error", reason)
+            return 2
+        finally:
+            if (evidence / "baseline-build.log").exists():
+                baseline_build["log"] = "baseline-build.log"
+                checkpoint()
+        baseline_build.update(status="passed", binary_sha256=file_sha256(baseline))
+        checkpoint()
+
     for (stage, run), suite in zip(suites, result["suites"]):
         if stage == comparison_stage and (rejected or errors):
             suite.update(status="blocked", diagnostic="correctness or smoke prerequisite failed")
@@ -1895,17 +2002,15 @@ def main(source, work, sha, profile="pr"):
         token = PROCESS_LOGS.set((log_dir, suite["processes"]))
         try:
             if stage == "wal-handoff":
-                baseline = build_baseline(source, work, evidence, baseline_sha)
-                result["baseline_build"] = {"sha": baseline_sha, "binary_sha256": file_sha256(baseline),
-                                            "log": "baseline-build.log"}
                 metrics = run(baseline, binary, work / stage, baseline_sha)
             elif stage == comparison_stage:
-                metrics = run(baseline, binary, work / stage, indexed=profile == "post-cycle")
+                metrics = run(baseline, binary, work / stage, indexed=profile == "indexed",
+                              baseline_sha=baseline_sha, candidate_sha=sha)
             else:
                 metrics = run(binary, work / stage)
             if metrics is not None:
                 suite["metrics"] = metrics
-            if profile == "post-cycle" and stage == comparison_stage:
+            if profile == "indexed" and stage == comparison_stage:
                 failed = metrics["failed_targets"]
                 check(not failed, f"indexed performance missed {len(failed)} targets: {', '.join(failed)}")
             if not any(case.get("ready_ms") is not None for case in suite["processes"]):

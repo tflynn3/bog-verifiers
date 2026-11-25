@@ -69,7 +69,9 @@ class GateTest(unittest.TestCase):
             verify.decode_rows(wire.replace(b'"line": "second"', b'"line": "a", "line": "second"'))
 
     def test_readme_only_revision_fails_bootstrap_and_full_entrypoints(self):
-        cases = [((), {}, "pr"), (("--full",), {}, "full"), ((), {"SLIPWAY_PARAM_MODE": "full"}, "full")]
+        cases = [((), {}, "pr"), (("--full",), {}, "full"), (("--compare",), {}, "full"),
+                 ((), {"SLIPWAY_PARAM_MODE": "compare"}, "full"),
+                 ((), {"SLIPWAY_PARAM_MODE": "post-cycle"}, "post-cycle")]
         for args, params, profile in cases:
             with self.subTest(args=args):
                 result = entrypoint(*args, **readme_candidate(README_ONLY), **params)
@@ -82,6 +84,9 @@ class GateTest(unittest.TestCase):
                 self.assertEqual(report["tested_sha"], README_ONLY)
                 self.assertEqual(report["exit_code"], 1)
                 self.assertEqual(report["profile"], profile)
+                if profile != "pr":
+                    self.assertEqual(report["baseline_sha"], verify.COMPARISON_BASELINE_SHA)
+                    self.assertEqual(report["baseline_build"]["status"], "blocked")
                 self.assertIn("snapshot-pagination", {suite["name"] for suite in report["suites"]})
                 self.assertTrue(all(suite["status"] == "blocked" for suite in report["suites"]))
 
@@ -93,10 +98,11 @@ class GateTest(unittest.TestCase):
         baseline, default = plan("pr")
         self.assertIsNone(baseline)
         self.assertEqual(default, list(verify.REQUIRED_SUITES))
-        self.assertEqual(plan("full"), (verify.CYCLE3_BASELINE_SHA,
-                                       default + ["wal-handoff", "small-batch-performance"]))
-        self.assertEqual(plan("post-cycle"), (verify.BASELINE_SHA,
-                                             default + ["wal-handoff", "indexed-performance"]))
+        extended = ["graceful-shutdown", "full-disk-restart", "wal-handoff"]
+        self.assertEqual(plan("full"), (verify.COMPARISON_BASELINE_SHA,
+                                       default + extended + ["small-batch-performance"]))
+        self.assertEqual(plan("post-cycle"), plan("full"))
+        self.assertEqual(plan("indexed"), (verify.BASELINE_SHA, default + extended + ["indexed-performance"]))
         self.assertEqual(plan("legacy"), (verify.BASELINE_SHA,
                                           [name for name in default if name != "snapshot-pagination"]))
 
@@ -154,6 +160,28 @@ class GateTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn(f"revision mismatch: fetched {README_ONLY}", result.stderr)
         self.assertNotIn("candidate_sha=", result.stdout)
+
+    def test_comparison_with_missing_candidate_ref_reports_both_shas(self):
+        inputs = {**readme_candidate(README_ONLY), "SLIPWAY_CANDIDATE_BRANCH": "missing"}
+        result = entrypoint("--compare", **inputs)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(f"Bog revision {README_ONLY} is unavailable", result.stderr)
+        report = json.loads(next(line.removeprefix("BOG_RESULT ") for line in result.stdout.splitlines()
+                                 if line.startswith("BOG_RESULT ")))
+        self.assertEqual(report["requested_sha"], README_ONLY)
+        self.assertIsNone(report["tested_sha"])
+        self.assertEqual(report["baseline_sha"], verify.COMPARISON_BASELINE_SHA)
+
+    def test_comparison_baseline_requires_a_present_buildable_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / "source"
+            bundle = readme_candidate(README_ONLY)["SLIPWAY_REPOSITORY"]
+            subprocess.run(["git", "clone", "-q", "-b", "main", bundle, str(source)], check=True)
+            with self.assertRaisesRegex(verify.InfrastructureError, f"{verify.COMPARISON_BASELINE_SHA} is missing"):
+                verify.build_baseline(source, work, work, verify.COMPARISON_BASELINE_SHA)
+            with self.assertRaisesRegex(verify.InfrastructureError, f"{README_ONLY} build failed: missing ./cmd/bog"):
+                verify.build_baseline(source, work, work, README_ONLY)
 
     def test_missing_candidate_inputs_fail(self):
         result = entrypoint()
