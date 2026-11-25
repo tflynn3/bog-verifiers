@@ -80,7 +80,51 @@ class GateTest(unittest.TestCase):
                                          if line.startswith("BOG_RESULT ")))
                 self.assertEqual(report["tested_sha"], README_ONLY)
                 self.assertEqual(report["exit_code"], 1)
+                self.assertEqual(report["profile"], "pr")
+                self.assertIn("snapshot-pagination", {suite["name"] for suite in report["suites"]})
                 self.assertTrue(all(suite["status"] == "blocked" for suite in report["suites"]))
+
+    def test_legacy_mode_cannot_bypass_pagination_for_an_unpinned_revision(self):
+        for args, params in [(("--legacy",), {}), ((), {"SLIPWAY_PARAM_MODE": "legacy"})]:
+            with self.subTest(args=args, params=params):
+                result = entrypoint(*args, **readme_candidate(README_ONLY), **params)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"legacy mode requires pinned Cycle 1 SHA {verify.BASELINE_SHA}", result.stderr)
+
+    def test_cursor_walk_changes_limits_and_requires_exact_termination(self):
+        args = verify.query_args(0, 3)
+        rows = [verify.Row(i, f"Log/{i}") for i in range(3)]
+        requests = []
+        responses = iter([(rows[:1], "opaque"), (rows[1:], None)])
+
+        class Service:
+            def query_page(self, params):
+                requests.append(params)
+                return next(responses)
+
+        verify.expect_walk(Service(), args, rows, (1, 2), "changed page size")
+        self.assertEqual(requests, [{**args, "page": "1", "limit": 1},
+                                    {**args, "cursor": "opaque", "limit": 2}])
+        for response, expected in [((rows[:1], None), rows), ((rows[:1], "extra"), rows[:1])]:
+            with self.subTest(response=response):
+                responses = iter([response])
+                with self.assertRaisesRegex(verify.Rejected, "present exactly when rows remain"):
+                    verify.expect_walk(Service(), args, expected, (1,), "termination")
+
+    def test_indexed_targets_apply_to_paired_median_and_require_all_pairs(self):
+        count = len(verify.BENCH_SEEDS) * verify.BENCH_REPEATS
+        pair = {"wide_query_p95/live": 0.5, "wide_query_p95/restart": 0.51,
+                "narrow_query_p95/live": 1.25, "durable_rows_per_second": 0.79,
+                "restart_ready_ms": 1.25, "peak_rss_kib": 1.26, "rare_or_absent_query_p95/live": 1.5}
+        targets = verify.indexed_targets([pair] * (count - 1) + [{**pair, "wide_query_p95/live": 9}])
+        self.assertEqual({key for key, result in targets.items() if not result["passed"]},
+                         {"wide_query_p95/restart", "durable_rows_per_second", "peak_rss_kib"})
+        with self.assertRaisesRegex(verify.InfrastructureError, "every configured benchmark pair"):
+            verify.indexed_targets([pair] * (count - 1))
+
+    def test_historical_wal_fixture_uses_castagnoli_crc_and_little_endian_marker(self):
+        self.assertEqual(verify.crc32c(b"123456789"), 0xe3069283)
+        self.assertEqual(verify.commit_marker(8), b"BOGCMT01\x08" + b"\x00" * 7 + b"\xf7" + b"\xff" * 7)
 
     def test_fetched_tip_must_match_full_candidate_sha(self):
         result = entrypoint(**readme_candidate("0" * 40))

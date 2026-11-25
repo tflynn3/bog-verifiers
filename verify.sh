@@ -14,27 +14,50 @@ infra() {
   exit 2
 }
 
-# The bootstrap image and explicit full invocation use the same entrypoint.
-if [ "${1:-}" = --full ]; then
-  shift
-fi
-[ "$#" -eq 0 ] || infra 'usage: verify.sh [--full]'
+mode=${SLIPWAY_PARAM_MODE:-}
+profile=pr
+case "$mode" in
+  legacy|post-cycle) profile=$mode ;;
+esac
+case "${1:-}" in
+  --full) shift ;;
+  --legacy)
+    [ "$profile" != post-cycle ] || infra '--legacy cannot run a post-cycle evaluation'
+    profile=legacy
+    shift
+    ;;
+esac
+[ "$#" -eq 0 ] || infra 'usage: verify.sh [--full|--legacy]'
+verifier_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || infra 'cannot locate verifier'
 
 repository=${SLIPWAY_REPOSITORY:-}
 branch=${SLIPWAY_CANDIDATE_BRANCH:-}
 expected=${SLIPWAY_CANDIDATE_COMMIT:-}
+allow_ancestor=false
+factory_repository=http://bog-git.kagent.svc.cluster.local/bog.git
 # General verifier steps use Slipway parameters instead of a repository lease.
 if [ -z "$repository$branch$expected" ]; then
-  case "${SLIPWAY_PARAM_MODE:-}" in
-    smoke)
-      repository=${SLIPWAY_PARAM_REPOSITORY:-http://bog-git.kagent.svc.cluster.local/bog.git}
+  case "$profile:$mode" in
+    legacy:*)
+      command -v python3 >/dev/null || infra 'missing verifier tool: python3'
+      repository=${SLIPWAY_PARAM_REPOSITORY:-$factory_repository}
+      branch=${SLIPWAY_PARAM_BRANCH:-main}
+      expected=${SLIPWAY_PARAM_COMMIT:-}
+      if [ -z "$expected" ]; then
+        expected=$(python3 -B "$verifier_dir/verify.py" --baseline) || infra 'cannot read pinned Cycle 1 SHA'
+      fi
+      if [ "$branch" = main ]; then allow_ancestor=true; fi
+      ;;
+    pr:smoke)
+      repository=${SLIPWAY_PARAM_REPOSITORY:-$factory_repository}
       branch=${SLIPWAY_PARAM_BRANCH:-}
       expected=${SLIPWAY_PARAM_COMMIT:-}
       ;;
-    post-cycle)
-      repository=http://bog-git.kagent.svc.cluster.local/bog.git
+    post-cycle:post-cycle)
+      repository=${SLIPWAY_PARAM_REPOSITORY:-$factory_repository}
       branch=main
       expected=${SLIPWAY_INPUT_TESTEDCOMMIT:-}
+      allow_ancestor=true
       ;;
   esac
 fi
@@ -50,7 +73,6 @@ for tool in git go python3 timeout; do
 done
 ref="refs/heads/$branch"
 git check-ref-format "$ref" || reject 'invalid Bog candidate branch (suites=0)'
-verifier_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || infra 'cannot locate verifier'
 work=$(mktemp -d /tmp/bog-verify-XXXXXX) || infra 'cannot create verifier workspace'
 trap 'rm -rf "$work"' EXIT
 trap 'exit 2' HUP INT TERM
@@ -61,7 +83,7 @@ finalize() {
   trap - EXIT
   # Slipway keeps verifier pod stdout and the termination message. A runner
   # with a writable artifact mount can also retain the raw log files.
-  if ! python3 -B "$verifier_dir/verify.py" --report "$work" "$code" "${outcome:-}" "$expected" "${sha:-}"; then
+  if ! python3 -B "$verifier_dir/verify.py" --report "$work" "$code" "${outcome:-}" "$expected" "${sha:-}" "$profile"; then
     printf '%s\n' 'Bog verifier infrastructure error: cannot publish verifier report' >&2
     code=2
   fi
@@ -85,7 +107,7 @@ timeout -k 5s 60s git -C "$checkout" fetch -q --no-tags -- "$repository" "$ref" 
   infra "cannot fetch Bog candidate branch $ref (suites=0)"
 fetched=$(git -C "$checkout" rev-parse --verify 'FETCH_HEAD^{commit}') || infra 'cannot resolve fetched commit'
 if [ "$fetched" != "$expected" ]; then
-  if [ "${SLIPWAY_PARAM_MODE:-}" != post-cycle ] || [ -n "${SLIPWAY_CANDIDATE_COMMIT:-}" ] ||
+  if [ "$allow_ancestor" != true ] ||
      ! git -C "$checkout" merge-base --is-ancestor "$expected" "$fetched"; then
     reject "Bog revision mismatch: fetched $fetched, expected $expected (suites=0)"
   fi
@@ -93,10 +115,12 @@ fi
 git -C "$checkout" checkout -q --detach "$expected" || infra "cannot check out Bog revision $expected"
 [ "$(git -C "$checkout" rev-parse --verify HEAD)" = "$expected" ] || infra 'checked-out SHA did not match the requested SHA'
 sha=$expected
-printf 'bog full verification candidate_sha=%s\n' "$sha"
+printf 'bog full verification candidate_sha=%s profile=%s\n' "$sha" "$profile"
 
+watchdog=240
+if [ "$profile" = post-cycle ]; then watchdog=7200; fi
 status=0
-timeout -k 5s 240s python3 -B -u "$verifier_dir/verify.py" "$checkout" "$work" "$sha" || status=$?
+timeout -k 5s "${watchdog}s" python3 -B -u "$verifier_dir/verify.py" "$checkout" "$work" "$sha" "$profile" || status=$?
 case "$status" in
   0)
     [ -s "$work/passed" ] || infra 'missing full-suite completion record'
@@ -107,7 +131,10 @@ case "$status" in
     ;;
   124|137)
     stage=$(cat "$work/stage" 2>/dev/null) || stage='harness initialization'
-    reject "Bog $sha exceeded the 240s watchdog ($stage)"
+    if [ "$profile" = post-cycle ]; then
+      infra "Bog $sha exceeded the ${watchdog}s watchdog ($stage)"
+    fi
+    reject "Bog $sha exceeded the ${watchdog}s watchdog ($stage)"
     ;;
   *) infra "SHA $sha, status $status" ;;
 esac
