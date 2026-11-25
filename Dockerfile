@@ -5,5 +5,5 @@ COPY --chmod=0755 verify.sh /verifier/verify.sh
 COPY verify.py /verifier/verify.py
 COPY corpus/replay.ndjson /verifier/corpus/replay.ndjson
 USER 65532:65532
-ENV HOME=/tmp GOCACHE=/tmp/gocache GOMODCACHE=/tmp/gomodcache GOWORK=off GOTOOLCHAIN=local
+ENV HOME=/tmp GOCACHE=/tmp/gocache GOMODCACHE=/tmp/gomodcache GOWORK=off GOTOOLCHAIN=local GOPROXY=off
 ENTRYPOINT ["/verifier/verify.sh"]
