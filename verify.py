@@ -12,6 +12,7 @@ import math
 import os
 import random
 import re
+import select
 import signal
 import socket
 import subprocess
@@ -34,12 +35,21 @@ STAMP = re.compile(
 )
 WAL_MAGIC = b"BOGWAL01"
 MAX_FRAME = 4 * 1024 * 1024
+DEFAULT_QUERY_LIMIT = 500
+MAX_QUERY_LIMIT = 1000
 HTTP_TIMEOUT = 5
 START_TIMEOUT = 12
-CORPUS_PATH = Path(__file__).resolve().parent / "corpus" / "replay.ndjson"
+CORPUS_DIR = Path(__file__).resolve().parent / "corpus"
+CORPUS_PATH = CORPUS_DIR / "replay.ndjson"
 CORPUS_SHA256 = "7b79f2ac83692126019934e6a7738524aaa55f3e2151237d8421cae0539aff72"
 CORPUS_SOURCES = {"access": 513, "error": 36, "app": 1009, "seed": 1000}
-SEEDS = {"query-oracle": 0xB061, "kill-durability": 0xB067, "performance-smoke": 0xB070}
+APACHE_PATH = CORPUS_DIR / "apache-access.log"
+APACHE_SHA256 = "29e286fd748b06450152c4efcfe9c4f2a668a8b3223720f7fba052ffd902b14e"
+APACHE_STAMP = re.compile(r"^\S+ \S+ \S+ \[([^\]]+)\] ")
+SEEDS = {
+    "query-oracle": 0xB061, "kill-durability": 0xB067, "performance-smoke": 0xB070,
+    "apache-replay": 0xB091,
+}
 PROCESS_LOGS = contextvars.ContextVar("process_logs")
 
 
@@ -88,13 +98,22 @@ def encode_rows(rows):
     )
 
 
+def unique_fields(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON field {key!r}")
+        result[key] = value
+    return result
+
+
 def decode_rows(body):
     try:
         result = []
         for line in body.split(b"\n"):
             if not line.strip():
                 continue
-            value = json.loads(line.decode("utf-8"))
+            value = json.loads(line.decode("utf-8"), object_pairs_hook=unique_fields)
             if not isinstance(value, dict) or not isinstance(value.get("line"), str):
                 raise ValueError("expected an object with a string line")
             if set(value) != {"ts", "line"}:
@@ -181,7 +200,7 @@ class Bog:
                 check(should_start, f"{self.directory_name}: Bog became ready when startup should have failed")
                 check(self.process.poll() is None, f"Bog exited at readiness: {self.log_tail()}")
                 return time.monotonic() - self.started
-            time.sleep(0.025)
+            time.sleep(0.005)
         expectation = "become ready" if should_start else "exit with a startup error"
         raise Rejected(f"Bog did not {expectation} in {START_TIMEOUT}s: {self.log_tail()}")
 
@@ -206,6 +225,13 @@ class Bog:
         client.send(remainder)
         with client.getresponse() as response:
             check(response.status == 204, f"active POST during SIGTERM returned HTTP {response.status}")
+        self.wait_for_sigterm()
+
+    def stop(self):
+        self.process.terminate()
+        self.wait_for_sigterm()
+
+    def wait_for_sigterm(self):
         code = self.process.wait(timeout=HTTP_TIMEOUT)
         check(code == 0, f"SIGTERM did not produce a clean exit (status {code}): {self.log_tail()}")
 
@@ -236,7 +262,7 @@ class Bog:
                 header = bytearray()
                 while not header.endswith(b"\r\n\r\n"):
                     chunk = conn.sock.recv(1)
-                    check(chunk and len(header) < 4096, "no HTTP 100 Continue before SIGTERM")
+                    check(chunk and len(header) < 4096, "no HTTP 100 Continue before request body")
                     header.extend(chunk)
                 check(header.startswith(b"HTTP/1.1 100 "), f"unexpected interim status {header[:100]!r}")
             yield conn
@@ -246,7 +272,7 @@ class Bog:
     @contextlib.contextmanager
     def partial_ingest(self, rows):
         body = encode_rows(rows)
-        with self.open_ingest(len(body)) as conn:
+        with self.open_ingest(len(body), expect_continue=True) as conn:
             split = body.index(b"\n") + 1
             conn.send(body[:split])
             yield
@@ -255,7 +281,7 @@ class Bog:
                 check(response.status == 204,
                       f"completed partial POST returned {response.status}")
 
-    def query(self, start, end, contains="", limit=500, offset=0):
+    def query(self, start, end, contains="", limit=DEFAULT_QUERY_LIMIT, offset=0):
         args = {"start": stamp(start, offset), "end": stamp(end, offset)}
         if limit is not None:
             args["limit"] = limit
@@ -298,11 +324,11 @@ def expect_rows(actual, expected, label):
     check(len(actual) == len(expected), f"{label}: expected {len(expected)} rows, got {len(actual)}")
 
 
-def expect_query(bog, rows, start, end, *, contains="", limit=500, offset=0, label):
+def expect_query(bog, rows, start, end, *, contains="", limit=DEFAULT_QUERY_LIMIT, offset=0, label):
     # sorted is stable, so equal instants retain acknowledged ingest order.
     matched = [row for row in rows if start <= row.ns < end and contains in row.line]
     expect_rows(bog.query(start, end, contains, limit, offset),
-                sorted(matched, key=lambda row: row.ns)[:500 if limit is None else limit], label)
+                sorted(matched, key=lambda row: row.ns)[:DEFAULT_QUERY_LIMIT if limit is None else limit], label)
 
 
 def load_corpus():
@@ -310,7 +336,9 @@ def load_corpus():
     digest = hashlib.sha256(raw).hexdigest()
     if digest != CORPUS_SHA256:
         raise InfrastructureError(f"replay corpus digest mismatch: {digest}")
-    records = raw.splitlines(keepends=True)
+    records = raw.split(b"\n")
+    if records.pop() != b"":
+        raise InfrastructureError("replay corpus is missing its final LF")
     rows = decode_rows(raw)
     ids = [row.line.split(" ", 1)[0] for row in rows]
     counts = Counter(record_id.split("-", 1)[0].removeprefix("id=") for record_id in ids)
@@ -318,6 +346,57 @@ def load_corpus():
         raise InfrastructureError(f"replay corpus record count mismatch: {len(ids)} rows, {dict(counts)}")
     print(f"corpus records={len(rows)} sha256={digest} sources={dict(sorted(counts.items()))}")
     return records, rows
+
+
+def load_apache():
+    raw = APACHE_PATH.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != APACHE_SHA256:
+        raise InfrastructureError(f"Apache fixture digest mismatch: {digest}")
+    lines = raw.split(b"\n")
+    if len(lines) != 257 or lines.pop() != b"" or len(set(lines)) != 256:
+        raise InfrastructureError("expected 256 distinct LF-terminated Apache log lines")
+    rows = []
+    for record in lines:
+        line = record.decode("utf-8")
+        match = APACHE_STAMP.match(line)
+        if not match:
+            raise InfrastructureError(f"Apache log line has no timestamp: {line[:200]!r}")
+        when = dt.datetime.strptime(match[1], "%d/%b/%Y:%H:%M:%S %z")
+        delta = when - EPOCH
+        rows.append(Row((delta.days * 86400 + delta.seconds) * SECOND, line))
+    print(f"apache records={len(rows)} sha256={digest}")
+    return rows
+
+
+def replay_apache(binary, directory):
+    rows = load_apache()
+    random.Random(SEEDS["apache-replay"]).shuffle(rows)
+    first = rows[0]
+    start, end = min(row.ns for row in rows), max(row.ns for row in rows) + 1
+    rows.extend([first, dataclasses.replace(first, offset=-450)])
+
+    with run_bog(binary, directory) as bog:
+        for index in range(0, len(rows), 32):
+            bog.ingest(rows[index:index + 32])
+        check_apache_queries(bog, rows, start, end, first.ns, "before restart")
+        bog.kill()
+    with run_bog(binary, directory) as bog:
+        check_apache_queries(bog, rows, start, end, first.ns, "after restart")
+
+
+def check_apache_queries(bog, rows, start, end, tied, phase):
+    for left, right, literal, limit, offset in [
+        (start, end, "", None, 0),
+        (tied, tied + 1, "", 1000, 345),
+        (start, end, "GET /Orders?", 9, -450),
+        (start, end, "GET /orders?", 500, 0),
+        (start, end, "q=a+b%26c&item=", 500, 0),
+        (start, end, "[a.*]", 500, 0),
+        (start, end, '" 404 ', 500, 0),
+    ]:
+        expect_query(bog, rows, left, right, contains=literal, limit=limit, offset=offset,
+                     label=f"Apache {phase} [{left}, {right}), literal {literal!r}, limit {limit}")
 
 
 def reconcile_corpus(bog, rows, label, contains=""):
@@ -341,17 +420,19 @@ def reconcile_corpus(bog, rows, label, contains=""):
 
 
 def replay_corpus_suite(binary, directory):
+    directory.mkdir()
+    replay_apache(binary, directory / "apache")
     try:
         records, rows = load_corpus()
     except Rejected as exc:
         raise InfrastructureError(f"invalid archived corpus: {exc}") from exc
     start, end = min(row.ns for row in rows), max(row.ns for row in rows) + 1
     for replay in (False, True):
-        with run_bog(binary, directory) as bog:
+        with run_bog(binary, directory / "ndjson") as bog:
             if not replay:
                 for index in range(0, len(records), 100):
                     batch = records[index:index + 100]
-                    bog.ingest_body(b"".join(batch), len(batch))
+                    bog.ingest_body(b"\n".join(batch) + b"\n", len(batch))
             label = "archived corpus after restart" if replay else "archived corpus before restart"
             reconcile_corpus(bog, rows, label)
             for literal in ("Traceback (most recent call last):\n", "café", "東京", "🙂",
@@ -374,7 +455,7 @@ def corpus_suite(binary, directory):
     templates = access + [
         "level=ERROR service=orders trace={} café",
         "level=error service=orders trace={} café",
-        'trace={} message="panic"\n\tat app.run()\r\nraw=C:\\logs [a.*] ☃\u2028tail',
+        'trace={} message="panic"\n\tat app.run()\r\nraw=C:\\logs [a.*] ☃\u0085\u2028\u2029tail',
     ]
     rows = [
         Row(rng.randrange(-20, 41), rng.choice(templates).format(i + 1),
@@ -409,6 +490,7 @@ def corpus_suite(binary, directory):
             (-21, 41, "level=ERROR", 7, 0, "case-sensitive filter before limit"),
             (-21, 41, "level=error", 500, 0, "lowercase filter"),
             (-21, 41, "\n\tat", 500, 0, "decoded newline and tab"),
+            (-21, 41, "\u0085\u2028\u2029", 500, 0, "Unicode separators inside NDJSON strings"),
             (-21, 41, "[a.*]", 500, 0, "literal punctuation"),
             (-21, 41, "q=a+b&v=1", 500, 0, "encoded query parameters"),
             (-21, 41, "MISSING-0447", 500, 0, "unmatched filter"),
@@ -537,6 +619,8 @@ def concurrency_suite(binary, directory):
         for batch in make_batches("snapshot", 24, 16)
     ]
     batch_by_row = {row: i for i, batch in enumerate(batches) for row in batch}
+    if sum(map(len, batches)) + 2 >= DEFAULT_QUERY_LIMIT:
+        raise InfrastructureError("snapshot fixtures exceed the query limit")
     end = len(batch_by_row) + 1
     lock = threading.Lock()
     invoked = set()
@@ -644,116 +728,91 @@ def shutdown_suite(binary, directory):
 
 
 def durability_suite(binary, directory):
-    # A response is evidence only if a client actually observed it before losing the connection.
-    recorded = {}
-    previous = []
-    writers = 4
-    rng = random.Random(SEEDS["kill-durability"])
-    delays = [0, rng.uniform(0.0003, 0.002), rng.uniform(0.006, 0.012)]
-    upper = len(delays) * 1000
-    waves = []
+    seed = SEEDS["kill-durability"]
+    rng = random.Random(seed)
+    phases = ["partial-upload", "full-upload", "observed-204"] * 8
+    rng.shuffle(phases)
+    lower = parse_stamp("0001-01-01T00:00:00Z")
+    upper = parse_stamp("9999-12-31T23:59:59.999999999Z")
+    history = []
+    trials = []
     log_dir, _ = PROCESS_LOGS.get()
     ledger = log_dir / "ledger.jsonl"
-    ledger_lock = threading.Lock()
 
-    def record(wave, tag, outcome, rows):
-        event = {"wave": wave + 1, "batch": tag, "outcome": outcome, "rows": len(rows)}
-        with ledger_lock, ledger.open("a") as stream:
-            stream.write(json.dumps(event, sort_keys=True) + "\n")
+    def record(event):
+        wire = json.dumps(event, sort_keys=True)
+        with ledger.open("a") as stream:
+            stream.write(wire + "\n")
             stream.flush()
             os.fsync(stream.fileno())
-            recorded[tag] = (outcome, rows)
+        print("BOG_SIGKILL " + wire, flush=True)
 
-    def reconcile(bog, wave):
-        actual = bog.query(0, upper, limit=1000)
-        counts = Counter(actual)
-        required = []
-        resolved = {}
-        for tag, (outcome, batch) in recorded.items():
-            copies = [counts[row] for row in batch]
-            if outcome == "unknown":
-                check(all(count == 0 for count in copies) or all(count == 1 for count in copies),
-                      f"SIGKILL wave {wave}: {tag} was partial or repeated after an unknown outcome")
-                resolved[tag] = ("recovered" if copies[0] else "absent", batch)
-            else:
-                expected = int(outcome in {"acknowledged", "recovered"})
-                check(all(count == expected for count in copies),
-                      f"SIGKILL wave {wave}: {tag} {outcome} batch expected {expected} copies, got {copies}")
-            if copies[0] == 1:
-                required.extend(batch)
-        expect_rows(actual, sorted(required, key=lambda row: row.ns), f"SIGKILL wave {wave} reconciliation")
-        check(Counter(previous) <= counts, f"SIGKILL wave {wave} lost previously recovered rows")
-        if resolved:
-            outcomes = Counter(outcome for outcome, _ in resolved.values())
-            print(f"SIGKILL replay={wave} unknown_resolved={dict(sorted(outcomes.items()))}")
-            for tag, (outcome, rows) in resolved.items():
-                record(wave - 1, tag, outcome, rows)
+    def probe(bog):
+        # All expected rows fit in one bounded query over the supported time domain.
+        actual = bog.query(lower, upper, limit=MAX_QUERY_LIMIT)
+        check(len(actual) < MAX_QUERY_LIMIT, "SIGKILL reconciliation reached the query limit")
         return actual
 
-    for wave, delay in enumerate(delays):
-        def tag_batch(kind, number, size, padding=0):
-            tag = f"crash/wave-{wave}/{kind}-{number}"
-            rows = [Row(wave * 1000 + number * 32 + i, f"{tag} row={i:02d} " + "x" * padding)
-                    for i in range(size)]
-            return tag, rows
+    for trial, phase in enumerate(phases, 1):
+        tag = f"crash/{seed:04x}/{trial:02}/{phase}"
+        base = trial * 32
+        padding = rng.randrange(256, 4097)
+        row_count = rng.randrange(4, 13)
+        delay = rng.choice((0, 0.0003, 0.001, 0.004))
+        acknowledged = [Row(base, tag + "/pre-ack")]
+        rejected = [Row(base + 1, tag + "/pre-reject")]
+        target = [Row(base + 2 + i, f"{tag}/target/{i:02} " + "x" * padding)
+                  for i in range(row_count)]
+        payload = encode_rows(target)
+        event = {"trial": trial, "phase": phase, "tag": tag, "seed": seed,
+                 "row_count": row_count, "padding": padding, "delay_ms": delay * 1000,
+                 "first_ns": base, "payload_sha256": hashlib.sha256(payload).hexdigest()}
+        record({**event, "event": "plan"})
+        with run_bog(binary, directory) as bog:
+            bog.ingest(acknowledged)
+            record({"trial": trial, "batch": tag + "/pre-ack", "outcome": "acknowledged", "status": 204})
+            status, _ = bog.request("POST", "/ingest", encode_rows(rejected) + b'{"ts":')
+            record({"trial": trial, "batch": tag + "/pre-reject", "outcome": "rejected", "status": status})
+            check(status == 400, f"{tag}/pre-reject: expected HTTP 400, got {status}")
+            history.extend(acknowledged)
+
+            with bog.open_ingest(len(payload), expect_continue=True) as client:
+                uploaded = payload.index(b"\n") + 1 if phase == "partial-upload" else len(payload)
+                client.send(payload[:uploaded])
+                if phase == "partial-upload":
+                    expect_rows(probe(bog), history, f"{tag}: prefix visible before kill")
+                time.sleep(delay)
+                response_ready = bool(select.select([client.sock], [], [], 0)[0])
+                status = None
+                if phase == "observed-204":
+                    with client.getresponse() as response:
+                        status = response.status
+                    check(status == 204, f"{tag}: expected HTTP 204 before SIGKILL, got {status}")
+                bog.kill()
+            outcome = {"partial-upload": "incomplete", "full-upload": "unknown",
+                       "observed-204": "acknowledged"}[phase]
+            record({"trial": trial, "batch": tag + "/target", "outcome": outcome,
+                    "uploaded_bytes": uploaded, "declared_bytes": len(payload),
+                    "socket_readable_before_kill": response_ready, "status": status,
+                    "signal": "SIGKILL"})
 
         with run_bog(binary, directory) as bog:
-            previous = reconcile(bog, wave)
-            tag, rows = tag_batch("ack", 0, 12)
-            bog.ingest(rows)
-            record(wave, tag, "acknowledged", rows)
-            tag, rows = tag_batch("invalid", 1, 3)
-            status, _ = bog.request("POST", "/ingest", encode_rows(rows) + b'{"ts":')
-            check(status == 400, f"{tag}: expected definite HTTP 400 rejection, got {status}")
-            record(wave, tag, "rejected", rows)
-
-            incomplete_tag, incomplete_rows = tag_batch("incomplete", 2, 2)
-            unknown_tag, unknown_rows = tag_batch("unread-response", 3, 16)
-            incomplete = encode_rows(incomplete_rows)
-            unknown = encode_rows(unknown_rows)
-            started = [threading.Event() for _ in range(writers)]
-            finish = threading.Event()
-            padding = [rng.randrange(2048, 32_769) for _ in range(writers)]
-
-            def race(worker):
-                tag, rows = tag_batch("concurrent", worker + 4, 16, padding=padding[worker])
-                payload = encode_rows(rows)
-                try:
-                    with bog.open_ingest(len(payload)) as client:
-                        started[worker].set()
-                        check(finish.wait(HTTP_TIMEOUT), f"{tag}: crash clients did not start together")
-                        client.send(payload)
-                        with client.getresponse() as response:
-                            status = response.status
-                except (OSError, http.client.HTTPException):
-                    record(wave, tag, "unknown", rows)
-                    return
-                check(status in (204, 503), f"{tag}: unexpected HTTP {status}")
-                record(wave, tag, "acknowledged" if status == 204 else "rejected", rows)
-
-            with bog.open_ingest(len(incomplete)) as partial, bog.open_ingest(len(unknown)) as unread:
-                partial.send(encode_rows(incomplete_rows[:1]))
-                unread.send(unknown)
-                record(wave, incomplete_tag, "incomplete", incomplete_rows)
-                record(wave, unknown_tag, "unknown", unknown_rows)
-                with ThreadPoolExecutor(max_workers=writers) as pool:
-                    futures = [pool.submit(race, i) for i in range(writers)]
-                    for event in started:
-                        check(event.wait(HTTP_TIMEOUT), "crash client did not connect")
-                    finish.set()
-                    time.sleep(delay)
-                    bog.kill()
-                    for future in futures:
-                        future.result(timeout=HTTP_TIMEOUT)
-            outcomes = {tag: outcome for tag, (outcome, _) in recorded.items()
-                        if tag.startswith(f"crash/wave-{wave}/")}
-            waves.append({"wave": wave + 1, "delay_ms": delay * 1000, "padding": padding,
-                          "client_outcomes": outcomes})
-            print("BOG_SIGKILL " + json.dumps(waves[-1], sort_keys=True))
-    with run_bog(binary, directory) as bog:
-        reconcile(bog, len(delays))
-    return {"waves": waves, "ledger": str(ledger.relative_to(log_dir.parent)),
-            "final_outcomes": {tag: outcome for tag, (outcome, _) in recorded.items()}}
+            actual = probe(bog)
+            counts = Counter(actual)
+            copies = [counts[row] for row in target]
+            allowed = {"incomplete": [[0] * row_count],
+                       "unknown": [[0] * row_count, [1] * row_count],
+                       "acknowledged": [[1] * row_count]}[outcome]
+            check(copies in allowed, f"{tag}: {outcome} batch recovered with row multiplicities {copies}")
+            check(all(counts[row] == 0 for row in rejected), f"{tag}: rejected batch survived")
+            if copies[0]:
+                history.extend(target)
+            expect_rows(actual, history, f"{tag}: missing, duplicated, phantom, or misordered rows after restart")
+        trials.append({**event, "outcome": outcome, "recovered_rows": sum(copies),
+                       "total_recovered_rows": len(history)})
+        record({**trials[-1], "event": "reconciliation"})
+    return {"trials": trials, "phase_counts": dict(Counter(phases)),
+            "ledger": str(ledger.relative_to(log_dir.parent))}
 
 
 def data_files(store):
@@ -796,7 +855,6 @@ def recovery_suite(binary, directory):
           "the second durable POST did not append to the WAL")
     check(committed["bog.commit"] != earlier["bog.commit"], "the commit marker did not advance")
     suffix = wal[len(old_wal):]
-    check(suffix.endswith(encode_rows(final)), "the appended WAL frame did not preserve the POST body")
 
     resumed = Row(4, "ingest after the uncommitted suffix is discarded")
     for label, suffix_bytes in [
@@ -832,9 +890,10 @@ def recovery_suite(binary, directory):
         try:
             with run_bog(binary, case, ready=False):
                 pass
-            if "bog.wal" in files:
-                check((case / "bog.wal").is_file() and (case / "bog.wal").read_bytes() == files["bog.wal"],
-                      f"{label}: refused store's WAL was modified")
+            for name in committed:
+                path = case / name
+                observed = path.read_bytes() if path.exists() else None
+                check(observed == files.get(name), f"{label}: refused startup changed {name}")
         except Rejected as exc:
             refusals.append(str(exc))
     check(not refusals, ", ".join(refusals))
@@ -846,6 +905,8 @@ def free_bytes(path):
 
 
 def bounded_mount():
+    if sys.platform != "linux" or os.geteuid() == 0:
+        raise InfrastructureError("ENOSPC suites require an unprivileged Linux process")
     supplied = os.environ.get("SLIPWAY_PARAM_ENOSPC_MOUNT")
     mount = Path(supplied or "/dev/shm").resolve()
     mountinfo = Path("/proc/self/mountinfo")
@@ -861,18 +922,16 @@ def bounded_mount():
             if (1024**2 <= capacity <= 128 * 1024**2 and free_bytes(mount) >= capacity * 0.9
                     and os.access(mount, os.W_OK | os.X_OK)):
                 return mount, capacity
-    reason = f"{mount} is not a writable, mostly empty, private 1–128 MiB mount"
-    if supplied:
-        raise InfrastructureError(f"ENOSPC mount configured by the runner is unusable: {reason}")
-    return None, reason
+    raise InfrastructureError(f"ENOSPC requires {mount} to be a writable, mostly empty, private 1–128 MiB mount")
 
 
-def constrain_append(filler, capacity, payload_size):
+def fill_blocks(filler, capacity):
     with filler.open("wb", buffering=0) as stream:
         chunk = bytes(1024 * 1024)
         try:
             while stream.tell() <= capacity:
-                stream.write(chunk)
+                if not stream.write(chunk):
+                    raise InfrastructureError("filler write made no progress")
         except OSError as exc:
             if exc.errno != errno.ENOSPC:
                 raise
@@ -881,8 +940,14 @@ def constrain_append(filler, capacity, payload_size):
                   f"capacity_bytes={capacity} allocated_bytes={allocated}")
         else:
             raise InfrastructureError("bounded filesystem did not return kernel ENOSPC")
-        # Leave space for the header and some payload pages before the append hits ENOSPC.
-        stream.truncate(allocated - 64 * 1024)
+        os.fsync(stream.fileno())
+    return allocated
+
+
+def constrain_append(filler, capacity, payload_size):
+    allocated = fill_blocks(filler, capacity)
+    # Leave space for the header and some payload pages before the append hits ENOSPC.
+    os.truncate(filler, allocated - 64 * 1024)
     available = free_bytes(filler.parent)
     if not 0 < available < payload_size:
         raise InfrastructureError(f"cannot constrain WAL append: available_bytes={available}, "
@@ -892,10 +957,6 @@ def constrain_append(filler, capacity, payload_size):
 
 def enospc_suite(binary, directory):
     mount, capacity = bounded_mount()
-    if mount is None:
-        if os.environ.get("SLIPWAY_PARAM_MODE") == "post-cycle":
-            raise InfrastructureError(f"post-cycle ENOSPC check is required: {capacity}")
-        return {"available": False, "reason": capacity}
     print(f"ENOSPC available=true mount={mount} capacity_bytes={capacity}")
     history = [Row(1, "ENOSPC acknowledged history/1"), Row(2, "ENOSPC acknowledged history/2")]
     interrupted = [Row(3 + i, f"ENOSPC failed row {i}: " + "x" * 16_384) for i in range(32)]
@@ -923,6 +984,81 @@ def enospc_suite(binary, directory):
         with run_bog(binary, store) as bog:
             expect_rows(bog.query(0, 41), history + resumed, "ENOSPC new durable write after second restart")
     return {"available": True, "capacity_bytes": capacity, "kernel_errno": errno.ENOSPC}
+
+
+def require_full_blocks(path):
+    stats = os.statvfs(path)
+    if stats.f_bavail != 0 or stats.f_favail <= 0:
+        raise InfrastructureError(f"expected zero allocatable blocks and free inodes at {path}: "
+                                  f"blocks={stats.f_bavail}, inodes={stats.f_favail}")
+    return stats
+
+
+def probe_full_disk(probe):
+    stats = require_full_blocks(probe.parent)
+    with probe.open("xb", buffering=0) as stream:
+        try:
+            stream.write(bytes(stats.f_frsize))
+        except OSError as exc:
+            if exc.errno != errno.ENOSPC:
+                raise
+        else:
+            raise InfrastructureError("fresh inode accepted an allocating write on the full filesystem")
+    probe.unlink()
+    return require_full_blocks(probe.parent)
+
+
+def full_disk_restart_suite(binary, directory):
+    mount, capacity = bounded_mount()
+    history = [Row(2, "full-disk acknowledged first"), Row(1, "full-disk acknowledged late")]
+    resumed = Row(3, "full-disk durable append after space was released")
+    with tempfile.TemporaryDirectory(prefix="bog-full-restart-", dir=mount) as tmp:
+        root = Path(tmp)
+        store = root / "store"
+        with run_bog(binary, store) as bog:
+            bog.ingest(history)
+            bog.kill()
+        prior = data_files(store)
+        marker = store / "bog.commit"
+        filler = root / "filler"
+
+        # Keep the original inode alive so an unlink and replacement cannot reuse its number.
+        with marker.open("rb") as saved_marker:
+            identity = os.fstat(saved_marker.fileno())
+            allocated = fill_blocks(filler, capacity)
+            stats = probe_full_disk(root / "allocation-probe")
+            evidence = {
+                "mount": str(mount), "capacity_bytes": capacity, "filler_bytes": allocated,
+                "uid": os.geteuid(), "allocatable_blocks": stats.f_bavail, "free_inodes": stats.f_favail,
+                "kernel_errno": errno.ENOSPC, "marker_inode_before": identity.st_ino,
+                "marker_sha256_before": hashlib.sha256(prior["bog.commit"]).hexdigest(),
+            }
+            print("BOG_FULL_DISK " + json.dumps(evidence, sort_keys=True))
+
+            def verify_preserved_files():
+                check(data_files(store) == prior, "full-disk restart changed the acknowledged WAL or marker bytes")
+                current = marker.stat()
+                check((current.st_dev, current.st_ino) == (identity.st_dev, identity.st_ino),
+                      f"full-disk restart replaced bog.commit inode {identity.st_ino} with {current.st_ino}")
+                require_full_blocks(store)
+                return current.st_ino
+
+            with run_bog(binary, store) as bog:
+                expect_query(bog, history, 0, 4, label="acknowledged data reopened at zero allocatable blocks")
+                verify_preserved_files()
+                bog.stop()
+            evidence["marker_inode_after"] = verify_preserved_files()
+            evidence["marker_bytes_preserved"] = True
+
+        filler.unlink()
+        if free_bytes(store) == 0:
+            raise InfrastructureError("failed to release space on the bounded filesystem")
+        with run_bog(binary, store) as bog:
+            bog.ingest([resumed])
+            bog.kill()
+        with run_bog(binary, store) as bog:
+            expect_query(bog, history + [resumed], 0, 4, label="append after disk space was freed survives restart")
+    return evidence
 
 
 def milliseconds(seconds):
@@ -1031,6 +1167,7 @@ SUITES = (
     ("kill-durability", durability_suite),
     ("wal-recovery", recovery_suite),
     ("enospc-recovery", enospc_suite),
+    ("full-disk-restart", full_disk_restart_suite),
     ("performance-smoke", performance_suite),
 )
 REQUIRED_SUITES = (
@@ -1043,6 +1180,7 @@ REQUIRED_SUITES = (
     "kill-durability",
     "wal-recovery",
     "enospc-recovery",
+    "full-disk-restart",
     "performance-smoke",
 )
 
@@ -1093,7 +1231,7 @@ def log_tail(path, size):
 def new_result(requested_sha, tested_sha):
     return {
         "schema_version": 1, "requested_sha": requested_sha, "tested_sha": tested_sha,
-        "corpus_sha256": CORPUS_SHA256, "seeds": SEEDS,
+        "corpus_sha256": CORPUS_SHA256, "apache_fixture_sha256": APACHE_SHA256, "seeds": SEEDS,
         "run_name": os.environ.get("SLIPWAY_RUN_NAME"), "run_uid": os.environ.get("SLIPWAY_RUN_UID"),
         "step": os.environ.get("SLIPWAY_STEP_NAME"),
         "image_digest": os.environ.get("BOG_VERIFIER_IMAGE_DIGEST"),
@@ -1185,8 +1323,7 @@ def main(source, work, sha):
             metrics = run(binary, work / stage)
             if metrics is not None:
                 suite["metrics"] = metrics
-            unavailable = stage == "enospc-recovery" and metrics is not None and not metrics["available"]
-            if not unavailable and not any(case.get("ready_ms") is not None for case in suite["processes"]):
+            if not any(case.get("ready_ms") is not None for case in suite["processes"]):
                 raise InfrastructureError("required suite ran without a ready Bog subprocess")
         except (Rejected, subprocess.TimeoutExpired, threading.BrokenBarrierError,
                 ConnectionError, TimeoutError, http.client.HTTPException) as exc:
@@ -1201,18 +1338,15 @@ def main(source, work, sha):
             errors.append(stage)
         else:
             completed.append(stage)
-            suite["status"] = "unavailable" if unavailable else "passed"
-            detail = f" ({metrics['reason']})" if unavailable else ""
-            print(f"{suite['status'].upper()} {stage} seconds={time.monotonic() - started:.3f}{detail}")
+            suite["status"] = "passed"
+            print(f"PASS {stage} seconds={time.monotonic() - started:.3f}")
         finally:
             PROCESS_LOGS.reset(token)
             suite["elapsed_ms"] = milliseconds(time.monotonic() - started)
             checkpoint()
 
-    skipped = [suite["name"] for suite in result["suites"] if suite["status"] == "unavailable"]
     print(f"candidate_sha={sha} binary_sha256={digest} "
-          f"suites_passed={len(completed) - len(skipped)}/{len(REQUIRED_SUITES)} "
-          f"suites_unavailable={len(skipped)} "
+          f"suites_passed={len(completed)}/{len(REQUIRED_SUITES)} "
           f"suites_rejected={len(rejected)} suites_infra_error={len(errors)}")
     if errors:
         finish("infra_error", f"required suites with infrastructure errors: {', '.join(errors)}")
@@ -1221,13 +1355,13 @@ def main(source, work, sha):
         stage, reason = rejected[0]
         failed = ", ".join(name for name, _ in rejected)
         finish("rejected", f"{stage}: {reason} (failed: {failed})")
-        return reject(work, sha, stage, len(completed) - len(skipped), f"{reason} (failed: {failed})")
+        return reject(work, sha, stage, len(completed), f"{reason} (failed: {failed})")
     if tuple(completed) != REQUIRED_SUITES:
         finish("infra_error", "required suite execution did not complete")
         return 2
     finish("passed")
-    (work / "passed").write_text(f"{sha} {digest} {len(completed) - len(skipped)}\n")
-    print(f"verified_sha={sha} binary_sha256={digest} suites={len(completed) - len(skipped)}")
+    (work / "passed").write_text(f"{sha} {digest} {len(completed)}\n")
+    print(f"verified_sha={sha} binary_sha256={digest} suites={len(completed)}")
     return 0
 
 
