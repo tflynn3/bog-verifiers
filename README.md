@@ -1,7 +1,7 @@
 # bog-verifiers
 
-The default PR gate exercises the public contract verified on Bog
-`cbe3b9ef20527f11142de6df509211ce801645cd`. The verifier fetches the requested
+The Cycle 7 PR gate uses Bog `be7f937a1025a57166d15888727012ed4989a6b4` as
+its reference. The verifier fetches the requested
 branch, checks out the exact commit, and builds `./cmd/bog` with Go 1.27 on Linux.
 It launches Bog in a private data directory on a local filesystem and drives
 its HTTP API from a separate process. Recovery checks use stopped copies of
@@ -13,15 +13,17 @@ the documented WAL and commit marker.
   `SLIPWAY_CANDIDATE_COMMIT`. The fetched branch tip must match the full SHA.
   Standalone runs can set `SLIPWAY_PARAM_MODE=smoke` and supply
   `SLIPWAY_PARAM_BRANCH`, `SLIPWAY_PARAM_COMMIT`, and optionally
-  `SLIPWAY_PARAM_REPOSITORY`.
+  `SLIPWAY_PARAM_REPOSITORY`. Run the same entrypoint on the baseline and
+  each PR head. The fetched history must contain the Cycle 7 reference for
+  the paired smoke and WAL handoffs.
 - With the same candidate inputs, use `--full`, `--compare`, or
   `SLIPWAY_PARAM_MODE=full` or `compare` for the paired post-cycle matrix and
   WAL handoffs against `4ff49aae9672cf5aec8e3fbd20ffe0a84ae15bc0`.
   Both revisions must be present in the fetched history and build before the
   suites start. A missing or unbuildable candidate fails at checkout or build.
   A missing or unbuildable pinned baseline is an infrastructure error.
-- `SLIPWAY_PARAM_MODE=post-cycle` also gates log replay performance in pairs
-  against `cbe3b9ef20527f11142de6df509211ce801645cd`. For a standalone step,
+- `SLIPWAY_PARAM_MODE=post-cycle` also gates controlled log replay performance
+  against `be7f937` and the pre-Bloom reference `4ff49aa`. For a standalone step,
   use `SLIPWAY_INPUT_TESTEDCOMMIT` to select an exact commit reachable from
   `main`. Set `SLIPWAY_PARAM_REPOSITORY` to override the default Slipway remote.
 - `--legacy` or `SLIPWAY_PARAM_MODE=legacy` checks the pinned Cycle 1 build
@@ -72,19 +74,27 @@ the documented WAL and commit marker.
   with file preservation. The default gate also covers exclusive directory
   locking and concurrent ENOSPC rejections.
 - The Linux log replay builds 65,573 rows per run from seeded selections of
-  the Apache, Git daemon, and multiline application fixtures. It posts the
-  same corpus in steady timestamp order and in shuffled append order on
-  separate stores. Serial acknowledgments establish append order for the
-  independent oracle, which compares exact rows and duplicate multiplicity.
-  Wide queries cover dense, rare, absent, Unicode, and short literals. Narrow
-  queries split timestamp ties across pages and match embedded newlines.
-  Dedicated probes hit the first block, the final 37-row partial block, and
-  the end of a 96 KiB line.
-- Dense and rare cursors start before a 91-row backfill that seals the partial
-  block. Active walks must return their original rows in order. Fresh paged
-  and unpaged queries must include the backfill. After SIGKILL and restart,
-  fresh walks must reproduce the acknowledged data and old cursors must
-  return HTTP 400.
+  captured Apache access, Git daemon, and multiline application logs, and
+  authored syslog messages. It uses fresh stores for steady and shuffled
+  append orders. Serial acknowledgments establish the append order for the
+  stable timestamp sort in the independent oracle. Ordinary queries and
+  complete cursor walks compare exact rows, including duplicates and ties.
+- An 8,192-row dense prefix precedes long stretches with one dense-literal
+  match per 8,192 rows. The replay also checks rare and absent literals,
+  four-byte grams that occur on distinct rows of one sealed block, Unicode
+  in composed and decomposed forms, quotes, backslashes, and control
+  characters. Dedicated queries hit the first sealed block, the final
+  37-row partial block, and the end of a 96 KiB line in an over-budget block.
+- Dense and rare walks start before an early and tied backfill. Each walk
+  continues after the first acknowledged POST and finishes after a second
+  POST seals the partial block. Fresh ordinary and paged queries include
+  the backfill. After SIGKILL and restart the verifier checks the same data,
+  requires HTTP 400 for old cursors, and tests a second restart after
+  appending a near-4 MiB frame followed by a small backfill.
+- The PR gate opens each revision's WAL with the other, verifies the
+  committed files, appends using the receiver, and reopens the extended
+  WAL with the original writer. The oracle checks both ordinary queries
+  and complete walks at every step.
 
 ## Timing and compatibility
 
@@ -94,10 +104,13 @@ durable requests and rows per second, POST latency, narrow and wide query
 latency, peak RSS, and restart-to-health time. Timing measurements carry
 no PR verdict thresholds.
 
-The log replay also records dense, rare, and absent HTTP query latency
-before and after restart, durable serial ingest throughput, Linux peak RSS,
-and restart-to-health time for both orders. Each query category uses 36
-measured requests per phase. Latency includes receiving the response body.
+The paired log replay smoke runs one pair per append order on identical
+HTTP bodies, with the baseline first for steady and the candidate first for
+shuffled. Each side records 36 raw HTTP latency samples per dense, rare,
+and absent query category before and after restart, all timed POSTs,
+durable ingest throughput, Linux peak RSS, and restart-to-health time.
+Query latency includes receiving the response body. The PR gate checks
+correctness and sample completeness.
 
 Full mode also checks SIGTERM draining and reopening acknowledged data at
 zero allocatable blocks. It runs 12 alternating-order pairs on one Linux
@@ -112,21 +125,26 @@ eight concurrent small batches in each direction, and reopens the result
 with the original writer. The handoffs verify the original WAL prefix and
 the complete query results at each step.
 
-Post-cycle QA adds eight log replay pairs on the same Linux host and
-filesystem. Each append order uses two seeds, with one baseline-first and
-one candidate-first pair per seed. Each pair uses fresh stores and identical
-HTTP bodies, and each side runs the PR correctness assertions. The median
-candidate-to-baseline ratio across the four pairs must meet each limit for
-each append order. Query limits apply independently before and after restart.
+Post-cycle QA runs 56 SIGKILL trials. It also runs six alternating-order
+performance pairs per workload and reference on the same Linux host and
+local filesystem with the same Go version and resource limits. Each side
+ingests one million rows across four connections, with 500 rows per POST.
+Timestamp ties are contained within a POST. Complete cursor walks reconcile
+every row before and after restart. Query timings include ordinary requests
+and cursor continuations, with first-page timings for the absent literal.
+A fixed-cadence control measures steady dense queries after restart.
+The median candidate-to-reference ratio across the six pairs must meet
+each applicable limit for each append order and phase.
 
-| Metric | Target |
-| --- | --- |
-| Dense query p95 | ≤ 1.25 |
-| Rare query p95 | ≤ 1.50 |
-| Absent query p95 | ≤ 1.50 |
-| Durable ingest rows per second | ≥ 0.80 |
-| Peak RSS | ≤ 1.25 |
-| Restart-to-health | ≤ 1.25 |
+| Reference | Metric | Target |
+| --- | --- | --- |
+| `be7f937` | Each query p95 and durable POST p99 | ≤ 1.15 |
+| `be7f937` | Durable rows per second | ≥ 0.90 |
+| `be7f937` | Ingest and WAL replay peak RSS | ≤ 1.05 |
+| `be7f937` | Steady restart-to-health | ≤ 0.95 |
+| `be7f937` | Shuffled restart-to-health | ≤ 1.05 |
+| `4ff49aa` | Steady dense query p95 after restart | ≤ 1.15 |
+| `4ff49aa` | Rare and absent query p95 | ≤ 0.25 |
 
 The historical indexed comparison retains its 48 planned pairs, with
 1,000,000 rows per run in 500-row POSTs and the Cycle 1 baseline. Its median
@@ -145,10 +163,12 @@ candidate-to-baseline targets are:
 SHA when configured, binary and fixture digests, seeds, suite outcomes, and
 timings. `BOG_BUILD`, `BOG_PROCESS`, `BOG_SIGKILL`,
 `BOG_FULL_DISK`, `BOG_PERFORMANCE_PAIR`, and `BOG_LOG_REPLAY_PAIR` provide
-detailed evidence.
+detailed evidence. `BOG_LOG_REPLAY_SAMPLE` publishes raw samples in each
+PR's run log. The paired replay suite also writes its samples and ratios
+to `pairs.jsonl`.
 Set `SLIPWAY_PARAM_ARTIFACT_DIR` to a writable directory to retain
 `result.json`, process logs, the crash ledger, and per-pair samples. The
-Small-batch POST metrics use all requests for percentiles and retain up to 128
+small-batch POST metrics use all requests for percentiles and retain up to 128
 raw samples per run. Match a Slipway report to its WorkflowRun UID, step, and
 image digest. Standalone runs can set `BOG_VERIFIER_IMAGE_DIGEST`.
 
@@ -164,7 +184,7 @@ git -C ../bog bundle create "$qa_dir/bog.bundle" refs/heads/main
 container=$(docker create \
   -e SLIPWAY_REPOSITORY=/tmp/bog.bundle \
   -e SLIPWAY_CANDIDATE_BRANCH=main \
-  -e SLIPWAY_CANDIDATE_COMMIT=cbe3b9ef20527f11142de6df509211ce801645cd \
+  -e SLIPWAY_CANDIDATE_COMMIT=be7f937a1025a57166d15888727012ed4989a6b4 \
   bog-verifier)
 docker cp "$qa_dir/bog.bundle" "$container:/tmp/bog.bundle"
 docker start -a "$container"

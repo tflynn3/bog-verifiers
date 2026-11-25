@@ -87,9 +87,8 @@ class GateTest(unittest.TestCase):
                 if profile != "pr":
                     self.assertEqual(report["baseline_sha"], verify.COMPARISON_BASELINE_SHA)
                     self.assertEqual(report["baseline_build"]["status"], "blocked")
-                if profile == "post-cycle":
-                    self.assertEqual(report["log_replay_baseline_build"],
-                                     {"sha": verify.POST_CYCLE_BASELINE_SHA, "status": "blocked"})
+                self.assertEqual(report["cycle7_baseline_build"],
+                                 {"sha": verify.CYCLE7_BASELINE_SHA, "status": "blocked"})
                 self.assertIn("snapshot-pagination", {suite["name"] for suite in report["suites"]})
                 self.assertTrue(all(suite["status"] == "blocked" for suite in report["suites"]))
 
@@ -99,17 +98,19 @@ class GateTest(unittest.TestCase):
             return result["baseline_sha"], [suite["name"] for suite in result["suites"]]
 
         baseline, default = plan("pr")
-        self.assertIsNone(baseline)
-        self.assertEqual(default, list(verify.REQUIRED_SUITES))
+        self.assertEqual(baseline, verify.CYCLE7_BASELINE_SHA)
+        core = list(verify.REQUIRED_SUITES)
+        cycle7 = ["cycle7-wal-handoff", "log-replay-paired-smoke"]
+        self.assertEqual(default, core + cycle7)
         extended = ["graceful-shutdown", "full-disk-restart", "wal-handoff"]
         self.assertEqual(plan("full"), (verify.COMPARISON_BASELINE_SHA,
-                                       default + extended + ["small-batch-performance"]))
+                                       core + extended + ["small-batch-performance"] + cycle7))
         self.assertIn("log-replay", default)
         full_baseline, full_suites = plan("full")
         self.assertEqual(plan("post-cycle"), (full_baseline, full_suites + ["log-replay-performance"]))
-        self.assertEqual(plan("indexed"), (verify.BASELINE_SHA, default + extended + ["indexed-performance"]))
+        self.assertEqual(plan("indexed"), (verify.BASELINE_SHA, core + extended + ["indexed-performance"]))
         self.assertEqual(plan("legacy"), (verify.BASELINE_SHA,
-                                          [name for name in default
+                                          [name for name in core
                                            if name not in ("snapshot-pagination", "log-replay")]))
 
     def test_timing_sample_cap_preserves_quantiles_from_all_requests(self):
@@ -158,23 +159,46 @@ class GateTest(unittest.TestCase):
             verify.indexed_targets([pair] * (count - 1))
 
     def test_log_replay_gates_each_metric_on_paired_medians(self):
-        count = len(verify.LOG_REPLAY_SEEDS) * verify.LOG_REPLAY_REPEATS
-        pair = {
-            "dense_query_p95/live": 1.25, "dense_query_p95/restart": 1.0,
-            "rare_query_p95/live": 1.51, "rare_query_p95/restart": 1.50,
-            "absent_query_p95/live": 1.50, "absent_query_p95/restart": 1.51,
-            "durable_rows_per_second": 0.79, "peak_rss_kib": 1.25, "restart_ready_ms": 1.26,
-        }
+        count = len(verify.LOG_REPLAY_SEEDS) * verify.CONTROLLED_REPLAY_REPEATS
+        pair = {f"{name}/{phase}": 1.15 for name in verify.LOG_QUERY_METRICS for phase in ("live", "restart")}
+        pair.update({"rare_query_p95/live": 1.16, "absent_page_p95/restart": 1.16, "post_p99": 1.15,
+                     "durable_rows_per_second": 0.89, "ingest_peak_rss_kib": 1.05, "replay_peak_rss_kib": 1.06,
+                     "restart_ready_ms": 1.05, "fixed_dense_query_p95/restart": 1.15})
         outlier = {**pair, "dense_query_p95/live": 20, "rare_query_p95/live": 0.01}
-        targets = verify.log_replay_targets([pair] * (count - 1) + [outlier])
+        targets = verify.log_replay_targets([pair] * (count - 1) + [outlier], "steady", verify.CYCLE7_BASELINE_SHA)
         self.assertEqual({key for key, target in targets.items() if not target["passed"]},
-                         {"rare_query_p95/live", "absent_query_p95/restart",
-                          "durable_rows_per_second", "restart_ready_ms"})
+                         {"rare_query_p95/live", "absent_page_p95/restart",
+                          "durable_rows_per_second", "restart_ready_ms", "replay_peak_rss_kib"})
+        shuffled = {key: value for key, value in pair.items() if key != "fixed_dense_query_p95/restart"}
+        targets = verify.log_replay_targets([shuffled] * count, "shuffled", verify.CYCLE7_BASELINE_SHA)
+        self.assertTrue(targets["restart_ready_ms"]["passed"])
+        pre_bloom = verify.log_replay_targets([pair] * count, "steady", verify.COMPARISON_BASELINE_SHA)
+        self.assertEqual(pre_bloom["absent_page_p95/restart"]["target"], 0.25)
+        self.assertEqual(pre_bloom["dense_query_p95/restart"]["target"], 1.15)
         with self.assertRaisesRegex(verify.InfrastructureError, "every configured pair and measurement"):
-            verify.log_replay_targets([pair] * (count - 1))
+            verify.log_replay_targets([pair] * (count - 1), "steady", verify.CYCLE7_BASELINE_SHA)
         missing = {key: value for key, value in pair.items() if key != "rare_query_p95/live"}
         with self.assertRaisesRegex(verify.InfrastructureError, "every configured pair and measurement"):
-            verify.log_replay_targets([pair] * (count - 1) + [missing])
+            verify.log_replay_targets([pair] * (count - 1) + [missing], "steady", verify.CYCLE7_BASELINE_SHA)
+
+    def test_log_replay_exercises_dense_and_sparse_ranges_and_block_edges(self):
+        sources = verify.log_replay_sources()
+        self.assertEqual([line.encode() for line in sources[-1]], verify.SYSLOG_PATH.read_bytes().splitlines())
+        for order in verify.LOG_REPLAY_ORDERS:
+            with self.subTest(order=order):
+                replay = verify.LogReplay(sources, verify.LOG_REPLAY_SEEDS[0], order)
+                cases = {name: rows for name, _, rows in replay.queries(replay.rows)}
+                self.assertEqual(len(cases["dense"]) - len(cases["sparse-after-prefix"]),
+                                 verify.LOG_DENSE_PREFIX_ROWS)
+                self.assertTrue(0 < len(cases["sparse-after-prefix"]) < 10)
+                for case in ("escaped-text", "unicode", "decomposed-unicode", "large-line", "final-partial-block"):
+                    self.assertEqual(len(cases[case]), 1)
+                self.assertFalse(cases["split-grams"])
+                self.assertFalse(cases["absent"])
+                self.assertEqual(len(cases["ties-across-posts"]), 4)
+                self.assertEqual(replay.rows[-1], cases["final-partial-block"][0])
+                self.assertGreater(len(cases["large-line"][0].line.encode()), verify.LOG_BLOCK_TEXT_BUDGET)
+                self.assertEqual((len(replay.rows) + len(replay.backfill)) % verify.LOG_BLOCK_ROWS, 0)
 
     def test_historical_wal_fixture_uses_castagnoli_crc_and_little_endian_marker(self):
         self.assertEqual(verify.crc32c(b"123456789"), 0xe3069283)
@@ -227,7 +251,8 @@ class GateTest(unittest.TestCase):
             root = Path(directory)
             source, work = buildable_candidate(root)
             with patch.object(verify, "bounded_mount", return_value=(root, 64 * 1024**2)), \
-                 patch.object(verify.sys, "platform", "linux"):
+                 patch.object(verify.sys, "platform", "linux"), \
+                 patch.object(verify, "build_baseline", return_value=work / "bog"):
                 self.assertEqual(verify.main(source, work, "0" * 40), 1)
             self.assertIn("Bog exited during startup (status 0)", (work / "rejection").read_text())
             self.assertFalse((work / "passed").exists())
@@ -243,7 +268,8 @@ class GateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             source, work = buildable_candidate(Path(directory))
             suites = tuple((name, lambda *_: None) for name in verify.REQUIRED_SUITES)
-            with patch.object(verify, "SUITES", suites):
+            with patch.object(verify, "SUITES", suites), \
+                 patch.object(verify, "build_baseline", return_value=work / "bog"):
                 self.assertEqual(verify.main(source, work, "0" * 40), 2)
             report = json.loads((work / "artifacts/result.json").read_text())
             self.assertEqual(report["suites"][0]["diagnostic"], "required suite ran without a ready Bog subprocess")

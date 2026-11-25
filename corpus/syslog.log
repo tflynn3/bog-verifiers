@@ -1,0 +1,12 @@
+<34>1 2025-03-14T12:00:00.001Z edge-01 sshd 2104 auth - Failed publickey for qa-user from 192.0.2.17 port 41230 ssh2
+<38>1 2025-03-14T12:00:00.020Z edge-01 sshd 2108 auth - Accepted publickey for qa-user from 192.0.2.17 port 41234 ssh2
+<30>1 2025-03-14T12:00:01.190Z edge-01 systemd 1 unit - Started Log Replay Worker.
+<29>1 2025-03-14T12:00:01.192Z edge-01 systemd 1 unit - log-replay.service: Deactivated successfully.
+<11>1 2025-03-14T12:00:02.005Z queue-02 relay 728 send [retry@32473 count="1" route="audit"] Upstream timed out; retry scheduled in 250 ms
+<14>1 2025-03-14T12:00:02.254Z queue-02 relay 728 send [retry@32473 count="1" route="audit"] Delivery resumed; queue depth 13
+<13>1 2025-03-14T12:00:03.212Z edge-01 chronyd 533 clock - Selected source 198.51.100.10
+<12>1 2025-03-14T12:00:04.122Z store-03 kernel - io - blk_update_request: I/O error, dev vdb, sector 96
+<14>1 2025-03-14T12:00:04.180Z store-03 backup 3187 run - Checkpoint reached at /srv/logs/current
+<14>1 2025-03-14T12:00:05.000Z edge-01 cron 4301 job - (qa-user) CMD (/usr/local/bin/rotate-qa-logs)
+<13>1 2025-03-14T12:00:05.045Z edge-01 networkd 809 link - eth1: Gained carrier
+<12>1 2025-03-14T12:00:06.739Z queue-02 relay 728 config [cfg@32473 path="C:\\logs\\queue" team="qa\]ops"] Retaining last valid configuration
