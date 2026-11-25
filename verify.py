@@ -39,6 +39,7 @@ WAL_MAGIC = b"BOGWAL01"
 COMMIT_MAGIC = b"BOGCMT01"
 BASELINE_SHA = "25d0c0acc103bd73f0552a8f10240c8d8c1d023d"
 COMPARISON_BASELINE_SHA = "4ff49aae9672cf5aec8e3fbd20ffe0a84ae15bc0"
+POST_CYCLE_BASELINE_SHA = "cbe3b9ef20527f11142de6df509211ce801645cd"
 NEXT_CURSOR = "Bog-Next-Cursor"
 MAX_FRAME = 4 * 1024 * 1024
 DEFAULT_QUERY_LIMIT = 500
@@ -57,6 +58,7 @@ GIT_DAEMON_SHA256 = "8dcd8aba73ae74db1bc3adb9c32b2a06feee7aa92386ec61005b0d3dd3c
 SEEDS = {
     "query-oracle": 0xB061, "kill-durability": 0xB067, "performance-smoke": 0xB070,
     "apache-replay": 0xB091, "snapshot-pagination": 0xB102, "git-daemon-replay": 0xB119,
+    "log-replay": 0xB120,
 }
 PROCESS_LOGS = contextvars.ContextVar("process_logs")
 
@@ -1669,6 +1671,269 @@ def performance_suite(binary, directory):
     return measure_benchmark(binary, directory / "store", workload, reconcile=True, keep_alive=True)
 
 
+LOG_BLOCK_ROWS = 128  # Documented append block size, used to place fixture rows.
+LOG_REPLAY_ROWS = 65_536 + 37
+LOG_REPLAY_BATCH_ROWS = 317
+LOG_REPLAY_ORDERS = ("steady", "shuffled")
+LOG_REPLAY_SEEDS = (SEEDS["log-replay"], SEEDS["log-replay"] + 1)
+LOG_REPLAY_REPEATS = 2
+LOG_DENSE = " env=production"
+LOG_RARE = " trace=7dbf-before-retry"
+LOG_ABSENT = " trace=7DBF-before-retry"
+LOG_UNICODE = "café_東京_🙂"
+LOG_DECOMPOSED = "cafe\u0301_東京_🙂"
+
+
+def log_replay_sources():
+    _, archive = load_corpus()
+    return (
+        [row.line for row in load_apache()],
+        [row.line for row in load_git_daemon()],
+        [row.line for row in archive if row.line.startswith("id=app-") and "\nTraceback" in row.line],
+    )
+
+
+class LogReplay:
+    """Offline input and exact results for a serial HTTP replay."""
+
+    def __init__(self, sources, seed, order):
+        self.seed = seed
+        self.order = order
+        rng = random.Random(seed)
+        rows = [Row(i // 4 * SECOND, LOG_DENSE + f" seq={i:05} " + rng.choice(sources[i % len(sources)]))
+                for i in range(LOG_REPLAY_ROWS)]
+        for i in range(0, len(rows), 8191):
+            rows[i] = Row(rows[i].ns, rows[i].line + LOG_RARE)
+        rows[0] = Row(rows[0].ns, rows[0].line + " block=first")
+        rows[-1] = Row(rows[-1].ns, rows[-1].line + LOG_RARE + " block=tail")
+        rows[17] = rows[16]  # Exact duplicate followed by distinct rows at the same timestamp.
+        rows[30] = Row(rows[30].ns, rows[30].line + f" Qz={LOG_UNICODE}")
+        rows[31] = Row(rows[31].ns, rows[31].line + f" Qz={LOG_DECOMPOSED}")
+        rows[LOG_REPLAY_ROWS // 2] = Row(
+            rows[LOG_REPLAY_ROWS // 2].ns,
+            LOG_DENSE + " level=ERROR " + "x" * (96 * 1024) + "\ncontinuation:large-log-end",
+        )
+        self.end = rows[-1].ns + 2 * SECOND
+        if order == "shuffled":
+            # Keep the first-block and final-tail probes in place in either order.
+            middle = rows[1:-1]
+            rng.shuffle(middle)
+            rows[1:-1] = middle
+        self.rows = rows
+        self.batches = []
+        digest = hashlib.sha256()
+        for start in range(0, len(rows), LOG_REPLAY_BATCH_ROWS):
+            batch = rows[start:start + LOG_REPLAY_BATCH_ROWS]
+            body = encode_rows(batch)
+            self.batches.append((body, len(batch)))
+            digest.update(body)
+        self.append_sha256 = digest.hexdigest()
+        self.append_bytes = sum(len(body) for body, _ in self.batches)
+        # The old partial block seals on this acknowledged append. Early rows
+        # backfill, and later rows tie with the last old row or extend beyond it.
+        tail = len(rows) % LOG_BLOCK_ROWS
+        self.backfill = [
+            Row(SECOND if i % 3 == 0 else rows[-1].ns + (i % 3 - 1) * SECOND,
+                LOG_DENSE + (LOG_RARE if i < 3 else "") + f" retroactive-retry={i:02}")
+            for i in range(LOG_BLOCK_ROWS - tail)
+        ]
+        self.backfill_body = encode_rows(self.backfill)
+        self.backfill_sha256 = hashlib.sha256(self.backfill_body).hexdigest()
+
+    def queries(self, rows):
+        cases = [
+            ("dense", 0, self.end, LOG_DENSE),
+            ("rare", 0, self.end, LOG_RARE),
+            ("absent", 0, self.end, LOG_ABSENT),
+            ("first-block", 0, self.end, "block=first"),
+            ("final-partial-block", 0, self.end, "block=tail"),
+            ("large-line", 0, self.end, "\ncontinuation:large-log-end"),
+            ("unicode", 0, self.end, LOG_UNICODE),
+            ("decomposed-unicode", 0, self.end, LOG_DECOMPOSED),
+            ("short-literal", 0, self.end, "Qz"),
+            ("ties-at-narrow-boundary", 4 * SECOND, 4 * SECOND + 1, ""),
+            ("narrow-multiline", 4 * SECOND, 9 * SECOND, "\nTraceback"),
+            ("empty-window", 4 * SECOND, 4 * SECOND, LOG_DENSE),
+        ]
+        return [(name, query_args(left, right, literal), oracle(rows, left, right, literal))
+                for name, left, right, literal in cases]
+
+    def timing_queries(self):
+        rows = self.rows + self.backfill
+        rng = random.Random(self.seed)
+        ranges = [rng.randrange(self.end // (8 * SECOND)) * SECOND for _ in range(12)]
+        return [
+            [(name, query_target(query_args(left, self.end, literal, MAX_QUERY_LIMIT)),
+              oracle(rows, left, self.end, literal)[:MAX_QUERY_LIMIT])
+             for name, literal in (("dense", LOG_DENSE), ("rare", LOG_RARE), ("absent", LOG_ABSENT))]
+            for left in ranges
+        ]
+
+
+def verify_log_queries(bog, cases, phase, *, hold=()):
+    pending = []
+    for name, args, expected in cases:
+        label = f"log replay {phase} {name}"
+        limit = MAX_QUERY_LIMIT
+        actual, cursor = bog.query_page({**args, "limit": limit})
+        check(cursor is None, f"{label}: unpaged response included {NEXT_CURSOR}")
+        expect_rows(actual, expected[:limit], f"{label} unpaged")
+        if name in hold:
+            first_limit = 3 if name == "rare" else 257
+            cursor = expect_page(bog, args, expected, 0, first_limit, None, label)
+            check(cursor is not None, f"{label}: expected a cursor to resume across backfill")
+            pending.append((args, expected, first_limit, cursor, label))
+        else:
+            # Small pages split timestamp ties and duplicates, while wide
+            # results use larger pages to keep the PR check bounded.
+            limits = (997, None, 1000) if len(expected) > MAX_QUERY_LIMIT else (1, 2, 23)
+            expect_walk(bog, args, expected, limits, label)
+    return pending
+
+
+def measure_log_queries(bog, queries):
+    durations = {"dense": [], "rare": [], "absent": []}
+    with contextlib.closing(http.client.HTTPConnection("127.0.0.1", bog.port, timeout=HTTP_TIMEOUT)) as client:
+        for sample, group in enumerate(queries[:2] + queries * 3):
+            for name, target, expected in group:
+                started = time.monotonic()
+                status, body, headers = bog.checked_exchange("GET", target, connection=client)
+                elapsed = time.monotonic() - started
+                check(status == 200, f"log replay timing {name} returned HTTP {status}: {body[:150]!r}")
+                check(headers.get_all(NEXT_CURSOR) is None, f"log replay timing {name} returned {NEXT_CURSOR}")
+                expect_rows(decode_rows(body), expected, f"log replay timing {name}, sample {sample}")
+                if sample >= 2:
+                    durations[name].append(elapsed)
+    return {name: latency_metrics(times) for name, times in durations.items()}
+
+
+def measure_log_replay(binary, directory, replay):
+    initial = replay.queries(replay.rows)
+    final = replay.queries(replay.rows + replay.backfill)
+    timing = replay.timing_queries()
+    with run_bog(binary, directory) as bog:
+        empty_ready_ms = milliseconds(bog.startup_seconds)
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1", bog.port, timeout=HTTP_TIMEOUT)) as client:
+            started = time.monotonic()
+            for body, count in replay.batches:
+                bog.ingest_body(body, count, connection=client)
+            elapsed = time.monotonic() - started
+        pending = verify_log_queries(bog, initial, "before backfill", hold=("dense", "rare"))
+        bog.ingest_body(replay.backfill_body, len(replay.backfill))
+        for args, expected, position, cursor, label in pending:
+            expect_walk(bog, args, expected, (1, 997, None, 1000), f"{label}, resumed after sealing",
+                        position=position, cursor=cursor)
+        live_queries = measure_log_queries(bog, timing)
+        verify_log_queries(bog, final, "fresh after backfill")
+        live_rss = peak_rss_kib(bog.process)
+        bog.kill()
+
+    with run_bog(binary, directory) as bog:
+        restart_ready_ms = milliseconds(bog.startup_seconds)
+        for args, _, _, cursor, label in pending:
+            expect_bad_query(bog, {**args, "cursor": cursor}, f"{label}, stale after restart")
+        restart_queries = measure_log_queries(bog, timing)
+        verify_log_queries(bog, final, "fresh after restart")
+        restart_rss = peak_rss_kib(bog.process)
+    return {
+        "order": replay.order, "seed": replay.seed, "rows": len(replay.rows),
+        "backfill_rows": len(replay.backfill), "batches": len(replay.batches),
+        "append_sha256": replay.append_sha256, "backfill_sha256": replay.backfill_sha256,
+        "ingest_elapsed_ms": milliseconds(elapsed),
+        "durable_rows_per_second": round(len(replay.rows) / elapsed, 2),
+        "durable_mib_per_second": round(replay.append_bytes / (1024 ** 2 * elapsed), 2),
+        "live_query": live_queries, "restart_query": restart_queries,
+        "empty_ready_ms": empty_ready_ms, "restart_ready_ms": restart_ready_ms,
+        "live_peak_rss_kib": live_rss, "restart_peak_rss_kib": restart_rss,
+        "peak_rss_kib": max(live_rss, restart_rss),
+    }
+
+
+def log_replay_suite(binary, directory):
+    if sys.platform != "linux":
+        raise InfrastructureError("log replay needs Linux process RSS telemetry")
+    directory.mkdir()
+    sources = log_replay_sources()
+    return {order: measure_log_replay(binary, directory / order, LogReplay(sources, LOG_REPLAY_SEEDS[0], order))
+            for order in LOG_REPLAY_ORDERS}
+
+
+LOG_REPLAY_TARGETS = {
+    "dense_query_p95": ("<=", 1.25),
+    "rare_query_p95": ("<=", 1.50),
+    "absent_query_p95": ("<=", 1.50),
+    "durable_rows_per_second": (">=", 0.80),
+    "peak_rss_kib": ("<=", 1.25),
+    "restart_ready_ms": ("<=", 1.25),
+}
+
+
+def log_replay_ratios(baseline, candidate):
+    for key in ("order", "seed", "rows", "backfill_rows", "batches", "append_sha256", "backfill_sha256"):
+        if baseline[key] != candidate[key]:
+            raise InfrastructureError(f"log replay pair used different input: {key}")
+
+    def measurements(result):
+        return {
+            **{key: result[key] for key in ("durable_rows_per_second", "peak_rss_kib", "restart_ready_ms")},
+            **{f"{kind}_query_p95/{phase}": result[f"{phase}_query"][kind]["p95_ms"]
+               for phase in ("live", "restart") for kind in ("dense", "rare", "absent")},
+        }
+
+    before, after = measurements(baseline), measurements(candidate)
+    if any(not math.isfinite(value) or value <= 0 for value in (*before.values(), *after.values())):
+        raise InfrastructureError("log replay pair has invalid measurements")
+    return {name: after[name] / value for name, value in before.items()}
+
+
+def log_replay_targets(pairs):
+    required = {key for key in LOG_REPLAY_TARGETS if not key.endswith("_p95")}
+    required.update(f"{kind}_query_p95/{phase}" for phase in ("live", "restart")
+                    for kind in ("dense", "rare", "absent"))
+    if len(pairs) != len(LOG_REPLAY_SEEDS) * LOG_REPLAY_REPEATS or any(pair.keys() != required for pair in pairs):
+        raise InfrastructureError("log replay performance needs every configured pair and measurement")
+    return median_targets(pairs, LOG_REPLAY_TARGETS)
+
+
+def paired_log_replay_suite(baseline, candidate, directory, *, baseline_sha, candidate_sha):
+    directory.mkdir()
+    sources = log_replay_sources()
+    log_dir, _ = PROCESS_LOGS.get()
+    ledger = log_dir / "pairs.jsonl"
+    revisions = {"baseline_sha": baseline_sha, "candidate_sha": candidate_sha}
+    binaries = {"baseline": baseline, "candidate": candidate}
+    profiles, failures = {}, []
+    for append_order in LOG_REPLAY_ORDERS:
+        pairs = []
+        for seed in LOG_REPLAY_SEEDS:
+            replay = LogReplay(sources, seed, append_order)
+            for repeat in range(1, LOG_REPLAY_REPEATS + 1):
+                order = ["baseline", "candidate"] if repeat % 2 else ["candidate", "baseline"]
+                results = {}
+                for role in order:
+                    prefix = f"{append_order}-{seed}-{repeat}-{role}-"
+                    try:
+                        with tempfile.TemporaryDirectory(prefix=prefix, dir=directory) as store:
+                            results[role] = measure_log_replay(binaries[role], Path(store), replay)
+                    except (Rejected, subprocess.TimeoutExpired) as exc:
+                        if role == "baseline":
+                            raise InfrastructureError(f"log replay baseline {baseline_sha} failed: {exc}") from exc
+                        raise
+                ratios = log_replay_ratios(results["baseline"], results["candidate"])
+                pairs.append(ratios)
+                summary = {**revisions, "append_order": append_order, "seed": seed, "repeat": repeat,
+                           "order": order, "ratios": ratios, "append_sha256": replay.append_sha256,
+                           "backfill_sha256": replay.backfill_sha256}
+                with ledger.open("a") as stream:
+                    stream.write(json.dumps({**summary, **results}, sort_keys=True) + "\n")
+                print("BOG_LOG_REPLAY_PAIR " + json.dumps(summary, sort_keys=True))
+        targets = log_replay_targets(pairs)
+        profiles[append_order] = {"pairs": len(pairs), "targets": targets}
+        failures.extend(f"{append_order}/{name}" for name, target in targets.items() if not target["passed"])
+    return {**revisions, "profiles": profiles, "failed_targets": failures,
+            "ledger": str(ledger.relative_to(log_dir.parent))}
+
+
 def paired_ratios(baseline, candidate, *, small_batches=False):
     for key in ("workload_sha256", "profile", "seed", "rows", "batch_rows", "writers", "keep_alive"):
         if baseline[key] != candidate[key]:
@@ -1694,9 +1959,13 @@ def paired_ratios(baseline, candidate, *, small_batches=False):
 def indexed_targets(pairs):
     if len(pairs) != len(BENCH_SEEDS) * BENCH_REPEATS:
         raise InfrastructureError("indexed performance needs every configured benchmark pair")
+    return median_targets(pairs, INDEXED_TARGETS)
+
+
+def median_targets(pairs, limits):
     targets = {}
     for metric in pairs[0]:
-        comparison, target = INDEXED_TARGETS[metric.partition("/")[0]]
+        comparison, target = limits[metric.partition("/")[0]]
         ratio = statistics.median(pair[metric] for pair in pairs)
         passed = ratio <= target if comparison == "<=" else ratio >= target
         targets[metric] = {"median_ratio": ratio, "comparison": comparison, "target": target, "passed": passed}
@@ -1766,6 +2035,7 @@ SUITES = (
     ("historical-surrogates", historical_surrogate_suite),
     ("enospc-recovery", enospc_suite),
     ("performance-smoke", performance_suite),
+    ("log-replay", log_replay_suite),
 )
 REQUIRED_SUITES = (
     "query-oracle",
@@ -1779,6 +2049,7 @@ REQUIRED_SUITES = (
     "historical-surrogates",
     "enospc-recovery",
     "performance-smoke",
+    "log-replay",
 )
 EXTENDED_SUITES = (
     ("graceful-shutdown", shutdown_suite),
@@ -1787,13 +2058,16 @@ EXTENDED_SUITES = (
 )
 COMPARISON_SUITES = {"full": "small-batch-performance", "post-cycle": "small-batch-performance",
                      "indexed": "indexed-performance"}
+LOG_REPLAY_COMPARISON = "log-replay-performance"
 
 
 def suite_plan(suites, profile):
     if profile == "legacy":
-        return tuple((name, run) for name, run in suites if name != "snapshot-pagination")
+        return tuple((name, run) for name, run in suites if name not in ("snapshot-pagination", "log-replay"))
     if profile in COMPARISON_SUITES:
-        return (*suites, *EXTENDED_SUITES, (COMPARISON_SUITES[profile], paired_performance_suite))
+        suites = (*suites, *EXTENDED_SUITES, (COMPARISON_SUITES[profile], paired_performance_suite))
+        if profile == "post-cycle":
+            suites += ((LOG_REPLAY_COMPARISON, paired_log_replay_suite),)
     return suites
 
 
@@ -1817,12 +2091,12 @@ def build(source, work, log):
     return binary
 
 
-def build_baseline(source, work, evidence, baseline_sha):
+def build_baseline(source, work, evidence, baseline_sha, *, label="baseline"):
     revision = subprocess.run(["git", "rev-parse", "--verify", f"{baseline_sha}^{{commit}}"], cwd=source,
                               capture_output=True, text=True, timeout=15)
     if revision.returncode or revision.stdout.strip() != baseline_sha:
         raise InfrastructureError(f"comparison baseline revision {baseline_sha} is missing from the fetched history")
-    baseline_dir = work / "baseline"
+    baseline_dir = work / label
     baseline_dir.mkdir()
     checkout = baseline_dir / "source"
     fetched = subprocess.run(["git", "worktree", "add", "--detach", str(checkout), baseline_sha],
@@ -1833,14 +2107,14 @@ def build_baseline(source, work, evidence, baseline_sha):
                                  capture_output=True, text=True, timeout=15)
     if checked_out.returncode or checked_out.stdout.strip() != baseline_sha:
         raise InfrastructureError(f"comparison checkout does not match {baseline_sha}")
-    log = evidence / "baseline-build.log"
+    log = evidence / f"{label}-build.log"
     try:
         binary = build(checkout, baseline_dir, log)
     except Rejected as exc:
         raise InfrastructureError(f"comparison baseline {baseline_sha} build failed: {exc}") from exc
     finally:
         if log.exists():
-            print("BOG_BUILD " + json.dumps({"role": "baseline", "sha": baseline_sha,
+            print("BOG_BUILD " + json.dumps({"role": label, "sha": baseline_sha,
                                              "log_tail": log_tail(log, 4096)}))
     return binary
 
@@ -1883,6 +2157,8 @@ def new_result(requested_sha, tested_sha, profile="pr"):
         "image_digest": os.environ.get("BOG_VERIFIER_IMAGE_DIGEST"),
         "build": {"status": "pending"},
         **({"baseline_build": {"sha": baseline_sha, "status": "pending"}} if profile in COMPARISON_SUITES else {}),
+        **({"log_replay_baseline_build": {"sha": POST_CYCLE_BASELINE_SHA, "status": "pending"}}
+           if profile == "post-cycle" else {}),
         "suites": [{"name": name, "status": "pending"} for name, _ in required],
         "status": "running",
     }
@@ -1900,9 +2176,7 @@ def publish_result(work, code, reason, requested_sha, tested_sha, profile="pr"):
     result.update(status=status, exit_code=code)
     if reason and "diagnostic" not in result:
         result["diagnostic"] = reason
-    builds = [result["build"]]
-    if "baseline_build" in result:
-        builds.append(result["baseline_build"])
+    builds = [result[key] for key in ("build", "baseline_build", "log_replay_baseline_build") if key in result]
     for check_result in [*builds, *result["suites"]]:
         if check_result["status"] == "pending":
             check_result["status"] = "blocked"
@@ -1964,32 +2238,36 @@ def main(source, work, sha, profile="pr"):
     completed = []
     rejected = []
     errors = []
-    baseline = None
+    baselines = {}
     comparison_stage = COMPARISON_SUITES.get(profile)
     baseline_sha = result["baseline_sha"]
-    if comparison_stage:
-        print(f"bog comparison candidate_sha={sha} baseline_sha={baseline_sha}")
-        (work / "stage").write_text(f"comparison baseline build {baseline_sha}, 0/{len(required)} suites completed")
-        baseline_build = result["baseline_build"]
+    for label, key in (("baseline", "baseline_build"), ("log-replay-baseline", "log_replay_baseline_build")):
+        if key not in result:
+            continue
+        baseline_build = result[key]
+        commit = baseline_build["sha"]
+        print(f"bog comparison candidate_sha={sha} {label}_sha={commit}")
+        (work / "stage").write_text(f"{label} build {commit}, 0/{len(required)} suites completed")
         baseline_build.update(status="running")
         checkpoint()
         try:
-            baseline = build_baseline(source, work, evidence, baseline_sha)
+            baselines[label] = build_baseline(source, work, evidence, commit, label=label)
         except (InfrastructureError, subprocess.TimeoutExpired) as exc:
             reason = diagnostic(exc)
-            print(f"ERROR comparison baseline {baseline_sha}: {reason}", file=sys.stderr)
+            print(f"ERROR {label} {commit}: {reason}", file=sys.stderr)
             baseline_build.update(status="infra_error", diagnostic=reason)
             finish("infra_error", reason)
             return 2
         finally:
-            if (evidence / "baseline-build.log").exists():
-                baseline_build["log"] = "baseline-build.log"
+            log_name = f"{label}-build.log"
+            if (evidence / log_name).exists():
+                baseline_build["log"] = log_name
                 checkpoint()
-        baseline_build.update(status="passed", binary_sha256=file_sha256(baseline))
+        baseline_build.update(status="passed", binary_sha256=file_sha256(baselines[label]))
         checkpoint()
 
     for (stage, run), suite in zip(suites, result["suites"]):
-        if stage == comparison_stage and (rejected or errors):
+        if stage in (comparison_stage, LOG_REPLAY_COMPARISON) and (rejected or errors):
             suite.update(status="blocked", diagnostic="correctness or smoke prerequisite failed")
             continue
         log_dir = evidence / stage
@@ -2002,17 +2280,20 @@ def main(source, work, sha, profile="pr"):
         token = PROCESS_LOGS.set((log_dir, suite["processes"]))
         try:
             if stage == "wal-handoff":
-                metrics = run(baseline, binary, work / stage, baseline_sha)
+                metrics = run(baselines["baseline"], binary, work / stage, baseline_sha)
             elif stage == comparison_stage:
-                metrics = run(baseline, binary, work / stage, indexed=profile == "indexed",
+                metrics = run(baselines["baseline"], binary, work / stage, indexed=profile == "indexed",
                               baseline_sha=baseline_sha, candidate_sha=sha)
+            elif stage == LOG_REPLAY_COMPARISON:
+                metrics = run(baselines["log-replay-baseline"], binary, work / stage,
+                              baseline_sha=result["log_replay_baseline_build"]["sha"], candidate_sha=sha)
             else:
                 metrics = run(binary, work / stage)
             if metrics is not None:
                 suite["metrics"] = metrics
-            if profile == "indexed" and stage == comparison_stage:
+            if stage == LOG_REPLAY_COMPARISON or (profile == "indexed" and stage == comparison_stage):
                 failed = metrics["failed_targets"]
-                check(not failed, f"indexed performance missed {len(failed)} targets: {', '.join(failed)}")
+                check(not failed, f"{stage} missed {len(failed)} targets: {', '.join(failed)}")
             if not any(case.get("ready_ms") is not None for case in suite["processes"]):
                 raise InfrastructureError("required suite ran without a ready Bog subprocess")
         except (Rejected, subprocess.TimeoutExpired, threading.BrokenBarrierError,

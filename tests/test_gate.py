@@ -87,6 +87,9 @@ class GateTest(unittest.TestCase):
                 if profile != "pr":
                     self.assertEqual(report["baseline_sha"], verify.COMPARISON_BASELINE_SHA)
                     self.assertEqual(report["baseline_build"]["status"], "blocked")
+                if profile == "post-cycle":
+                    self.assertEqual(report["log_replay_baseline_build"],
+                                     {"sha": verify.POST_CYCLE_BASELINE_SHA, "status": "blocked"})
                 self.assertIn("snapshot-pagination", {suite["name"] for suite in report["suites"]})
                 self.assertTrue(all(suite["status"] == "blocked" for suite in report["suites"]))
 
@@ -101,10 +104,13 @@ class GateTest(unittest.TestCase):
         extended = ["graceful-shutdown", "full-disk-restart", "wal-handoff"]
         self.assertEqual(plan("full"), (verify.COMPARISON_BASELINE_SHA,
                                        default + extended + ["small-batch-performance"]))
-        self.assertEqual(plan("post-cycle"), plan("full"))
+        self.assertIn("log-replay", default)
+        full_baseline, full_suites = plan("full")
+        self.assertEqual(plan("post-cycle"), (full_baseline, full_suites + ["log-replay-performance"]))
         self.assertEqual(plan("indexed"), (verify.BASELINE_SHA, default + extended + ["indexed-performance"]))
         self.assertEqual(plan("legacy"), (verify.BASELINE_SHA,
-                                          [name for name in default if name != "snapshot-pagination"]))
+                                          [name for name in default
+                                           if name not in ("snapshot-pagination", "log-replay")]))
 
     def test_timing_sample_cap_preserves_quantiles_from_all_requests(self):
         times = [0.001] * 97 + [0.010] * 2 + [0.100]
@@ -150,6 +156,25 @@ class GateTest(unittest.TestCase):
                          {"wide_query_p95/restart", "durable_rows_per_second", "peak_rss_kib"})
         with self.assertRaisesRegex(verify.InfrastructureError, "every configured benchmark pair"):
             verify.indexed_targets([pair] * (count - 1))
+
+    def test_log_replay_gates_each_metric_on_paired_medians(self):
+        count = len(verify.LOG_REPLAY_SEEDS) * verify.LOG_REPLAY_REPEATS
+        pair = {
+            "dense_query_p95/live": 1.25, "dense_query_p95/restart": 1.0,
+            "rare_query_p95/live": 1.51, "rare_query_p95/restart": 1.50,
+            "absent_query_p95/live": 1.50, "absent_query_p95/restart": 1.51,
+            "durable_rows_per_second": 0.79, "peak_rss_kib": 1.25, "restart_ready_ms": 1.26,
+        }
+        outlier = {**pair, "dense_query_p95/live": 20, "rare_query_p95/live": 0.01}
+        targets = verify.log_replay_targets([pair] * (count - 1) + [outlier])
+        self.assertEqual({key for key, target in targets.items() if not target["passed"]},
+                         {"rare_query_p95/live", "absent_query_p95/restart",
+                          "durable_rows_per_second", "restart_ready_ms"})
+        with self.assertRaisesRegex(verify.InfrastructureError, "every configured pair and measurement"):
+            verify.log_replay_targets([pair] * (count - 1))
+        missing = {key: value for key, value in pair.items() if key != "rare_query_p95/live"}
+        with self.assertRaisesRegex(verify.InfrastructureError, "every configured pair and measurement"):
+            verify.log_replay_targets([pair] * (count - 1) + [missing])
 
     def test_historical_wal_fixture_uses_castagnoli_crc_and_little_endian_marker(self):
         self.assertEqual(verify.crc32c(b"123456789"), 0xe3069283)
@@ -201,7 +226,8 @@ class GateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source, work = buildable_candidate(root)
-            with patch.object(verify, "bounded_mount", return_value=(root, 64 * 1024**2)):
+            with patch.object(verify, "bounded_mount", return_value=(root, 64 * 1024**2)), \
+                 patch.object(verify.sys, "platform", "linux"):
                 self.assertEqual(verify.main(source, work, "0" * 40), 1)
             self.assertIn("Bog exited during startup (status 0)", (work / "rejection").read_text())
             self.assertFalse((work / "passed").exists())

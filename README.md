@@ -1,7 +1,7 @@
 # bog-verifiers
 
-The default PR gate exercises the public contract of Bog
-`4ff49aae9672cf5aec8e3fbd20ffe0a84ae15bc0`. The verifier fetches the requested
+The default PR gate exercises the public contract verified on Bog
+`cbe3b9ef20527f11142de6df509211ce801645cd`. The verifier fetches the requested
 branch, checks out the exact commit, and builds `./cmd/bog` with Go 1.27 on Linux.
 It launches Bog in a private data directory on a local filesystem and drives
 its HTTP API from a separate process. Recovery checks use stopped copies of
@@ -20,14 +20,14 @@ the documented WAL and commit marker.
   Both revisions must be present in the fetched history and build before the
   suites start. A missing or unbuildable candidate fails at checkout or build.
   A missing or unbuildable pinned baseline is an infrastructure error.
-- `SLIPWAY_PARAM_MODE=post-cycle` runs the same matrix. For a standalone
-  post-cycle step, use `SLIPWAY_INPUT_TESTEDCOMMIT` to select an exact commit
-  reachable from `main`. Set `SLIPWAY_PARAM_REPOSITORY` to override the
-  default Slipway remote.
+- `SLIPWAY_PARAM_MODE=post-cycle` also gates log replay performance in pairs
+  against `cbe3b9ef20527f11142de6df509211ce801645cd`. For a standalone step,
+  use `SLIPWAY_INPUT_TESTEDCOMMIT` to select an exact commit reachable from
+  `main`. Set `SLIPWAY_PARAM_REPOSITORY` to override the default Slipway remote.
 - `--legacy` or `SLIPWAY_PARAM_MODE=legacy` checks the pinned Cycle 1 build
-  `25d0c0acc103bd73f0552a8f10240c8d8c1d023d`. It omits cursor tests because
-  that revision predates the paged API. Standalone runs default to that SHA
-  on `main` and accept `SLIPWAY_PARAM_REPOSITORY`.
+  `25d0c0acc103bd73f0552a8f10240c8d8c1d023d`, which predates the paged API.
+  Standalone runs default to that SHA on `main` and accept
+  `SLIPWAY_PARAM_REPOSITORY`.
 - `SLIPWAY_PARAM_MODE=indexed` runs the historical indexed comparison against
   Cycle 1 with its original workload and ratio targets. It accepts the same
   candidate inputs as post-cycle mode.
@@ -71,6 +71,20 @@ the documented WAL and commit marker.
   suffixes, and startup refusal for committed corruption or invalid markers
   with file preservation. The default gate also covers exclusive directory
   locking and concurrent ENOSPC rejections.
+- The Linux log replay builds 65,573 rows per run from seeded selections of
+  the Apache, Git daemon, and multiline application fixtures. It posts the
+  same corpus in steady timestamp order and in shuffled append order on
+  separate stores. Serial acknowledgments establish append order for the
+  independent oracle, which compares exact rows and duplicate multiplicity.
+  Wide queries cover dense, rare, absent, Unicode, and short literals. Narrow
+  queries split timestamp ties across pages and match embedded newlines.
+  Dedicated probes hit the first block, the final 37-row partial block, and
+  the end of a 96 KiB line.
+- Dense and rare cursors start before a 91-row backfill that seals the partial
+  block. Active walks must return their original rows in order. Fresh paged
+  and unpaged queries must include the backfill. After SIGKILL and restart,
+  fresh walks must reproduce the acknowledged data and old cursors must
+  return HTTP 400.
 
 ## Timing and compatibility
 
@@ -79,6 +93,11 @@ connections. It reconciles every row live and after restart, and records
 durable requests and rows per second, POST latency, narrow and wide query
 latency, peak RSS, and restart-to-health time. Timing measurements carry
 no PR verdict thresholds.
+
+The log replay also records dense, rare, and absent HTTP query latency
+before and after restart, durable serial ingest throughput, Linux peak RSS,
+and restart-to-health time for both orders. Each query category uses 36
+measured requests per phase. Latency includes receiving the response body.
 
 Full mode also checks SIGTERM draining and reopening acknowledged data at
 zero allocatable blocks. It runs 12 alternating-order pairs on one Linux
@@ -92,6 +111,22 @@ Full mode also opens each revision's WAL with the other revision, appends
 eight concurrent small batches in each direction, and reopens the result
 with the original writer. The handoffs verify the original WAL prefix and
 the complete query results at each step.
+
+Post-cycle QA adds eight log replay pairs on the same Linux host and
+filesystem. Each append order uses two seeds, with one baseline-first and
+one candidate-first pair per seed. Each pair uses fresh stores and identical
+HTTP bodies, and each side runs the PR correctness assertions. The median
+candidate-to-baseline ratio across the four pairs must meet each limit for
+each append order. Query limits apply independently before and after restart.
+
+| Metric | Target |
+| --- | --- |
+| Dense query p95 | ≤ 1.25 |
+| Rare query p95 | ≤ 1.50 |
+| Absent query p95 | ≤ 1.50 |
+| Durable ingest rows per second | ≥ 0.80 |
+| Peak RSS | ≤ 1.25 |
+| Restart-to-health | ≤ 1.25 |
 
 The historical indexed comparison retains its 48 planned pairs, with
 1,000,000 rows per run in 500-row POSTs and the Cycle 1 baseline. Its median
@@ -109,7 +144,8 @@ candidate-to-baseline targets are:
 `BOG_RESULT` records the requested and tested SHAs, the comparison baseline
 SHA when configured, binary and fixture digests, seeds, suite outcomes, and
 timings. `BOG_BUILD`, `BOG_PROCESS`, `BOG_SIGKILL`,
-`BOG_FULL_DISK`, and `BOG_PERFORMANCE_PAIR` provide detailed evidence.
+`BOG_FULL_DISK`, `BOG_PERFORMANCE_PAIR`, and `BOG_LOG_REPLAY_PAIR` provide
+detailed evidence.
 Set `SLIPWAY_PARAM_ARTIFACT_DIR` to a writable directory to retain
 `result.json`, process logs, the crash ledger, and per-pair samples. The
 Small-batch POST metrics use all requests for percentiles and retain up to 128
@@ -128,7 +164,7 @@ git -C ../bog bundle create "$qa_dir/bog.bundle" refs/heads/main
 container=$(docker create \
   -e SLIPWAY_REPOSITORY=/tmp/bog.bundle \
   -e SLIPWAY_CANDIDATE_BRANCH=main \
-  -e SLIPWAY_CANDIDATE_COMMIT=4ff49aae9672cf5aec8e3fbd20ffe0a84ae15bc0 \
+  -e SLIPWAY_CANDIDATE_COMMIT=cbe3b9ef20527f11142de6df509211ce801645cd \
   bog-verifier)
 docker cp "$qa_dir/bog.bundle" "$container:/tmp/bog.bundle"
 docker start -a "$container"
