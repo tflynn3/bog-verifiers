@@ -1,37 +1,38 @@
 diff --git a/verify/release/parity_linux_test.go b/verify/release/parity_linux_test.go
-index 2620d5d..a694118 100644
+index 2620d5d..09716d7 100644
 --- a/verify/release/parity_linux_test.go
 +++ b/verify/release/parity_linux_test.go
 @@ -12,0 +13 @@ import (
 +	"os/exec"
 @@ -22,0 +24 @@ import (
 +	querymodel "bog/verify/query-model"
-@@ -57,5 +59,13 @@ type parityProof struct {
+@@ -57,5 +59,14 @@ type parityProof struct {
 -	Point          backup.Point `json:"verified_point"`
 -	CapturedRows   int          `json:"captured_rows"`
 -	PostRestore204 bool         `json:"post_restore_204"`
 -	PostAppendRows int          `json:"post_append_rows"`
 -	RestartRows    int          `json:"restart_rows"`
-+	RestoreStatus       string            `json:"restore_status,omitempty"`
-+	Point               backup.Point      `json:"verified_point"`
-+	CapturedRows        int               `json:"captured_rows"`
-+	PostRestore204      bool              `json:"post_restore_204"`
-+	LegacyRestartRows   int               `json:"legacy_restart_rows"`
-+	Operator            *operatorProof    `json:"backup_compare,omitempty"`
-+	LegacyRows          int               `json:"legacy_rows"`
-+	UnpagedChecks       int               `json:"unpaged_checks"`
-+	StaleCursorRejected bool              `json:"stale_cursor_rejected"`
-+	Resource            *resourceProof    `json:"retained_resource_admission,omitempty"`
-+	Replacement         *replacementProof `json:"live_replacement,omitempty"`
-+	PostAppendRows      int               `json:"post_append_rows"`
-+	RestartRows         int               `json:"restart_rows"`
-@@ -80,5 +89,0 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
++	RestoreControlChecks int               `json:"restored_control_404_checks,omitempty"`
++	RestoreStatus        string            `json:"restore_status,omitempty"`
++	Point                backup.Point      `json:"verified_point"`
++	CapturedRows         int               `json:"captured_rows"`
++	PostRestore204       bool              `json:"post_restore_204"`
++	LegacyRestartRows    int               `json:"legacy_restart_rows"`
++	Operator             *operatorProof    `json:"backup_compare,omitempty"`
++	LegacyRows           int               `json:"legacy_rows"`
++	UnpagedChecks        int               `json:"unpaged_checks"`
++	StaleCursorRejected  bool              `json:"stale_cursor_rejected"`
++	Resource             *resourceProof    `json:"retained_resource_admission,omitempty"`
++	Replacement          *replacementProof `json:"live_replacement,omitempty"`
++	PostAppendRows       int               `json:"post_append_rows"`
++	RestartRows          int               `json:"restart_rows"`
+@@ -80,5 +90,0 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -	dir, point, err := makeRestoredFixture(ctx, root, rows)
 -	if err != nil {
 -		return proof, fmt.Errorf("prepare verified restore: %w", err)
 -	}
 -	proof.Point = point
-@@ -90,0 +96,78 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -90,0 +97,95 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 +	legacy := filepath.Join(root, "legacy")
 +	if err := os.Mkdir(legacy, 0700); err != nil {
 +		return proof, err
@@ -86,6 +87,23 @@ index 2620d5d..a694118 100644
 +		return proof, nil
 +	}
 +	proof.RestoreStatus = "fail"
++	// A successful replacement probe established support for this flag.
++	restoreFlags := append(slices.Clone(flags), replacementFlag+"=false")
++	checkControlHidden := func(base string) error {
++		for _, probe := range []struct{ method, action string }{
++			{http.MethodGet, "status"}, {http.MethodPost, "start"},
++		} {
++			res, err := request(ctx, client, probe.method, base+"/_capacity/compaction?action="+probe.action+"&cutoff=0", nil)
++			if err != nil {
++				return err
++			}
++			if res.status != http.StatusNotFound {
++				return fmt.Errorf("restored capacity control %s returned HTTP %d, want 404", probe.action, res.status)
++			}
++			proof.RestoreControlChecks++
++		}
++		return nil
++	}
 +	dir, point, err := makeRestoredFixture(ctx, root, rows)
 +	if err != nil {
 +		return proof, fmt.Errorf("prepare verified restore: %w", err)
@@ -97,7 +115,7 @@ index 2620d5d..a694118 100644
 +		if err := backup.Restore(ctx, bundle, compareDir); err != nil {
 +			return proof, err
 +		}
-+		if err := serveDirectory(ctx, binary, compareDir, client, flags, func(base string) error {
++		if err := serveDirectory(ctx, binary, compareDir, client, restoreFlags, func(base string) error {
 +			result, err := probeOperator(ctx, operator, bundle, base, len(rows))
 +			proof.Operator = result
 +			return err
@@ -110,13 +128,25 @@ index 2620d5d..a694118 100644
 +			return proof, err
 +		}
 +	}
-@@ -99 +182 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -94 +195,4 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+-	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
++	err = serveDirectory(ctx, binary, dir, client, restoreFlags, func(base string) error {
++		if err := checkControlHidden(base); err != nil {
++			return err
++		}
+@@ -99 +203 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -		if err := checkRestoredWalks(ctx, pager, rows); err != nil {
 +		if err := checkQueries(base, rows); err != nil {
-@@ -108 +191 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -108 +212 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
 +		if err := checkQueries(base, augmented); err != nil {
-@@ -128,0 +212,157 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -125 +229,4 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+-	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
++	err = serveDirectory(ctx, binary, dir, client, restoreFlags, func(base string) error {
++		if err := checkControlHidden(base); err != nil {
++			return err
++		}
+@@ -128,0 +236,157 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 +		proof.StaleCursorRejected = true
 +		if err := checkQueries(base, augmented); err != nil {
 +			return err
@@ -128,7 +158,7 @@ index 2620d5d..a694118 100644
 +		err = fmt.Errorf("restart with acknowledged post-restore write: %w", err)
 +	}
 +	if err == nil {
-+		proof.Resource, err = probeRestoredAdmission(ctx, binary, dir, client, flags, point, augmented)
++		proof.Resource, err = probeRestoredAdmission(ctx, binary, dir, client, restoreFlags, point, augmented)
 +	}
 +	if err == nil {
 +		proof.RestoreStatus = "pass"
@@ -274,7 +304,7 @@ index 2620d5d..a694118 100644
 +		if proof.RejectedHTTPStatus != http.StatusServiceUnavailable {
 +			return fmt.Errorf("tail admission: expected HTTP 503, got %d (%v)", proof.RejectedHTTPStatus, ingestErr)
 +		}
-@@ -133 +373,13 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -133 +397,13 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
 +		return checkRestoredWalks(ctx, pager, rows)
 +	}); err != nil {
@@ -289,18 +319,18 @@ index 2620d5d..a694118 100644
 +	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
 +		pager, err := newReleasePager(base, client, restoredPageCap)
 +		if err != nil {
-@@ -136 +388,4 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -136 +412,4 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -		proof.RestartRows = len(augmented)
 +		if err := checkRestoredWalks(ctx, pager, rows); err != nil {
 +			return err
 +		}
 +		proof.RestartRows = len(rows)
-@@ -139,2 +394,2 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -139,2 +418,2 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -	if err != nil {
 -		err = fmt.Errorf("restart with acknowledged post-restore write: %w", err)
 +	if err == nil {
 +		proof.Status = "pass"
-@@ -147,5 +402,3 @@ func checkRestoredWalks(ctx context.Context, pager *releasePager, appendOrder []
+@@ -147,5 +426,3 @@ func checkRestoredWalks(ctx context.Context, pager *releasePager, appendOrder []
 -		var want []row
 -		for _, r := range appendOrder {
 -			if strings.Contains(r.Line, filter) {
@@ -309,9 +339,9 @@ index 2620d5d..a694118 100644
 +		want, err := parityRowsFor(appendOrder, filter)
 +		if err != nil {
 +			return err
-@@ -153 +405,0 @@ func checkRestoredWalks(ctx context.Context, pager *releasePager, appendOrder []
+@@ -153 +429,0 @@ func checkRestoredWalks(ctx context.Context, pager *releasePager, appendOrder []
 -		slices.SortStableFunc(want, func(a, b row) int { return strings.Compare(a.TS, b.TS) })
-@@ -164,2 +416,5 @@ func checkRestoredWalk(ctx context.Context, pager *releasePager, filter string,
+@@ -164,2 +440,5 @@ func checkRestoredWalk(ctx context.Context, pager *releasePager, filter string,
 -	seen := make(map[string]bool)
 -	cursor := ""
 +	return resumeRestoredWalk(ctx, pager, filter, limit, want, "")
@@ -319,7 +349,7 @@ index 2620d5d..a694118 100644
 +
 +func resumeRestoredWalk(ctx context.Context, pager *releasePager, filter string, limit int, want []row, cursor string) error {
 +	seen := map[string]bool{cursor: true}
-@@ -172,2 +427,2 @@ func checkRestoredWalk(ctx context.Context, pager *releasePager, filter string,
+@@ -172,2 +451,2 @@ func checkRestoredWalk(ctx context.Context, pager *releasePager, filter string,
 -		if n > limit {
 -			return fmt.Errorf("page %d exceeded row limit", number)
 +		if n > limit || (len(want) > 0 && n == 0) {

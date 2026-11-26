@@ -50,7 +50,7 @@ def integer(value, low, high=None):
     return type(value) is int and value >= low and (high is None or value <= high)
 
 
-def validate_backfill_timelines(timelines, seed, published):
+def validate_backfill_timelines(timelines, seed, published, *, require_pin_retirement=False):
     label = f"capacity ({seed} rows)"
     check(isinstance(timelines, list) and len(timelines) == 2,
           f"{label}: expected clustered and scattered backfill timelines")
@@ -98,13 +98,25 @@ def validate_backfill_timelines(timelines, seed, published):
             storage = sample["filesystem"]
             stage_bytes = storage.get("checkpoint_staging_apparent_bytes")
             check(integer(stage_bytes, 0) or
-                  (stage_bytes is None and storage.get("unavailable")),
+                  (not require_pin_retirement and stage_bytes is None and storage.get("unavailable")),
                   f"{name}: missing staging observation at {sample['event']}")
         drain = trial["pin_drain"]
-        check((drain["status"] == "observed" and integer(drain.get("retired_pins_while_held"), 1) and
-               integer(drain.get("retired_pins_after_exhaustion"), 0, 0)) or
-              (drain["status"] == "unavailable" and isinstance(drain.get("reason"), str) and drain["reason"]),
+        observed = (drain["status"] == "observed" and integer(drain.get("retired_pins_while_held"), 1) and
+                    integer(drain.get("retired_pins_after_exhaustion"), 0, 0))
+        unavailable = drain["status"] == "unavailable" and isinstance(drain.get("reason"), str) and drain["reason"]
+        check(observed or (not require_pin_retirement and unavailable),
               f"{name}: incomplete pin-drain evidence")
+        if require_pin_retirement:
+            check(integer(drain.get("release_http_status"), 200, 299) and
+                  integer(drain.get("reclaimed_bytes"), 1), f"{name}: missing release or reclamation evidence")
+            def pin_count(sample):
+                return sample.get("candidate_status_metrics", {}).get("retired_generation_pins")
+
+            start, exhausted, fresh = (samples.index(boundaries[i]) for i in (3, 4, 6))
+            check(any(integer(pin_count(sample), 1) for sample in samples[start:exhausted + 1]) and
+                  any(integer(pin_count(sample), 0, 0) for sample in samples[exhausted + 1:fresh]
+                      if sample["event"] in ("after_exhaustion", "drain_poll")),
+                  f"{name}: missing measured positive-to-zero predecessor pins")
     check(generations[0] < generations[1] == published["generation"],
           f"{label}: inconsistent replacement generations")
 
@@ -153,8 +165,13 @@ def validate_capacity(evidence, *, require_backfill_timelines=False):
               integer(compaction.get("covered_rows"), seed + BATCH_ROWS, seed + BATCH_ROWS) and
               integer(compaction.get("committed_rows"), total, total), f"{label}: invalid compaction evidence")
         diagnostics = run["diagnostics"]
+        if require_backfill_timelines:
+            check(integer(fixture.get("query_work_budget"), 1), f"{label}: missing explicit query work budget")
+            check(integer(diagnostics.get("peak_sampled_checkpoint_staging_bytes"), 0),
+                  f"{label}: missing peak checkpoint staging bytes")
         if require_backfill_timelines or "backfill_timelines" in diagnostics:
-            validate_backfill_timelines(diagnostics.get("backfill_timelines"), seed, compaction)
+            validate_backfill_timelines(diagnostics.get("backfill_timelines"), seed, compaction,
+                                        require_pin_retirement=require_backfill_timelines)
         for phase in ("after_publication_continuation", "fresh_backfill", "restart_walk"):
             query = diagnostics["queries"][phase]
             last = query["last"]
@@ -230,6 +247,9 @@ def validate_budget(evidence, *, require_fixed_boundaries=False):
 def validate_parity(evidence, *, require_writable_restore=False):
     if require_writable_restore or "restore_status" in evidence:
         check(evidence.get("restore_status") == "pass", "parity: writable restore did not pass")
+    if require_writable_restore or "restored_control_404_checks" in evidence:
+        check(integer(evidence.get("restored_control_404_checks"), 4, 4),
+              "parity: capacity control was not proven absent on restore and restart")
     point = evidence["verified_point"]
     generation = point["Generation"]
     check(isinstance(generation, list) and len(generation) == 32 and

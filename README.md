@@ -253,16 +253,24 @@ At both 196,608 and 393,216 seed rows under the 128 MiB cgroup limit, the
 capacity producer records clustered and scattered backfill timelines.
 Each proves an acknowledged append and continuation during compaction,
 publication at the exact newer cutoff, exhaustion of the held snapshot,
-and fresh visibility. The timelines record staging observations and a
-positive-to-zero retired pin count when the runtime exposes that metric,
-or a reason when pin drain could not be observed. Each fixture also
-requires an exact full walk after restart and successful process, cgroup,
-and fixture root cleanup.
+and fresh visibility. The workflow builds the capacity producer from the
+dispatched revision so the capacity evidence track supplies the launcher
+and observations. Each fixture records its explicit `fixture.query_work_budget`,
+used for initial queries, continuations, and full restart walks, and the
+peak sampled checkpoint staging bytes. After each held walk exhausts,
+the producer uses the opt-in loopback release action. The gate requires
+the release HTTP status and observed reclaimed bytes in
+`pin_drain.release_http_status` and `pin_drain.reclaimed_bytes`, along with
+positive predecessor pin samples before release and zero afterward. Each
+fixture also requires an exact full walk after restart and successful
+process, cgroup, and fixture root cleanup.
 
 Restored parity checks legacy WAL replay, append, and restart, then removes the original data and
 bundle and starts the candidate on the verified v1 restore. Ordinary queries
 and framed cursor walks check restored rows, a durable append, and exact
-restart parity. When the operator CLI is available, a separate restored copy
+restart parity. Restored launches pass `-enable-capacity-control=false`.
+The parity report counts four HTTP 404 responses across status and start
+probes on restored startup and restart. When the operator CLI is available, a separate restored copy
 serves the default backup comparison. If `compare -help` advertises `-max-pages`,
 the comparison must also finish at the exact page ceiling and report an
 incomplete comparison at a lower ceiling. The resource probe discovers `-retained-tail-max-bytes` in

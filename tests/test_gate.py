@@ -53,6 +53,8 @@ class GateTest(unittest.TestCase):
                                              ("overlap", overlap), ("publication", complete),
                                              ("held_exhausted", None), ("after_exhaustion", complete),
                                              ("fresh_visible", None))]
+            samples[3]["candidate_status_metrics"] = {"retired_generation_pins": 1}
+            samples[5]["candidate_status_metrics"] = {"retired_generation_pins": 0}
             return dict(pattern=pattern, status="pass", held_cutoff=held, requested_cutoff=cutoff,
                         expected_committed_rows=final, held_rows_checked=rows, held_cursor_exhausted=True,
                         fresh_backfill_visible=True, acknowledged_backfill=dict(
@@ -60,13 +62,25 @@ class GateTest(unittest.TestCase):
                         publication=dict(generation=generation, observed_lag_lower_bound_ns=2,
                                          observed_lag_upper_bound_ns=4), samples=samples,
                         pin_drain=dict(status="observed", retired_pins_while_held=1,
-                                       retired_pins_after_exhaustion=0))
+                                       retired_pins_after_exhaustion=0, release_http_status=204, reclaimed_bytes=4096))
 
         seed = 196_608
         clustered = timeline("clustered", seed - 128, seed - 64, seed, 9, 25)
         scattered = timeline("scattered", seed, seed + 64, seed + 2048, 9 * seed // 16 - 3, 27)
         published = {"generation": 27}
         validate_backfill_timelines([scattered, clustered], seed, published)
+        validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
+        for changes, diagnostic in (
+            ({"status": "unavailable", "reason": "old producer"}, "incomplete pin-drain evidence"),
+            ({"release_http_status": 404}, "missing release or reclamation evidence"),
+            ({"reclaimed_bytes": 0}, "missing release or reclamation evidence"),
+        ):
+            with self.subTest(changes=changes), patch.dict(scattered["pin_drain"], changes):
+                with self.assertRaisesRegex(verify.Rejected, diagnostic):
+                    validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
+        with patch.dict(scattered["samples"][5]["candidate_status_metrics"], retired_generation_pins=1):
+            with self.assertRaisesRegex(verify.Rejected, "missing measured positive-to-zero predecessor pins"):
+                validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
         with patch.dict(clustered["samples"][3]["status"], covered_rows=seed):
             with self.assertRaisesRegex(verify.Rejected, "invalid overlap or publication cutoff"):
                 validate_backfill_timelines([clustered, scattered], seed, published)
