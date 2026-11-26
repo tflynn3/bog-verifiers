@@ -18,7 +18,7 @@ env:
   CGO_ENABLED: '0'
   FIXTURE: linux-release-v1
   BOG_REPOSITORY: tflynn3/bog
-  TOOLING_REVISION: d06f31a4026eb5f46e56fe0040321a7b389fbea3
+  TOOLING_REVISION: 820dc5c988a0e79bb4a83227144998ea44cf32d5
   REVISION: ${{ inputs.revision }}
 
 jobs:
@@ -71,7 +71,7 @@ jobs:
           cp gate/verify/release/README.md "$EVIDENCE/fixture.md"
           cp gate/verify/linux/README.md "$EVIDENCE/durability-fixture.md"
           cp gate/bench/retained-history/README.md "$EVIDENCE/capacity-fixture.md"
-          cp verifiers/release/*.patch "$EVIDENCE/"
+          cp verifiers/release/*.patch verifiers/release/backup_retry_linux_test.go "$EVIDENCE/"
           printf 'tooling_revision=%s\nverifier_revision=%s\n' "$(git -C gate rev-parse HEAD)" \
             "$(git -C verifiers rev-parse HEAD)" | tee -a "$EVIDENCE/run.txt"
           [[ "$(git -C verifiers rev-parse HEAD)" == "$GITHUB_SHA" ]]
@@ -113,11 +113,11 @@ jobs:
           common=(-binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE")
           unset BOG_CAPACITY_CONTROL
           capacity_control_available() {
-            if ! timeout --kill-after=2s 5s "$BINARY" -help > "$EVIDENCE/candidate-help.txt" 2>&1; then
+            if ! timeout --kill-after=2s 5s "$BINARY" -help > "$EVIDENCE/${1:-capacity}-candidate-help.txt" 2>&1; then
               echo "Candidate capability probe failed. See candidate-help.txt."
               return 2
             fi
-            if ! grep -Eq '^[[:blank:]]*-enable-capacity-control([[:blank:]=]|$)' "$EVIDENCE/candidate-help.txt"; then
+            if ! grep -Eq '^[[:blank:]]*-enable-capacity-control([[:blank:]=]|$)' "$EVIDENCE/${1:-capacity}-candidate-help.txt"; then
               echo "Live capacity unavailable. Candidate help omits -enable-capacity-control."
               return 1
             fi
@@ -172,13 +172,49 @@ jobs:
             export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/parity.json"
             timeout --kill-after=5s 3m go test -json -count=1 -run '^TestReleaseRestoredParity$' ./verify/release
           )
+          cursor() (
+            capacity_control_available cursor || exit
+            cd gate || exit
+            export BOG_RELEASE_BINARY="$BINARY" BOG_RELEASE_REVISION="$REVISION" BOG_RELEASE_FIXTURE="$FIXTURE"
+            export BOG_RELEASE_CURSOR_REPORT="$EVIDENCE/cursor.json"
+            timeout --kill-after=5s 17m go test -json -count=1 -run '^TestReleaseCursorLifecycle$' ./verify/release
+          )
+          backup() (
+            cd candidate || exit
+            [[ "$(git rev-parse HEAD)" == "$REVISION" && -z "$(git status --porcelain)" ]] || exit 2
+            probe=$(timeout --kill-after=5s 1m go test -list '^TestDestinationStageRecoversRepeatedSIGKILL$' ./internal/backup) || exit
+            if ! grep -Fxq TestDestinationStageRecoversRepeatedSIGKILL <<< "$probe"; then
+              echo "Backup retry check unavailable. Candidate lacks the destination staging coordinator fixture."
+              return 3
+            fi
+            python3 - "$EVIDENCE/backup-overlay.json" "$PWD" "$GITHUB_WORKSPACE/verifiers" <<'PYTHON' || exit
+          import json, pathlib, sys
+          output, candidate, verifiers = map(pathlib.Path, sys.argv[1:])
+          name = "backup_retry_linux_test.go"
+          output.write_text(json.dumps({"Replace": {
+              str(candidate / "internal/backup" / name): str(verifiers / "release" / name),
+          }}))
+          PYTHON
+            timeout --kill-after=5s 2m go test -overlay "$EVIDENCE/backup-overlay.json" -json -count=1 \
+              -run '^(TestDestinationStageRecoversRepeatedSIGKILL|TestReleaseBackupExportRetry)$' ./internal/backup \
+              | tee "$EVIDENCE/backup-tests.jsonl" || exit
+            python3 -B ../verifiers/release_gate.py backup "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE"
+          )
+          # Expiry can take up to 15 minutes. Start its issuer while the other
+          # producers run, and collect its exit status in the parent shell.
+          (cursor 2>&1 | tee "$EVIDENCE/cursor.log") &
+          cursor_pid=$!
           failed=0
-          for name in admission durability capacity parity; do
+          for name in admission durability capacity parity backup; do
             status=0
             "$name" 2>&1 | tee "$EVIDENCE/$name.log" || status=$?
             record "$name" "$status"
             if (( status != 0 )); then failed=1; fi
           done
+          status=0
+          wait "$cursor_pid" || status=$?
+          record cursor "$status"
+          if (( status != 0 )); then failed=1; fi
           exit "$failed"
 
       - name: Validate reports and candidate identity
@@ -206,7 +242,7 @@ jobs:
         run: |
           {
             (cd ../candidate && go test -race -count=1 ./internal/archtest) || exit 1
-            go test -race -count=1 ./verify/linux ./verify/release ./verify/query-model ./bench/retained-history
+            go test -race -count=1 ./verify/linux ./verify/release ./verify/query-model ./bench/retained-history ./internal/client
           } 2>&1 | tee "$EVIDENCE/verifier-race.log"
 
       - name: Publish release evidence

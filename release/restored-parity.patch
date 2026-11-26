@@ -1,17 +1,5 @@
-diff --git a/verify/release/main.go b/verify/release/main.go
-index 3f2254e..4fab646 100644
---- a/verify/release/main.go
-+++ b/verify/release/main.go
-@@ -54,0 +55 @@ func run(ctx context.Context, args []string) error {
-+			{"restored parity", parity, []string{"restored_parity"}},
-@@ -60,5 +60,0 @@ func run(ctx context.Context, args []string) error {
--		if parity != "" {
--			if checkErr := validateFile(parity, id, []string{"restored_parity"}); checkErr != nil {
--				err = errors.Join(err, fmt.Errorf("restored parity report: %w", checkErr))
--			}
--		}
 diff --git a/verify/release/parity_linux_test.go b/verify/release/parity_linux_test.go
-index a854994..4d9d395 100644
+index f6e55c4..f6c2ed6 100644
 --- a/verify/release/parity_linux_test.go
 +++ b/verify/release/parity_linux_test.go
 @@ -14 +13,0 @@ import (
@@ -20,16 +8,16 @@ index a854994..4d9d395 100644
 +	querymodel "bog/verify/query-model"
 @@ -54,0 +55 @@ type parityProof struct {
 +	LegacyRows     int          `json:"legacy_rows"`
-@@ -56,0 +58 @@ type parityProof struct {
+@@ -57,0 +59 @@ type parityProof struct {
 +	AppendedRows   int          `json:"appended_rows"`
-@@ -57,0 +60,6 @@ type parityProof struct {
+@@ -58,0 +61,6 @@ type parityProof struct {
 +	TerminalWalks  struct {
 +		Legacy   int `json:"legacy"`
 +		Restored int `json:"restored"`
 +		Appended int `json:"appended"`
 +		Restart  int `json:"restart"`
 +	} `json:"terminal_walks"`
-@@ -86,0 +95,12 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -87,0 +96,12 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 +	if err := serveDirectory(ctx, binary, filepath.Join(root, "source"), client, flags, func(base string) error {
 +		return checkRestoredWalks(ctx, client, base, rows, &proof.TerminalWalks.Legacy)
 +	}); err != nil {
@@ -42,25 +30,34 @@ index a854994..4d9d395 100644
 +			return proof, fmt.Errorf("isolate restore: %w", err)
 +		}
 +	}
-@@ -89 +109 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -89 +108,0 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+-	augmented := append(slices.Clone(rows), added)
+@@ -91 +110 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -		if err := checkRestoredWalks(ctx, client, base, rows); err != nil {
 +		if err := checkRestoredWalks(ctx, client, base, rows, &proof.TerminalWalks.Restored); err != nil {
-@@ -95 +115,9 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
--		return err
-+		if err != nil {
+@@ -95,0 +115 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
++		proof.PostRestore204 = status == http.StatusNoContent && err == nil
+@@ -97 +117 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+-			return fmt.Errorf("append to restored image: %w", err)
 +			return err
-+		}
+@@ -99,3 +119,3 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+-		proof.PostRestore204 = status == http.StatusNoContent
+-		if err := checkRestoredWalks(ctx, client, base, augmented); err != nil {
+-			return fmt.Errorf("walk after acknowledged post-restore write: %w", err)
 +		rows = append(rows, added)
 +		if err := checkRestoredWalks(ctx, client, base, rows, &proof.TerminalWalks.Appended); err != nil {
 +			return fmt.Errorf("after acknowledged append: %w", err)
-+		}
+@@ -103 +123,2 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+-		proof.PostAppendRows = len(augmented)
 +		proof.AppendedRows = len(rows)
-+		return nil
-@@ -101,2 +129 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
--		rows = append(rows, added)
--		if err := checkRestoredWalks(ctx, client, base, rows); err != nil {
++		proof.PostAppendRows = len(rows)
+@@ -110 +131 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+-		if err := checkRestoredWalks(ctx, client, base, augmented); err != nil {
 +		if err := checkRestoredWalks(ctx, client, base, rows, &proof.TerminalWalks.Restart); err != nil {
-@@ -114 +141,17 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -113 +134 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+-		proof.RestartRows = len(augmented)
++		proof.RestartRows = len(rows)
+@@ -122 +143,17 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -func checkRestoredWalks(ctx context.Context, client *http.Client, base string, appendOrder []row) error {
 +func checkRestoredWalks(ctx context.Context, client *http.Client, base string, appendOrder []row, terminal *int) error {
 +	var log querymodel.Log
@@ -79,7 +76,7 @@ index a854994..4d9d395 100644
 +	if err != nil {
 +		return err
 +	}
-@@ -116,5 +159,3 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
+@@ -124,5 +161,3 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
 -		var want []row
 -		for _, r := range appendOrder {
 -			if strings.Contains(r.Line, filter) {
@@ -88,14 +85,14 @@ index a854994..4d9d395 100644
 +		want, err := log.Match(log.HighWater(), querymodel.Filter{Start: start, End: end, Contains: filter})
 +		if err != nil {
 +			return err
-@@ -122 +162,0 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
+@@ -130 +164,0 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
 -		slices.SortStableFunc(want, func(a, b row) int { return strings.Compare(a.TS, b.TS) })
-@@ -126,0 +167 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
+@@ -134,0 +169 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
 +			(*terminal)++
-@@ -132 +173 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
+@@ -140 +175 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
 -func checkRestoredWalk(ctx context.Context, client *http.Client, base, filter string, limit int, want []row) error {
 +func checkRestoredWalk(ctx context.Context, client *http.Client, base, filter string, limit int, want []querymodel.Entry) error {
-@@ -143 +184,7 @@ func checkRestoredWalk(ctx context.Context, client *http.Client, base, filter st
+@@ -151 +186,7 @@ func checkRestoredWalk(ctx context.Context, client *http.Client, base, filter st
 -		n, err := checkRows(res, want)
 +		// VerifyWalk models row-limited pages. This fixture also has a byte
 +		// limit, so compare each returned prefix against Match's ordered rows.
@@ -104,17 +101,7 @@ index a854994..4d9d395 100644
 +			expected = append(expected, row{entry.Time.Format(time.RFC3339Nano), entry.Line})
 +		}
 +		n, err := checkRows(res, expected)
-@@ -147,3 +193,0 @@ func checkRestoredWalk(ctx context.Context, client *http.Client, base, filter st
+@@ -155,3 +195,0 @@ func checkRestoredWalk(ctx context.Context, client *http.Client, base, filter st
 -		if n > limit {
 -			return errors.New("page exceeded row limit")
 -		}
-diff --git a/verify/release/report_test.go b/verify/release/report_test.go
-index 7ffef1b..0692989 100644
---- a/verify/release/report_test.go
-+++ b/verify/release/report_test.go
-@@ -96,0 +97 @@ func TestValidateCommand(t *testing.T) {
-+		{"parity", []string{"restored_parity"}},
-@@ -118,0 +120,3 @@ func TestValidateCommand(t *testing.T) {
-+	if err := run(t.Context(), args[:len(args)-2]); err == nil || !strings.Contains(err.Error(), "restored parity report") {
-+		t.Fatalf("validation without parity accepted: %v", err)
-+	}

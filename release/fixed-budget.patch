@@ -1,51 +1,223 @@
 diff --git a/verify/release/admission.go b/verify/release/admission.go
-index 5e65629..cdc9620 100644
+index efb71ba..27e36b6 100644
 --- a/verify/release/admission.go
 +++ b/verify/release/admission.go
-@@ -112,0 +113,4 @@ func requireRejection(ctx context.Context, client *http.Client, target string) (
-+	return requireRejectionBody(ctx, client, target, "")
-+}
-+
-+func requireRejectionBody(ctx context.Context, client *http.Client, target, expectedBody string) (rejection, error) {
-@@ -129,0 +134,3 @@ func requireRejection(ctx context.Context, client *http.Client, target string) (
-+	if expectedBody != "" && (!strings.HasPrefix(res.contentType, "text/plain") || string(res.body) != expectedBody) {
-+		return evidence, fmt.Errorf("unexpected HTTP 503 body or content type: %.200q (%q)", res.body, res.contentType)
-+	}
-@@ -338 +345,6 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
--	budgetErr := serve(ctx, binary, client, []string{"-query-concurrency=1", "-query-work-budget=1"}, func(base string) error {
-+	var budget struct {
-+		rejection
+@@ -340 +340,2 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
+-		FixedBudgetWalk budgetWalkProof `json:"fixed_budget_walk"`
++		FixedBudgetWalk budgetWalkProof  `json:"fixed_budget_walk"`
 +		FixedPagination fixedBudgetProof `json:"fixed_budget_pagination"`
-+		FixedWalk       fixedBudgetProof `json:"fixed_budget_walk"`
-+	}
-+	budgetErr := serve(ctx, binary, client, []string{"-query-concurrency=1", fixedBudgetFlag + "=1"}, func(base string) error {
-@@ -342,2 +354,3 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
--		result, err := requireRejection(ctx, client, base+queryPath("", 1, budgetFilter))
--		return record(cases, "work_budget", result, err)
-+		var err error
-+		budget.rejection, err = requireRejectionBody(ctx, client, base+queryPath("", 1, budgetFilter), "query work budget exhausted\n")
-+		return err
-@@ -345,2 +358,10 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
--	if _, ok := cases["work_budget"]; !ok {
--		budgetErr = record(cases, "work_budget", nil, budgetErr)
-+	if budgetErr == nil {
-+		budget.FixedPagination, budgetErr = probeFixedBudget(ctx, binary, client, []row{
+@@ -354,0 +356,6 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
++	if walkErr == nil {
++		budgetProof.FixedPagination, walkErr = probeFixedBudget(ctx, binary, client, []row{
 +			{fixtureStart, "first"},
 +			{"2020-01-01T00:00:01Z", strings.Repeat("x", fixedBudgetPadding)},
 +		})
 +	}
-+	if budgetErr == nil {
-+		budget.FixedWalk, budgetErr = probeFixedBudget(ctx, binary, client, []row{
-+			{fixtureStart, "c"}, {fixtureStart, "a"}, {fixtureStart, "b"},
+diff --git a/verify/release/budget_walk.go b/verify/release/budget_walk.go
+index 61b7a7e..782a3e3 100644
+--- a/verify/release/budget_walk.go
++++ b/verify/release/budget_walk.go
+@@ -28,0 +29,2 @@ type budgetWalkProof struct {
++	// Retain the prior verifier's tied-walk report fields.
++	fixedBudgetProof
+@@ -84,0 +87,7 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
++	if tiedErr == nil {
++		proof.fixedBudgetProof = fixedBudgetProof{
++			Budget: tied.FirstCursorBudget, RejectedBudget: tied.FirstCursorBudget - 1,
++			RejectedHTTP: http.StatusServiceUnavailable, FirstRows: 1,
++			ResumedRows: tied.Rows - 1, ContinuationPages: tied.Pages - 1, Terminal: true,
++		}
++	}
+diff --git a/verify/release/cutover_linux_test.go b/verify/release/cutover_linux_test.go
+new file mode 100644
+index 0000000..b183bfb
+--- /dev/null
++++ b/verify/release/cutover_linux_test.go
+@@ -0,0 +1,179 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/http"
++	"os"
++	"strings"
++	"testing"
++	"time"
++
++	bogclient "bog/internal/client"
++)
++
++func TestReleaseCursorLifecycle(t *testing.T) {
++	path := os.Getenv("BOG_RELEASE_CURSOR_REPORT")
++	if path == "" {
++		t.Skip("release cursor report path required")
++	}
++	binary := os.Getenv("BOG_RELEASE_BINARY")
++	id, err := readIdentity(binary, os.Getenv("BOG_RELEASE_REVISION"), os.Getenv("BOG_RELEASE_FIXTURE"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx, cancel := context.WithTimeout(t.Context(), 16*time.Minute)
++	defer cancel()
++	cases := make(map[string]outcome)
++	wire := &http.Client{Timeout: queryDeadline}
++	defer wire.CloseIdleConnections()
++	err = errors.Join(
++		probePagePreparation(ctx, binary, wire, cases),
++		probeAuthenticatedExpiry(ctx, binary, wire, cases),
++	)
++	data, writeErr := json.MarshalIndent(report{id, cases}, "", "  ")
++	if writeErr == nil {
++		writeErr = os.WriteFile(path, append(data, '\n'), 0600)
++	}
++	if err := errors.Join(err, writeErr); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func cleanPageFailure(res response, status int, prefix string) bool {
++	return res.status == status && !res.cursorHeader &&
++		strings.HasPrefix(res.contentType, "text/plain") &&
++		strings.HasPrefix(string(res.body), prefix) && strings.Count(string(res.body), "\n") == 1 &&
++		strings.HasSuffix(string(res.body), "\n")
++}
++
++func probePagePreparation(ctx context.Context, binary string, wire *http.Client, cases map[string]outcome) error {
++	status := 0
++	err := serve(ctx, binary, wire, []string{"-query-max-response-bytes=96"}, func(base string) error {
++		if _, err := ingest(ctx, wire, base, []row{{fixtureStart, "fits"}, {fixtureStart, strings.Repeat("x", 128)}}); err != nil {
++			return err
++		}
++		res, err := request(ctx, wire, http.MethodGet, base+queryPath("", 1, ""), nil)
++		if err != nil {
++			return err
++		}
++		if !cleanPageFailure(res, http.StatusUnprocessableEntity, "query record exceeds response byte limit") {
++			return fmt.Errorf("first-page certification of an oversized later row: HTTP %d, cursor=%t", res.status, res.cursorHeader)
++		}
++		status = res.status
++		return nil
++	})
++	return record(cases, "first_page_preparation", map[string]int{"http_status": status}, err)
++}
++
++func probeAuthenticatedExpiry(ctx context.Context, binary string, wire *http.Client, cases map[string]outcome) error {
++	proof := make(map[string]int)
++	err := serve(ctx, binary, wire, nil, func(base string) error {
++		rows := []row{{fixtureStart, "first"}, {fixtureStart, "last"}}
++		if _, err := ingest(ctx, wire, base, rows); err != nil {
++			return err
++		}
++		client, err := bogclient.New(base, nil)
++		if err != nil {
++			return err
++		}
++		defer client.CloseIdleConnections()
++		start, err := time.Parse(time.RFC3339, fixtureStart)
++		if err != nil {
++			return err
++		}
++		end, err := time.Parse(time.RFC3339, fixtureEnd)
++		if err != nil {
++			return err
++		}
++		q := bogclient.Query{Start: start, End: end, Limit: 1}
++		first, err := client.FetchPage(ctx, q, "")
++		if err != nil {
++			return err
++		}
++		if first.NextCursor == "" || len(first.Rows) != 1 || !first.Rows[0].TS.Equal(start) || first.Rows[0].Line != "first" {
++			return errors.New("expiry fixture did not issue a cursor after the expected first row")
++		}
++		checkLast := func(p bogclient.Page) error {
++			if len(p.Rows) != 1 || !p.Rows[0].TS.Equal(start) || p.Rows[0].Line != "last" || p.NextCursor != "" {
++				return errors.New("wrong terminal page while the cursor was live")
++			}
++			return nil
++		}
++		cursor, err := client.WalkFrom(ctx, q, first.NextCursor, checkLast)
++		if err != nil || cursor != "" {
++			return fmt.Errorf("resume before expiry did not finish: %v", err)
++		}
++		proof["live_terminal_rows"] = 1
++
++		// Change the leading byte to avoid base64 encodings that differ only
++		// in unused trailing bits. The original token remains on its issuer.
++		changed := byte('A')
++		if first.NextCursor[0] == changed {
++			changed = 'B'
++		}
++		res, err := request(ctx, wire, http.MethodGet, base+queryPath(string(changed)+first.NextCursor[1:], 1, ""), nil)
++		if err != nil {
++			return err
++		}
++		if !cleanPageFailure(res, http.StatusBadRequest, "invalid cursor\n") {
++			return fmt.Errorf("tampered continuation: HTTP %d", res.status)
++		}
++		proof["tampered_http_status"] = res.status
++
++		ticker := time.NewTicker(5 * time.Second)
++		defer ticker.Stop()
++		for {
++			select {
++			case <-ctx.Done():
++				return fmt.Errorf("wait for authenticated cursor expiry: %w", ctx.Err())
++			case <-ticker.C:
++			}
++			res, err := request(ctx, wire, http.MethodGet, base+queryPath(first.NextCursor, 1, ""), nil)
++			if err != nil {
++				return err
++			}
++			if res.status == http.StatusOK {
++				n, err := checkRows(res, rows[1:])
++				if err != nil || n != 1 || res.cursorHeader {
++					return fmt.Errorf("live retry did not reproduce the terminal page: %v", err)
++				}
++				continue
++			}
++			if !cleanPageFailure(res, http.StatusGone, "query capture expired\n") {
++				return fmt.Errorf("authenticated expired continuation: HTTP %d", res.status)
++			}
++			proof["expired_http_status"] = res.status
++			break
++		}
++		delivered := false
++		retry, err := client.WalkFrom(ctx, q, first.NextCursor, func(bogclient.Page) error {
++			delivered = true
++			return nil
 +		})
-@@ -348 +369 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
--	return errors.Join(saturationErr, budgetErr)
-+	return errors.Join(saturationErr, record(cases, "work_budget", budget, budgetErr))
-diff --git a/verify/release/fixed_budget.go b/verify/release/fixed_budget.go
++		var status *bogclient.HTTPError
++		if delivered || retry != first.NextCursor || !errors.As(err, &status) ||
++			status.StatusCode != http.StatusGone || status.Body != "query capture expired\n" || status.Cause != nil {
++			return errors.New("production client did not preserve the failed continuation without delivering rows")
++		}
++		proof["failed_cursor_preserved"] = 1
++		freshRows := 0
++		fresh, err := client.Walk(ctx, q, func(p bogclient.Page) error {
++			for _, got := range p.Rows {
++				if freshRows >= len(rows) || !got.TS.Equal(start) || got.Line != rows[freshRows].Line {
++					return errors.New("wrong row on fresh walk after cursor expiry")
++				}
++				freshRows++
++			}
++			return nil
++		})
++		if err != nil || fresh != "" || freshRows != len(rows) {
++			return fmt.Errorf("fresh walk after expiry did not match %d rows: %v", len(rows), err)
++		}
++		proof["fresh_terminal_rows"] = freshRows
++		return nil
++	})
++	return record(cases, "authenticated_expiry", proof, err)
++}
+diff --git a/verify/release/prior_budget.go b/verify/release/prior_budget.go
 new file mode 100644
 index 0000000..f6a86c5
 --- /dev/null
-+++ b/verify/release/fixed_budget.go
++++ b/verify/release/prior_budget.go
 @@ -0,0 +1,135 @@
 +package main
 +

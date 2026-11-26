@@ -14,7 +14,8 @@ MEMORY_LIMIT = 128 * 1024**2
 SEED_ROWS = {196_608, 393_216}
 TAIL_ROWS = 2_048
 BATCH_ROWS = 64
-PRODUCERS = {"admission", "durability", "capacity", "parity"}
+PRODUCERS = {"admission", "durability", "capacity", "parity", "cursor", "backup"}
+BACKUP_TESTS = {"TestDestinationStageRecoversRepeatedSIGKILL", "TestReleaseBackupExportRetry"}
 
 
 def identity(binary, revision, fixture):
@@ -83,6 +84,16 @@ def validate_capacity(evidence):
         check(compaction["state"] == "complete" and integer(compaction.get("generation"), seed // 8192 + 1) and
               integer(compaction.get("covered_rows"), seed + BATCH_ROWS, seed + BATCH_ROWS) and
               integer(compaction.get("committed_rows"), total, total), f"{label}: invalid compaction evidence")
+        queries = run["diagnostics"]["queries"]
+        for phase, cursor in (("seed_capture", True), ("after_publication_continuation", False),
+                              ("fresh_backfill", False), ("restart_walk", False)):
+            sample = queries[phase]
+            attempts = sample["attempts"]
+            last = sample["last"]
+            check(integer(attempts, 1) and sample["admissions"] == {"ndjson_response": attempts} and
+                  "first_failure" not in sample and last["phase"] == "complete" and
+                  integer(last.get("http_status"), 200, 200) and integer(last.get("body_bytes"), 1) and
+                  last["has_cursor_header"] is cursor, f"{label}: missing exact walk evidence for {phase}")
         cleanup = run["cleanup"]
         check(cleanup["status"] == "pass" and cleanup["candidate_reaped"] is True and
               cleanup["subtree_empty"] is True and cleanup["subtree_removed"] is True and
@@ -93,14 +104,52 @@ def validate_budget(evidence):
     check(integer(evidence.get("http_status"), 503, 503) and
           integer(evidence.get("ndjson_rows"), 0, 0) and evidence.get("next_cursor") is False and
           integer(evidence.get("elapsed_ms"), 0, 1999), "admission: incomplete work budget rejection")
-    for name, continuations in (("fixed_budget_pagination", 1), ("fixed_budget_walk", 2)):
-        fixed = evidence[name]
-        budget = fixed.get("budget")
-        check(integer(budget, 2, 16_384) and integer(fixed.get("rejected_budget"), budget - 1, budget - 1) and
-              integer(fixed.get("rejected_http_status"), 503, 503) and integer(fixed.get("first_rows"), 1, 1) and
-              integer(fixed.get("resumed_rows"), continuations, continuations) and
-              integer(fixed.get("continuation_pages"), continuations, continuations) and fixed.get("terminal") is True,
-              f"admission: incomplete {name} evidence")
+    tied = evidence["fixed_budget_walk"]
+    sparse = tied["sparse_walk"]
+    for name, walk, rows in (("tied", tied, 3), ("sparse", sparse, 4)):
+        budget = walk.get("first_cursor_budget")
+        check(integer(budget, 2, 2048) and
+              integer(walk.get("rejected_budgets"), 1, budget - 1) and
+              integer(walk.get("pages"), 3, 3) and integer(walk.get("rows"), rows, rows),
+              f"admission: incomplete {name} fixed-budget walk")
+    check(tied["rejected_budgets"] == tied["first_cursor_budget"] - 1 and
+          all(integer(sparse.get(key), value, value) for key, value in {
+              "response_byte_cap": 96, "first_limit": 4, "first_rows": 2, "resume_limit": 1,
+          }.items()), "admission: incomplete issuing boundary or smaller-limit resume evidence")
+
+
+def validate_retarget(evidence):
+    healthy = evidence["healthy_to_full"]
+    full = evidence["full_to_healthy"]
+    check(integer(healthy.get("readiness_status"), 200, 200) and healthy.get("readiness_reason") == "ready" and
+          integer(healthy.get("ingest_status"), 204, 204) and healthy.get("replayed_after_restart") is True,
+          "durability: incomplete healthy-to-full retarget evidence")
+    check(integer(full.get("readiness_status"), 503, 503) and
+          full.get("readiness_reason") == "low_disk_headroom" and
+          integer(full.get("ingest_status"), 503, 503) and full.get("post_ingest_reason") == "wal_rollback" and
+          full.get("post_ingest_category") == "enospc",
+          "durability: incomplete full-to-healthy retarget evidence")
+
+
+def backup_test_results(directory):
+    passed = []
+    with (directory / "backup-tests.jsonl").open() as stream:
+        for line in stream:
+            event = json.loads(line, object_pairs_hook=unique_fields)
+            if event.get("Package") == "bog/internal/backup" and event.get("Action") == "pass":
+                passed.append(event.get("Test"))
+    check(len(passed) == len(BACKUP_TESTS) + 1 and set(passed) == BACKUP_TESTS | {None},
+          "backup: expected both retry tests and the package to pass")
+    return sorted(BACKUP_TESTS)
+
+
+def produce_backup(directory, expected):
+    tests = backup_test_results(directory)
+    report = {**expected, "cases": {"backup_retry": {"status": "pass", "evidence": {
+        "candidate_source_revision": expected["revision"], "passed_tests": tests,
+        "test_log_sha256": file_sha256(directory / "backup-tests.jsonl"),
+    }}}}
+    (directory / "backup.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
 def validate_parity(evidence):
@@ -126,13 +175,27 @@ def validate(directory, expected):
           set(statuses) == {f"{name} revision={expected['revision']} exit=0" for name in PRODUCERS},
           "missing, repeated or failing release producer status")
     validate_budget(case_evidence(directory, "admission", "work_budget", expected))
-    ready = case_evidence(directory, "durability", "descriptor_bound_readiness", expected)
-    check(integer(ready.get("initial_http_status"), 200, 200) and
-          integer(ready.get("full_http_status"), 503, 503) and ready.get("full_reason") == "low_disk_headroom" and
-          integer(ready.get("recovered_http_status"), 200, 200) and ready.get("recovered_reason") == "ready",
-          "durability: incomplete descriptor-bound readiness evidence")
+    saturated = case_evidence(directory, "admission", "one_slot_saturation", expected)
+    check(integer(saturated.get("http_status"), 503, 503) and
+          integer(saturated.get("ndjson_rows"), 0, 0) and saturated.get("next_cursor") is False and
+          all(saturated.get(key) is True for key in (
+              "response_started", "backpressured_before", "backpressured_after",
+          )), "admission: missing clean continuation rejection under backpressure")
+    validate_retarget(case_evidence(directory, "durability", "enospc", expected))
     validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected))
     validate_parity(case_evidence(directory, "parity", "restored_parity", expected))
+    first = case_evidence(directory, "cursor", "first_page_preparation", expected)
+    check(integer(first.get("http_status"), 422, 422), "cursor: missing first-page preparation rejection")
+    expiry = case_evidence(directory, "cursor", "authenticated_expiry", expected)
+    check(all(integer(expiry.get(key), value, value) for key, value in {
+        "live_terminal_rows": 1, "tampered_http_status": 400, "expired_http_status": 410,
+        "failed_cursor_preserved": 1, "fresh_terminal_rows": 2,
+    }.items()), "cursor: incomplete expiry or failed continuation evidence")
+    backup = case_evidence(directory, "backup", "backup_retry", expected)
+    check(backup.get("candidate_source_revision") == expected["revision"] and
+          backup.get("passed_tests") == backup_test_results(directory) and
+          backup.get("test_log_sha256") == file_sha256(directory / "backup-tests.jsonl"),
+          "backup: missing candidate source retry evidence")
     control = case_evidence(directory, "control", "capacity_control", expected)
     published = control["published"]
     check(integer(control["default_http_status"], 404, 404) and integer(control["wildcard_opt_in_exit"], 1) and
@@ -162,7 +225,7 @@ def produce_control(binary, directory, expected):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("control", "validate"))
+    parser.add_argument("action", choices=("control", "backup", "validate"))
     parser.add_argument("binary", type=Path)
     parser.add_argument("revision")
     parser.add_argument("fixture")
@@ -174,6 +237,8 @@ def main():
         expected = identity(binary, args.revision, args.fixture)
         if args.action == "control":
             produce_control(binary, directory, expected)
+        elif args.action == "backup":
+            produce_backup(directory, expected)
         else:
             validate(directory, expected)
     except (Rejected, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:

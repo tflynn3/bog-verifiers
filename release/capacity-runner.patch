@@ -1,21 +1,25 @@
+diff --git a/bench/retained-history/platform_linux.go b/bench/retained-history/platform_linux.go
+index 935cac7..822ae07 100644
 --- a/bench/retained-history/platform_linux.go
 +++ b/bench/retained-history/platform_linux.go
-@@ -47 +47 @@
+@@ -58 +58 @@ func startChild(binary, dir, group, mode string) (*child, string, error) {
 -		cmd.Env = append(cmd.Env, capacityControlEnv+"=1")
 +		cmd.Args = append(cmd.Args, "-enable-capacity-control")
+diff --git a/bench/retained-history/platform_linux_test.go b/bench/retained-history/platform_linux_test.go
+index 6fb9ba6..0debe9e 100644
 --- a/bench/retained-history/platform_linux_test.go
 +++ b/bench/retained-history/platform_linux_test.go
-@@ -15 +15 @@
+@@ -96 +96 @@ printf '%s\n' "$value" > observed
 -func TestChildCapacityControlEnvironment(t *testing.T) {
 +func TestChildCapacityControlOptIn(t *testing.T) {
-@@ -18,2 +18,2 @@
+@@ -99,2 +99,2 @@ func TestChildCapacityControlEnvironment(t *testing.T) {
 -		{"live", "0", "1/preserved"},
 -		{"legacy", "1", "unset/preserved"},
 +		{"live", "0", "unset/preserved/-enable-capacity-control"},
 +		{"legacy", "1", "unset/preserved/unset"},
-@@ -26 +26 @@
+@@ -107 +107 @@ func TestChildCapacityControlEnvironment(t *testing.T) {
 -				"#!/bin/sh\nprintf '%s/%s' \"${BOG_CAPACITY_CONTROL-unset}\" \"$BOG_CAPACITY_TEST_SENTINEL\" > observed\n"), 0700); err != nil {
 +				"#!/bin/sh\nprintf '%s/%s/%s' \"${BOG_CAPACITY_CONTROL-unset}\" \"$BOG_CAPACITY_TEST_SENTINEL\" \"${5-unset}\" > observed\n"), 0700); err != nil {
-@@ -46 +46 @@
+@@ -127 +127 @@ func TestChildCapacityControlEnvironment(t *testing.T) {
 -				t.Fatalf("candidate environment: got %q, want %q (%v)", got, tc.want, err)
 +				t.Fatalf("candidate opt-in: got %q, want %q (%v)", got, tc.want, err)

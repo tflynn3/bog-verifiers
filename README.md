@@ -221,46 +221,52 @@ docker start -a "$container"
 
 Run harness regressions with `python3 -B -m unittest discover -s tests -v`.
 
-## Linux release qualification for #53
+## Linux cutover qualification for #53, #59, #60, and #61
 
-Dispatch **Linux release verification** from the verifier ref containing these
-gate updates. Supply the full Bog commit SHA with the composed runtime and
-capacity changes. The workflow applies the verifier patches to a separate
-pinned gate checkout and builds one clean Linux amd64 candidate binary. The
-admission, durability, live capacity, and restored parity producers must all
-pass for fixture `linux-release-v1` with schema version 1 and the same candidate
-revision and binary SHA-256. The capacity stage also keeps its loopback control
-report. Download `linux-release-evidence` for the checkout revisions, build
-identity, reports, producer statuses, and logs.
+Dispatch **Linux release verification** from the verifier ref containing this
+gate. Supply the full Bog commit SHA that composes the runtime changes. The
+workflow checks out #61 at `820dc5c988a0e79bb4a83227144998ea44cf32d5` for
+the production-client release probes and applies the checked-in fixture
+patches. It builds one clean Linux amd64 candidate and validates schema 1
+reports against that commit, its binary SHA-256, and fixture
+`linux-release-v1`. The `linux-release-evidence` artifact contains the
+workflow and tooling revisions, the build identity, raw reports, and logs.
 
-The admission report preserves the existing saturation and work-budget
-rejections. Its `work_budget` case also records the measured budget for a
-one-row first page, a clean HTTP 503 one unit below it, and a full terminal
-continuation at the same fixed budget. A separate three-row walk measures its
-own first-page boundary and checks both continuations at that budget, in
-append order across tied timestamps.
+- Admission retains the slow-reader saturation, ingest, cursor retry, and
+  budget-1 probes. #61 walks tied rows in append order and sparse,
+  byte-trimmed matches with a smaller continuation limit. Each issuing
+  budget must complete the walk. Lower sampled budgets must reject before
+  sending rows or a cursor.
+- Cursor lifecycle checks clean HTTP 422 when a later matching row would
+  prevent a first page from certifying the walk. An issued cursor must
+  produce its terminal page while live. A tampered token returns HTTP 400,
+  and the original token returns HTTP 410 on the same process after expiry.
+  The production client must preserve the failed continuation without
+  delivering rows, and a fresh walk must match exactly. The expiry probe
+  runs alongside the other producers and allows the documented 15-minute
+  lifetime.
+- Linux durability retains SIGKILL, corruption recovery, and kernel ENOSPC
+  checks. After #60, a healthy-to-full path retarget must keep reporting
+  ready and accept a durable write on the opened filesystem. A
+  full-to-healthy retarget must keep reporting low disk headroom and reject
+  the write with the WAL rollback category.
+- Live capacity requires both seed sizes under the 128 MiB cgroup budget.
+  It must reconcile the held cursor after publication, see acknowledged
+  backfill on a fresh query, and walk every committed row after restart.
+  Both sizes must report terminal parity and successful cgroup cleanup.
+- Restored parity checks exact append-log order across row limits and
+  literal filters for the legacy layout and isolated writable restore.
+  It repeats the nine terminal walks after an acknowledged append and
+  after SIGKILL and restart.
+- Backup retry tests run against the pinned candidate source. The public
+  export probe kills three publishers once staging has begun, retries to
+  the same destination, verifies the recovered bundle, and checks that no
+  stage remains and an unrelated sibling survives. The coordinator probe
+  also checks concurrent retries. The report carries the release identity
+  and digest of the Go test event log.
 
-The durability report also checks `GET /ready` while the original data
-directory path is absent. After moving the directory within the private
-tmpfs, the producer fills that filesystem and requires HTTP 503 with
-`low_disk_headroom`. Freeing the space must return HTTP 200 with `ready`
-while the original path is still absent. A candidate without `GET /ready`
-skips this case in the producer. Release qualification requires it to pass.
-
-The capacity report must show both 196,608 and 393,216 retained rows under a
-128 MiB cgroup memory limit, exact recovery after restart, a published
-compaction cutoff, all required measurements, and successful cleanup for each
-fixture. The cleanup evidence records candidate reaping, an empty cgroup subtree,
-and its removal. The restored parity producer checks legacy startup, then
-starts the candidate on a verified v1 restore after removing the legacy source
-and backup bundle. It uses `verify/query-model` for exact ordered rows and
-records nine terminal walks per stage, including before the append, after
-HTTP 204, and after SIGKILL and restart.
-
-The short Slipway capacity control suite runs when Bog advertises
-`-enable-capacity-control`. It checks that the control is absent by default,
-that opt-in rejects a wildcard bind, and that loopback compaction publishes a
-generation whose rows survive SIGKILL and restart. An older candidate skips
-only this suite. The manually dispatched release workflow records an
-unavailable live capacity result when the flag is absent and requires passing
-live capacity, control, and restored parity evidence to qualify a release.
+Candidates that omit the loopback capacity flag skip its Slipway suite.
+The manual cutover dispatch probes for that flag before its live capacity
+and cursor lifecycle checks, and looks for the backup coordinator fixture
+before running the backup checks. Cutover qualification requires affirmative
+evidence even when an earlier candidate legitimately lacks a capability.
