@@ -1,0 +1,54 @@
+--- a/bench/retained-history/main.go
++++ b/bench/retained-history/main.go
+@@ -43,0 +44,6 @@
++type teardown struct {
++	ProcessesReaped int  `json:"processes_reaped"`
++	CgroupRemoved   bool `json:"cgroup_removed"`
++	StoreRemoved    bool `json:"store_removed"`
++}
++
+@@ -57,0 +64 @@
++	Teardown teardown `json:"teardown"`
+--- a/bench/retained-history/platform_linux.go
++++ b/bench/retained-history/platform_linux.go
+@@ -47 +47 @@
+-		cmd.Env = append(cmd.Env, capacityControlEnv+"=1")
++		cmd.Args = append(cmd.Args, "-enable-capacity-control")
+@@ -235 +235,5 @@
+-		defer func() { err = errors.Join(err, os.RemoveAll(dir)) }()
++		defer func() {
++			removeErr := os.RemoveAll(dir)
++			r.Teardown.StoreRemoved = removeErr == nil
++			err = errors.Join(err, removeErr)
++		}()
+@@ -241 +245,6 @@
+-		defer func() { r.collect(group); err = errors.Join(err, closeGroup(group)) }()
++		defer func() {
++			r.collect(group)
++			closeErr := closeGroup(group)
++			r.Teardown.CgroupRemoved = closeErr == nil
++			err = errors.Join(err, closeErr)
++		}()
+@@ -261 +270,5 @@
+-					err = errors.Join(err, p.stop())
++					stopErr := p.stop()
++					if stopErr == nil {
++						r.Teardown.ProcessesReaped++
++					}
++					err = errors.Join(err, stopErr)
+--- a/bench/retained-history/platform_linux_test.go
++++ b/bench/retained-history/platform_linux_test.go
+@@ -14 +14 @@
+-func TestChildCapacityControlEnvironment(t *testing.T) {
++func TestChildCapacityControlOptIn(t *testing.T) {
+@@ -18,2 +18,2 @@
+-		{"live", "1/preserved"},
+-		{"legacy", "unset/preserved"},
++		{"live", "unset/preserved/-enable-capacity-control"},
++		{"legacy", "unset/preserved/unset"},
+@@ -25 +25 @@
+-				"#!/bin/sh\nprintf '%s/%s' \"${BOG_CAPACITY_CONTROL-unset}\" \"$BOG_CAPACITY_TEST_SENTINEL\" > observed\n"), 0700); err != nil {
++				"#!/bin/sh\nprintf '%s/%s/%s' \"${BOG_CAPACITY_CONTROL-unset}\" \"$BOG_CAPACITY_TEST_SENTINEL\" \"${5-unset}\" > observed\n"), 0700); err != nil {
+@@ -44 +44 @@
+-				t.Fatalf("candidate environment: got %q, want %q (%v)", got, tc.want, err)
++				t.Fatalf("candidate opt-in: got %q, want %q (%v)", got, tc.want, err)

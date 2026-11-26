@@ -1,0 +1,203 @@
+name: Linux release verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Full lowercase commit SHA to qualify
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+  GOWORK: 'off'
+  GOAMD64: v1
+  CGO_ENABLED: '0'
+  FIXTURE: linux-release-v1
+  BOG_REPOSITORY: tflynn3/bog
+  TOOLING_REVISION: efb5f059f5ad7ab04e3321f33c4c7a4b2f7ea605
+  REVISION: ${{ inputs.revision }}
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Record fixture and check revision input
+        run: |
+          EVIDENCE="$RUNNER_TEMP/bog-release-evidence"
+          mkdir -p "$EVIDENCE"
+          printf 'EVIDENCE=%s\nBINARY=%s\n' "$EVIDENCE" "$RUNNER_TEMP/bog-release-candidate" >> "$GITHUB_ENV"
+          {
+            printf 'revision=%q\nfixture=%s\n' "$REVISION" "$FIXTURE"
+            uname -a
+            printf 'runner_os=%s\nrunner_arch=%s\nimage_os=%s\nimage_version=%s\n' "$RUNNER_OS" "$RUNNER_ARCH" "${ImageOS:-unknown}" "${ImageVersion:-unknown}"
+            cat /etc/os-release
+            nproc
+            findmnt --target "$RUNNER_TEMP"
+            findmnt --target /sys/fs/cgroup
+          } | tee "$EVIDENCE/run.txt"
+          [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "Expected a full lowercase commit SHA" | tee -a "$EVIDENCE/run.txt"; exit 1; }
+          [[ "$RUNNER_ARCH" == X64 && "$(uname -m)" == x86_64 ]]
+
+      - uses: actions/checkout@v4
+        with:
+          path: verifiers
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BOG_REPOSITORY }}
+          ref: ${{ env.TOOLING_REVISION }}
+          path: gate
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BOG_REPOSITORY }}
+          ref: ${{ inputs.revision }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Record fixture configuration
+        run: |
+          cp gate/verify/release/README.md "$EVIDENCE/fixture.md"
+          cp gate/verify/linux/README.md "$EVIDENCE/durability-fixture.md"
+          cp gate/bench/retained-history/README.md "$EVIDENCE/capacity-fixture.md"
+          cp verifiers/release/capacity-runner.patch "$EVIDENCE/"
+          printf 'tooling_revision=%s\nverifier_revision=%s\n' "$(git -C gate rev-parse HEAD)" \
+            "$(git -C verifiers rev-parse HEAD)" | tee -a "$EVIDENCE/run.txt"
+          [[ "$(git -C gate rev-parse HEAD)" == "$TOOLING_REVISION" ]]
+          git -C gate apply --unidiff-zero "$GITHUB_WORKSPACE/verifiers/release/capacity-runner.patch"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.0'
+          cache: false
+
+      - name: Build pinned candidate
+        id: build
+        working-directory: candidate
+        timeout-minutes: 6
+        run: |
+          {
+            head=$(git rev-parse HEAD)
+            printf 'HEAD=%s\n' "$head"
+            [[ "$head" == "$REVISION" ]]
+            [[ -z "$(git status --porcelain)" ]]
+            go version
+            [[ "$(go env GOVERSION GOOS GOARCH GOTOOLCHAIN GOAMD64 CGO_ENABLED)" == $'go1.27.0\nlinux\namd64\nlocal\nv1\n0' ]]
+            go build -trimpath -buildvcs=true -o "$BINARY" ./cmd/bog
+            go version -m "$BINARY" | tee "$EVIDENCE/build-info.txt"
+            grep -Eq "^[[:space:]]+build[[:space:]]+vcs.revision=$REVISION$" "$EVIDENCE/build-info.txt"
+            grep -Eq '^[[:space:]]+build[[:space:]]+vcs.modified=false$' "$EVIDENCE/build-info.txt"
+            sha256sum "$BINARY" | tee "$EVIDENCE/binary.sha256"
+          } 2>&1 | tee "$EVIDENCE/build.log"
+
+      - name: Run release evidence producers
+        if: steps.build.outcome == 'success'
+        timeout-minutes: 48
+        run: |
+          record() {
+            local name=$1 status=$2
+            printf '%s revision=%s exit=%d\n' "$name" "$REVISION" "$status" | tee -a "$EVIDENCE/producers.txt"
+          }
+          common=(-binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE")
+          admission() (
+            cd gate || exit
+            timeout --kill-after=5s 2m go run ./verify/release "${common[@]}" -report "$EVIDENCE/admission.json"
+          )
+          durability() (
+            cd gate || exit
+            timeout --kill-after=5s 15m go run ./verify/linux "${common[@]}" -report "$EVIDENCE/durability.json"
+          )
+          capacity() (
+            cd gate || exit
+            work=$(mktemp -d "$RUNNER_TEMP/bog-capacity.XXXXXXXX") || exit
+            cleanup() {
+              local status=$?
+              rm -rf -- "$work" || status=1
+              exit "$status"
+            }
+            trap cleanup EXIT
+            go build -trimpath -o "$work/capacity" ./bench/retained-history || exit
+            sudo -n systemd-run --quiet --wait --pipe --collect --expand-environment=no \
+              --uid="$(id -u)" --gid="$(id -g)" -p 'Delegate=memory io' -p DelegateSubgroup=runner \
+              -p RuntimeMaxSec=24min -p TimeoutStopSec=10s \
+              /bin/bash -euo pipefail -c '
+                work=$1 evidence=$2
+                shift 2
+                read -r unified </proc/self/cgroup
+                [[ "$unified" == 0::/*/runner ]]
+                group="/sys/fs/cgroup${unified#0::}"
+                parent="${group%/*}"
+                printf "+memory +io\n" > "$parent/cgroup.subtree_control"
+                {
+                  printf "capacity_mode=live\ncapacity_cgroup=%s\ncapacity_work_dir=%s\n" "$parent" "$work"
+                  cat "$parent/cgroup.controllers" "$parent/cgroup.subtree_control"
+                  findmnt --target "$work"
+                  df -h "$work"
+                } | tee "$evidence/capacity-runner.txt"
+                exec "$work/capacity" "$@" -mode live -cgroup-parent "$parent" \
+                  -work-dir "$work" -report "$evidence/capacity.json"
+              ' capacity "$work" "$EVIDENCE" "${common[@]}"
+          )
+          parity() (
+            cd gate || exit
+            export BOG_RELEASE_BINARY="$BINARY" BOG_RELEASE_REVISION="$REVISION" BOG_RELEASE_FIXTURE="$FIXTURE"
+            export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/parity.json"
+            timeout --kill-after=5s 3m go test -json -count=1 -run '^TestReleaseRestoredParity$' ./verify/release
+          )
+          control() (
+            python3 -B verifiers/release_gate.py control "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE"
+          )
+          failed=0
+          for name in admission durability capacity parity control; do
+            status=0
+            "$name" 2>&1 | tee "$EVIDENCE/$name.log" || status=$?
+            record "$name" "$status"
+            if (( status != 0 )); then failed=1; fi
+          done
+          exit "$failed"
+
+      - name: Validate reports and candidate identity
+        if: always() && steps.build.outcome == 'success'
+        working-directory: gate
+        timeout-minutes: 3
+        run: |
+          {
+            failed=0
+            sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
+            go run ./verify/release validate -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
+              -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
+              -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
+            python3 -B "$GITHUB_WORKSPACE/verifiers/release_gate.py" validate \
+              "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" || failed=1
+            exit "$failed"
+          } 2>&1 | tee "$EVIDENCE/validation.log"
+
+      - name: Race-test release verifier lifecycle
+        if: always() && steps.build.outcome == 'success'
+        working-directory: gate
+        timeout-minutes: 5
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          {
+            (cd ../candidate && go test -race -count=1 ./internal/archtest) || exit 1
+            go test -race -count=1 ./verify/linux ./verify/release ./bench/retained-history
+          } 2>&1 | tee "$EVIDENCE/verifier-race.log"
+
+      - name: Publish release evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release-evidence
+          path: ${{ runner.temp }}/bog-release-evidence
+          if-no-files-found: error

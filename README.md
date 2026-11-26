@@ -220,3 +220,26 @@ docker start -a "$container"
 ```
 
 Run harness regressions with `python3 -B -m unittest discover -s tests -v`.
+
+## Linux release qualification for #53
+
+Dispatch **Linux release verification** in this repository with the full
+integrated Bog revision. The workflow builds one clean Linux amd64 executable
+and passes it to the admission, durability, capacity, restored parity, and
+capacity control producers. It uses the pinned Bog verifier sources and applies
+the capacity launcher patch only to the tooling checkout. The candidate checkout
+stays clean. Download `linux-release-evidence` for the fixture and tooling
+revisions, candidate revision and binary SHA-256, reports, exit statuses, and logs.
+
+The capacity report must show both 196,608 and 393,216 retained rows under a
+128 MiB cgroup memory limit, exact recovery after restart, a published
+compaction cutoff, all required measurements, and successful teardown of both
+processes, the store, and the cgroup for each fixture. Restored parity is required
+and must record the verified checkpoint and WAL suffix, HTTP 204 after restore,
+and the expected rows after restart.
+
+The short Slipway capacity control suite runs when Bog advertises
+`-enable-capacity-control`. It checks that the control is absent by default,
+that opt-in rejects a wildcard bind, and that loopback compaction publishes a
+generation whose rows survive SIGKILL and restart. An older candidate skips
+only this suite. Release qualification requires the control and restored parity.

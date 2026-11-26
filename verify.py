@@ -44,6 +44,8 @@ CYCLE7_BASELINE_SHA = "be7f937a1025a57166d15888727012ed4989a6b4"
 NEXT_CURSOR = "Bog-Next-Cursor"
 QUERY_ADMISSION_FLAGS = {"query-limits": ("-query-work-budget", 32), "query-admission": ("-query-concurrency", 1)}
 QUERY_REJECTION_PROBES = ("ordinary", "first_page", "continuation")
+CAPACITY_FLAG = "-enable-capacity-control"
+CAPACITY_PATH = "/_capacity/compaction"
 MAX_FRAME = 4 * 1024 * 1024
 DEFAULT_QUERY_LIMIT = 500
 MAX_QUERY_LIMIT = 1000
@@ -149,7 +151,7 @@ def decode_rows(body):
 class Bog:
     """Public CLI and HTTP binding used by every workload."""
 
-    def __init__(self, binary, directory, log_path, *, flags=()):
+    def __init__(self, binary, directory, log_path, *, flags=(), host="127.0.0.1"):
         directory.mkdir(exist_ok=True)
         self.directory_name = directory.name
         with socket.socket() as probe:
@@ -160,7 +162,7 @@ class Bog:
         with log_path.open("wb") as log:
             try:
                 self.process = subprocess.Popen(
-                    [str(binary), "-addr", f"127.0.0.1:{self.port}", "-data-dir", str(directory), *flags],
+                    [str(binary), "-addr", f"{host}:{self.port}", "-data-dir", str(directory), *flags],
                     cwd=directory, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                 )
             except (FileNotFoundError, PermissionError) as exc:
@@ -338,14 +340,14 @@ def query_target(args):
 
 
 @contextlib.contextmanager
-def run_bog(binary, directory, *, ready=True, flags=()):
+def run_bog(binary, directory, *, ready=True, flags=(), host="127.0.0.1"):
     log_dir, cases = PROCESS_LOGS.get()
     path = log_dir / f"bog-{len(cases):02d}.log"
     case = {"store": directory.name, "log": str(path.relative_to(log_dir.parent)),
             "expected_ready": ready}
     cases.append(case)
     try:
-        bog = Bog(binary, directory, path, flags=flags)
+        bog = Bog(binary, directory, path, flags=flags, host=host)
         try:
             bog.startup_seconds = bog.wait_startup(ready)
             case["ready_ms"] = milliseconds(bog.startup_seconds) if ready else None
@@ -788,6 +790,58 @@ def advertised_flags(binary, directory):
     check(help_result.returncode == 0,
           f"Bog -help exited with status {help_result.returncode}: {help_result.stdout[-200:]!r}")
     return set(re.findall(r"^[ \t]*(-[a-z0-9-]+)(?=[ \t=]|$)", help_result.stdout, re.MULTILINE))
+
+
+def capacity_control_suite(binary, directory):
+    if CAPACITY_FLAG not in advertised_flags(binary, directory):
+        return SuiteSkipped(f"Bog -help does not list {CAPACITY_FLAG}")
+    directory.mkdir()
+    store = directory / "store"
+    status_path = f"{CAPACITY_PATH}?action=status&cutoff=3"
+    start_path = f"{CAPACITY_PATH}?action=start&cutoff=3"
+    rows = [Row(2, "later"), Row(1, "duplicate"), Row(1, "duplicate")]
+
+    def hidden(bog):
+        for method, path in (("GET", status_path), ("POST", start_path)):
+            status, _ = bog.request(method, path)
+            check(status == 404, f"capacity control with opt-in off: {method} returned HTTP {status}")
+
+    def state(bog, method, path):
+        status, body, _ = bog.checked_exchange(method, path)
+        check(200 <= status < 300, f"{method} {path} returned HTTP {status}: {body[:200]!r}")
+        try:
+            value = json.loads(body, object_pairs_hook=unique_fields)
+        except ValueError as exc:
+            raise Rejected(f"invalid compaction state: {body[:200]!r}") from exc
+        check(isinstance(value, dict) and value.get("state") in ("running", "complete") and
+              all(type(value.get(key)) is int and value[key] >= 0
+                  for key in ("generation", "covered_rows", "committed_rows")),
+              f"invalid compaction state: {value!r}")
+        return value
+
+    with run_bog(binary, store, host="0.0.0.0") as bog:
+        hidden(bog)
+    with run_bog(binary, store, host="0.0.0.0", ready=False, flags=(CAPACITY_FLAG,)) as bog:
+        wildcard_exit = bog.process.returncode
+    with run_bog(binary, store, flags=(CAPACITY_FLAG,)) as bog:
+        initial = state(bog, "GET", f"{CAPACITY_PATH}?action=status&cutoff=0")
+        bog.ingest(rows)
+        published = state(bog, "POST", start_path)
+        deadline = time.monotonic() + HTTP_TIMEOUT
+        while published["state"] == "running" and time.monotonic() < deadline:
+            time.sleep(0.02)
+            published = state(bog, "GET", status_path)
+        check(published["state"] == "complete" and published["generation"] > initial["generation"] and
+              published["covered_rows"] == published["committed_rows"] == len(rows),
+              f"capacity control did not publish the requested cutoff: {published!r}")
+        bog.kill()
+    with run_bog(binary, store) as bog:
+        hidden(bog)
+        expect_query(bog, rows, 0, SECOND, label="ordinary query after compacted restart")
+        expect_walk(bog, query_args(0, SECOND), oracle(rows, 0, SECOND), (1, 2),
+                    "paged query after compacted restart")
+    return {"default_http_status": 404, "wildcard_opt_in_exit": wildcard_exit,
+            "initial_generation": initial["generation"], "published": published, "restart_rows": len(rows)}
 
 
 def query_admission_required():
@@ -2504,6 +2558,7 @@ SUITES = (
     ("query-limits", query_limits_suite),
     ("query-admission", query_admission_suite),
     ("query-response-bytes", query_response_bytes_suite),
+    ("capacity-control", capacity_control_suite),
     ("archived-corpus", replay_corpus_suite),
     ("request-rejection", rejection_suite),
     ("concurrent-snapshots", concurrency_suite),
@@ -2521,6 +2576,7 @@ REQUIRED_SUITES = (
     "query-limits",
     "query-admission",
     "query-response-bytes",
+    "capacity-control",
     "archived-corpus",
     "request-rejection",
     "concurrent-snapshots",
