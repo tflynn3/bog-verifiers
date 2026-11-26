@@ -1,0 +1,89 @@
+diff --git a/internal/httpapi/query_expiry_integration_test.go b/internal/httpapi/query_expiry_integration_test.go
+new file mode 100644
+--- /dev/null
++++ b/internal/httpapi/query_expiry_integration_test.go
+@@ -0,0 +1,84 @@
++package httpapi
++
++import (
++	"net/http"
++	"net/url"
++	"testing"
++	"testing/synctest"
++	"time"
++
++	"bog/internal/store"
++)
++
++func TestAuthenticatedCursorExpiryReleasesCapture(t *testing.T) {
++	synctest.Test(t, func(t *testing.T) {
++		stamp := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
++		first := store.Row{TS: stamp, Line: "first"}
++		last := store.Row{TS: stamp, Line: "last"}
++		s := new(store.Store)
++		s.Publish([]store.Row{first, last})
++		memory := newMemoryPageSource(s)
++		source := &trackedPageSource{
++			PageSource: memory,
++			deadline:   time.Now().Add(time.Second),
++		}
++		h := NewWithPageSource(source, nil, DefaultQueryMaxResponseBytes, 1, DefaultQueryWorkBudget)
++		foreign := NewWithPageSource(newMemoryPageSource(s), nil, DefaultQueryMaxResponseBytes, 1, DefaultQueryWorkBudget)
++
++		out := requestPage(h, "&page=1&limit=1")
++		cursors := out.Header().Values("Bog-Next-Cursor")
++		if out.Code != http.StatusOK || out.Body.String() != jsonRow(t, first) || len(cursors) != 1 || cursors[0] == "" {
++			t.Fatalf("first page: HTTP %d, headers %v, body %q", out.Code, out.Header(), out.Body.String())
++		}
++		token := cursors[0]
++		path := "&limit=1&cursor=" + url.QueryEscape(token)
++
++		time.Sleep(time.Second - time.Nanosecond)
++		out = requestPage(h, path)
++		if out.Code != http.StatusOK || out.Body.String() != jsonRow(t, last) || len(out.Header().Values("Bog-Next-Cursor")) != 0 {
++			t.Fatalf("terminal page just before expiry: HTTP %d, headers %v, body %q", out.Code, out.Header(), out.Body.String())
++		}
++		if got := source.releases.Load(); got != 0 {
++			t.Fatalf("live cursor pin released %d times", got)
++		}
++
++		time.Sleep(time.Nanosecond)
++		synctest.Wait()
++		if got := source.releases.Load(); got != 1 {
++			t.Fatalf("deadline released the pin %d times, want 1 before any expired request", got)
++		}
++		memory.mu.Lock()
++		pins := len(memory.snapshots)
++		memory.mu.Unlock()
++		if pins != 0 {
++			t.Fatalf("retained %d source pins after expiry, want 0", pins)
++		}
++		for range 2 {
++			assertQueryRejection(t, requestPage(h, path), http.StatusGone, "query capture expired")
++		}
++
++		// Alter a complete base64 digit in the signature, preserving cursor framing.
++		i := len(token) - 2
++		digit := "A"
++		if token[i] == 'A' {
++			digit = "B"
++		}
++		tampered := token[:i] + digit + token[i+1:]
++		for _, tc := range []struct {
++			name    string
++			handler http.Handler
++			params  string
++		}{
++			{"malformed", h, "&cursor=malformed"},
++			{"tampered", h, "&cursor=" + url.QueryEscape(tampered)},
++			{"different filter", h, path + "&contains=last"},
++			{"different issuer", foreign, path},
++		} {
++			t.Log(tc.name)
++			assertQueryRejection(t, requestPage(tc.handler, tc.params), http.StatusBadRequest, "invalid cursor")
++		}
++		if got := source.releases.Load(); got != 1 {
++			t.Fatalf("requests using expired or invalid cursors released the pin %d times, want 1", got)
++		}
++	})
++}

@@ -1,0 +1,104 @@
+diff --git a/verify/release/README.md b/verify/release/README.md
+--- a/verify/release/README.md
++++ b/verify/release/README.md
+@@ -126 +126,5 @@
+-budgets that returned a clean initial rejection.
++budgets that returned a clean initial rejection. Candidates with the
++certification runtime's HTTP 400 `invalid limit` diagnostic also report
++`tied_smaller_resume` for a four-row tie. That walk starts at limit two and
++resumes at limit one at its first issuing budget. The legacy `invalid query`
++diagnostic skips only this additional tied walk.
+diff --git a/verify/release/admission.go b/verify/release/admission.go
+--- a/verify/release/admission.go
++++ b/verify/release/admission.go
+@@ -341,0 +342 @@
++	var certifiedPaging bool
+@@ -347,0 +349,4 @@
++		if err != nil {
++			return err
++		}
++		certifiedPaging, err = supportsCertifiedPaging(ctx, client, base)
+@@ -353 +358 @@
+-	walk, walkErr := probeBudgetWalk(ctx, binary, client)
++	walk, walkErr := probeBudgetWalk(ctx, binary, client, certifiedPaging)
+@@ -356,0 +362,18 @@
++}
++
++// The certification runtime introduced a specific invalid-limit diagnostic.
++// Probe it independently of continuation success so a broken walk fails the gate.
++func supportsCertifiedPaging(ctx context.Context, client *http.Client, base string) (bool, error) {
++	res, err := request(ctx, client, http.MethodGet, base+queryPath("", 0, ""), nil)
++	if err != nil {
++		return false, fmt.Errorf("detect paging certification: %w", err)
++	}
++	if res.status == http.StatusBadRequest && !res.cursorHeader {
++		switch string(res.body) {
++		case "invalid limit\n":
++			return true, nil
++		case "invalid query\n":
++			return false, nil
++		}
++	}
++	return false, fmt.Errorf("unexpected paging capability response: HTTP %d, %.200q", res.status, res.body)
+diff --git a/verify/release/budget_walk.go b/verify/release/budget_walk.go
+--- a/verify/release/budget_walk.go
++++ b/verify/release/budget_walk.go
+@@ -29 +29,2 @@
+-	SparseWalk sparseBudgetWalkProof `json:"sparse_walk"`
++	SparseWalk        sparseBudgetWalkProof      `json:"sparse_walk"`
++	TiedSmallerResume *budgetWalkProofWithLimits `json:"tied_smaller_resume,omitempty"`
+@@ -32,0 +34,5 @@
++	budgetWalkProofWithLimits
++	ResponseByteCap int `json:"response_byte_cap"`
++}
++
++type budgetWalkProofWithLimits struct {
+@@ -34,4 +40,3 @@
+-	ResponseByteCap int `json:"response_byte_cap"`
+-	FirstLimit      int `json:"first_limit"`
+-	FirstRows       int `json:"first_rows"`
+-	ResumeLimit     int `json:"resume_limit"`
++	FirstLimit  int `json:"first_limit"`
++	FirstRows   int `json:"first_rows"`
++	ResumeLimit int `json:"resume_limit"`
+@@ -70 +75 @@
+-func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (budgetWalkProof, error) {
++func probeBudgetWalk(ctx context.Context, binary string, client *http.Client, certifiedPaging bool) (budgetWalkProof, error) {
+@@ -84 +89 @@
+-	sparse, sparseErr := findSparseBudgetWalk(ctx, client, budgetWalkMax, fixture, launch(fixture.byteCap))
++	sparse, sparseErr := bisectBudgetWalk(ctx, client, budgetWalkMax, fixture, launch(fixture.byteCap))
+@@ -89 +94,11 @@
+-	return proof, errors.Join(tiedErr, sparseErr)
++	var smallerErr error
++	if certifiedPaging {
++		rows := []row{{fixtureStart, "c"}, {fixtureStart, "a"}, {fixtureStart, "b"}, {fixtureStart, "d"}}
++		fixture := budgetFixture{seed: rows, want: rows, firstLimit: 2, resumeLimit: 1, firstRows: 2}
++		result, err := bisectBudgetWalk(ctx, client, budgetWalkMax, fixture, launch(0))
++		proof.TiedSmallerResume = &result.budgetWalkProofWithLimits
++		if err != nil {
++			smallerErr = fmt.Errorf("tied walk with smaller resume limit: %w", err)
++		}
++	}
++	return proof, errors.Join(tiedErr, sparseErr, smallerErr)
+@@ -109,2 +124,5 @@
+-func findSparseBudgetWalk(ctx context.Context, client *http.Client, maxBudget int, fixture budgetFixture, launch budgetLaunch) (sparseBudgetWalkProof, error) {
+-	proof := sparseBudgetWalkProof{ResponseByteCap: fixture.byteCap, FirstLimit: fixture.firstLimit, ResumeLimit: fixture.resumeLimit}
++func bisectBudgetWalk(ctx context.Context, client *http.Client, maxBudget int, fixture budgetFixture, launch budgetLaunch) (sparseBudgetWalkProof, error) {
++	proof := sparseBudgetWalkProof{
++		budgetWalkProofWithLimits: budgetWalkProofWithLimits{FirstLimit: fixture.firstLimit, ResumeLimit: fixture.resumeLimit},
++		ResponseByteCap:           fixture.byteCap,
++	}
+diff --git a/verify/release/budget_walk_test.go b/verify/release/budget_walk_test.go
+--- a/verify/release/budget_walk_test.go
++++ b/verify/release/budget_walk_test.go
+@@ -130 +130 @@
+-			got, err := findSparseBudgetWalk(t.Context(), client, 8, fixture, launch)
++			got, err := bisectBudgetWalk(t.Context(), client, 8, fixture, launch)
+@@ -150,2 +150,5 @@
+-				budgetWalkStats: budgetWalkStats{tc.threshold, rejected, 3, 4},
+-				ResponseByteCap: fixture.byteCap, FirstLimit: fixture.firstLimit, FirstRows: 2, ResumeLimit: fixture.resumeLimit,
++				budgetWalkProofWithLimits: budgetWalkProofWithLimits{
++					budgetWalkStats: budgetWalkStats{tc.threshold, rejected, 3, 4},
++					FirstLimit:      fixture.firstLimit, FirstRows: 2, ResumeLimit: fixture.resumeLimit,
++				},
++				ResponseByteCap: fixture.byteCap,
