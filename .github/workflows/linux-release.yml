@@ -18,7 +18,7 @@ env:
   CGO_ENABLED: '0'
   FIXTURE: linux-release-v1
   BOG_REPOSITORY: tflynn3/bog
-  TOOLING_REVISION: efb5f059f5ad7ab04e3321f33c4c7a4b2f7ea605
+  TOOLING_REVISION: d06f31a4026eb5f46e56fe0040321a7b389fbea3
   REVISION: ${{ inputs.revision }}
 
 jobs:
@@ -70,11 +70,11 @@ jobs:
           cp gate/verify/release/README.md "$EVIDENCE/fixture.md"
           cp gate/verify/linux/README.md "$EVIDENCE/durability-fixture.md"
           cp gate/bench/retained-history/README.md "$EVIDENCE/capacity-fixture.md"
-          cp verifiers/release/capacity-runner.patch "$EVIDENCE/"
+          cp verifiers/release/*.patch "$EVIDENCE/"
           printf 'tooling_revision=%s\nverifier_revision=%s\n' "$(git -C gate rev-parse HEAD)" \
             "$(git -C verifiers rev-parse HEAD)" | tee -a "$EVIDENCE/run.txt"
           [[ "$(git -C gate rev-parse HEAD)" == "$TOOLING_REVISION" ]]
-          git -C gate apply --unidiff-zero "$GITHUB_WORKSPACE/verifiers/release/capacity-runner.patch"
+          git -C gate apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/*.patch
 
       - uses: actions/setup-go@v5
         with:
@@ -109,6 +109,17 @@ jobs:
             printf '%s revision=%s exit=%d\n' "$name" "$REVISION" "$status" | tee -a "$EVIDENCE/producers.txt"
           }
           common=(-binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE")
+          unset BOG_CAPACITY_CONTROL
+          capacity_control_available() {
+            if ! timeout --kill-after=2s 5s "$BINARY" -help > "$EVIDENCE/candidate-help.txt" 2>&1; then
+              echo "Candidate capability probe failed. See candidate-help.txt."
+              return 2
+            fi
+            if ! grep -Eq '^[[:blank:]]*-enable-capacity-control([[:blank:]=]|$)' "$EVIDENCE/candidate-help.txt"; then
+              echo "Live capacity unavailable. Candidate help omits -enable-capacity-control."
+              return 1
+            fi
+          }
           admission() (
             cd gate || exit
             timeout --kill-after=5s 2m go run ./verify/release "${common[@]}" -report "$EVIDENCE/admission.json"
@@ -118,6 +129,7 @@ jobs:
             timeout --kill-after=5s 15m go run ./verify/linux "${common[@]}" -report "$EVIDENCE/durability.json"
           )
           capacity() (
+            capacity_control_available || exit
             cd gate || exit
             work=$(mktemp -d "$RUNNER_TEMP/bog-capacity.XXXXXXXX") || exit
             cleanup() {
@@ -191,7 +203,7 @@ jobs:
         run: |
           {
             (cd ../candidate && go test -race -count=1 ./internal/archtest) || exit 1
-            go test -race -count=1 ./verify/linux ./verify/release ./bench/retained-history
+            go test -race -count=1 ./verify/linux ./verify/release ./verify/query-model ./bench/retained-history
           } 2>&1 | tee "$EVIDENCE/verifier-race.log"
 
       - name: Publish release evidence

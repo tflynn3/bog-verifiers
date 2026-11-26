@@ -54,7 +54,8 @@ def validate_capacity(evidence):
         for key, want in {"tail_rows": TAIL_ROWS, "batch_rows": BATCH_ROWS, "line_bytes": 1024,
                           "memory_limit_bytes": MEMORY_LIMIT}.items():
             check(integer(fixture.get(key), want, want), f"{label}: invalid {key}")
-        check(run["status"] == "pass" and run["phase"] == "complete" and run["timed_out"] is False and
+        check(run["status"] == "pass" and run["workload_status"] == "pass" and
+              run["phase"] == "complete" and run["timed_out"] is False and
               ("unavailable" not in run or run["unavailable"] == {}),
               f"{label}: incomplete run or unavailable measurement")
         for key in ("start_to_ready_ns", "restart_to_ready_ns", "ingest_p99_ns", "backfill_query_p99_ns",
@@ -82,9 +83,10 @@ def validate_capacity(evidence):
         check(compaction["state"] == "complete" and integer(compaction.get("generation"), seed // 8192 + 1) and
               integer(compaction.get("covered_rows"), seed + BATCH_ROWS, seed + BATCH_ROWS) and
               integer(compaction.get("committed_rows"), total, total), f"{label}: invalid compaction evidence")
-        teardown = run["teardown"]
-        check(integer(teardown.get("processes_reaped"), 2, 2) and teardown.get("cgroup_removed") is True and
-              teardown.get("store_removed") is True, f"{label}: incomplete teardown")
+        cleanup = run["cleanup"]
+        check(cleanup["status"] == "pass" and cleanup["candidate_reaped"] is True and
+              cleanup["subtree_empty"] is True and cleanup["subtree_removed"] is True and
+              cleanup.get("detail", "") == "", f"{label}: incomplete process or cgroup cleanup")
 
 
 def validate_parity(evidence):
@@ -95,7 +97,8 @@ def validate_parity(evidence):
           integer(point["NextOrdinal"], 3, 3) and integer(point["CoveredOffset"], 1) and
           integer(point["CommittedEnd"], point["CoveredOffset"] + 1),
           "parity: expected a verified checkpoint and nonempty WAL suffix")
-    check(integer(evidence["captured_rows"], 6, 6) and evidence["post_restore_204"] is True and
+    check(integer(evidence["legacy_rows"], 6, 6) and integer(evidence["captured_rows"], 6, 6) and
+          evidence["post_restore_204"] is True and integer(evidence["appended_rows"], 7, 7) and
           integer(evidence["restart_rows"], 7, 7), "parity: incomplete restore, ingest or restart evidence")
 
 

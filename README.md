@@ -226,20 +226,27 @@ Run harness regressions with `python3 -B -m unittest discover -s tests -v`.
 Dispatch **Linux release verification** in this repository with the full
 integrated Bog revision. The workflow builds one clean Linux amd64 executable
 and passes it to the admission, durability, capacity, restored parity, and
-capacity control producers. It uses the pinned Bog verifier sources and applies
-the capacity launcher patch only to the tooling checkout. The candidate checkout
-stays clean. Download `linux-release-evidence` for the fixture and tooling
+capacity control producers. It applies the capacity launcher and restored
+parity patches in the pinned tooling checkout. Download
+`linux-release-evidence` for the fixture and tooling
 revisions, candidate revision and binary SHA-256, reports, exit statuses, and logs.
+The admission, durability, capacity, and restored parity reports must pass for
+`linux-release-v1` and carry the same full candidate revision and binary SHA-256.
 
 The capacity report must show both 196,608 and 393,216 retained rows under a
 128 MiB cgroup memory limit, exact recovery after restart, a published
-compaction cutoff, all required measurements, and successful teardown of both
-processes, the store, and the cgroup for each fixture. Restored parity is required
-and must record the verified checkpoint and WAL suffix, HTTP 204 after restore,
-and the expected rows after restart.
+compaction cutoff, all required measurements, and successful cleanup for each
+fixture. The cleanup evidence records candidate reaping, an empty cgroup subtree,
+and its removal. The restored parity producer checks legacy startup, then
+starts the candidate on a verified v1 restore after removing the legacy source
+and backup bundle. It uses `verify/query-model` for exact ordered rows and
+checks terminal pages before the append, after its HTTP 204, and after SIGKILL
+and restart.
 
 The short Slipway capacity control suite runs when Bog advertises
 `-enable-capacity-control`. It checks that the control is absent by default,
 that opt-in rejects a wildcard bind, and that loopback compaction publishes a
 generation whose rows survive SIGKILL and restart. An older candidate skips
-only this suite. Release qualification requires the control and restored parity.
+only this suite. The manually dispatched release workflow records an
+unavailable live capacity result when the flag is absent and requires passing
+live capacity, control, and restored parity evidence to qualify a release.

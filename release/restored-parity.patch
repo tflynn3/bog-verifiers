@@ -1,0 +1,102 @@
+--- a/verify/release/parity_linux_test.go
++++ b/verify/release/parity_linux_test.go
+@@ -14 +13,0 @@
+-	"slices"
+@@ -22,0 +22 @@
++	querymodel "bog/verify/query-model"
+@@ -54,0 +55 @@
++	LegacyRows     int          `json:"legacy_rows"`
+@@ -56,0 +58 @@
++	AppendedRows   int          `json:"appended_rows"`
+@@ -86,0 +89,12 @@
++	if err := serveDirectory(ctx, binary, filepath.Join(root, "source"), client, flags, func(base string) error {
++		return checkRestoredWalks(ctx, client, base, rows)
++	}); err != nil {
++		return proof, fmt.Errorf("serve legacy layout: %w", err)
++	}
++	proof.LegacyRows = len(rows)
++	// Remove both inputs so serving and restart can only use the restore.
++	for _, name := range []string{"source", "bundle"} {
++		if err := os.RemoveAll(filepath.Join(root, name)); err != nil {
++			return proof, fmt.Errorf("isolate restore: %w", err)
++		}
++	}
+@@ -95 +109,9 @@
+-		return err
++		if err != nil {
++			return err
++		}
++		rows = append(rows, added)
++		if err := checkRestoredWalks(ctx, client, base, rows); err != nil {
++			return fmt.Errorf("after acknowledged append: %w", err)
++		}
++		proof.AppendedRows = len(rows)
++		return nil
+@@ -101 +122,0 @@
+-		rows = append(rows, added)
+@@ -114,0 +136,16 @@
++	var log querymodel.Log
++	for _, r := range appendOrder {
++		ts, err := time.Parse(time.RFC3339Nano, r.TS)
++		if err != nil {
++			return err
++		}
++		log.Append([]querymodel.Row{{Time: ts, Line: r.Line}})
++	}
++	start, err := time.Parse(time.RFC3339Nano, fixtureStart)
++	if err != nil {
++		return err
++	}
++	end, err := time.Parse(time.RFC3339Nano, fixtureEnd)
++	if err != nil {
++		return err
++	}
+@@ -116,7 +153,4 @@
+-		var want []row
+-		for _, r := range appendOrder {
+-			if strings.Contains(r.Line, filter) {
+-				want = append(want, r)
+-			}
+-		}
+-		slices.SortStableFunc(want, func(a, b row) int { return strings.Compare(a.TS, b.TS) })
++		want, err := log.Match(log.HighWater(), querymodel.Filter{Start: start, End: end, Contains: filter})
++		if err != nil {
++			return err
++		}
+@@ -132 +166 @@
+-func checkRestoredWalk(ctx context.Context, client *http.Client, base, filter string, limit int, want []row) error {
++func checkRestoredWalk(ctx context.Context, client *http.Client, base, filter string, limit int, want []querymodel.Entry) error {
+@@ -143,6 +177,9 @@
+-		n, err := checkRows(res, want)
+-		if err != nil {
+-			return err
+-		}
+-		if n > limit {
+-			return errors.New("page exceeded row limit")
++		// VerifyWalk models row-limited pages. This fixture also has a byte
++		// limit, so compare each returned prefix against Match's ordered rows.
++		expected := make([]row, 0, min(limit, len(want)))
++		for _, entry := range want[:min(limit, len(want))] {
++			expected = append(expected, row{entry.Time.Format(time.RFC3339Nano), entry.Line})
++		}
++		n, err := checkRows(res, expected)
++		if err != nil {
++			return err
+--- a/verify/release/main.go
++++ b/verify/release/main.go
+@@ -54,0 +55 @@
++			{"restored parity", parity, []string{"restored_parity"}},
+@@ -58,5 +58,0 @@
+-			}
+-		}
+-		if parity != "" {
+-			if checkErr := validateFile(parity, id, []string{"restored_parity"}); checkErr != nil {
+-				err = errors.Join(err, fmt.Errorf("restored parity report: %w", checkErr))
+--- a/verify/release/report_test.go
++++ b/verify/release/report_test.go
+@@ -96,0 +97 @@
++		{"parity", []string{"restored_parity"}},
+@@ -117,0 +119,3 @@
++	}
++	if err := run(t.Context(), args[:len(args)-2]); err == nil || !strings.Contains(err.Error(), "restored parity report") {
++		t.Fatalf("validation without parity accepted: %v", err)
