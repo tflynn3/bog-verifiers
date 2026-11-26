@@ -11,8 +11,9 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import verify
-from release_gate import (FIXTURE_ROOT_CLEANUP, record_fixture_root_cleanup, validate_backfill_timelines, validate_budget,
-                          validate_budget_trials, validate_durability)
+from release_gate import (CAPACITY_WORK_BUDGET, FIXTURE_ROOT_CLEANUP, MEMORY_LIMIT, record_fixture_root_cleanup,
+                          validate_backfill_timelines, validate_budget, validate_budget_trials,
+                          validate_capacity_observations, validate_durability)
 
 README_ONLY = "7655ed627bccad30700b8de4b6f47c8d7d5d8579"
 
@@ -43,6 +44,34 @@ def buildable_candidate(root):
 
 
 class GateTest(unittest.TestCase):
+    def test_capacity_observations_require_distinct_groups_and_attributed_teardown(self):
+        seed = 196_608
+        candidate = dict(lifetime="startup", reaped=True, exited_before_cleanup=False, exit_code=0)
+        restart = dict(candidate, lifetime="restart", exit_code=-1, exit_signal="killed", teardown_sigkill_sent=True)
+        group = dict(path="/sys/fs/cgroup/release/capacity-first", memory_max_bytes=MEMORY_LIMIT,
+                     memory_swap_max_bytes=0)
+        progress = dict(acknowledged_rows=seed, published_rows=seed, generation=25)
+        events = dict(oom=0, oom_kill=0)
+        run = dict(fixture=dict(query_work_budget=CAPACITY_WORK_BUDGET), cgroup=group,
+                   compaction=dict(generation=26), diagnostics=dict(
+                       seed_progress=progress, cgroup_memory_events=events, candidates=[candidate, restart]))
+        seen = set()
+        validate_capacity_observations(run, seed, "fixture", seen)
+        with self.assertRaisesRegex(verify.Rejected, "reused fixture cgroup"):
+            validate_capacity_observations(run, seed, "fixture", seen)
+
+        for target, changes, reason in (
+            (run["fixture"], {"query_work_budget": 1}, "explicit query work budget"),
+            (group, {"memory_swap_max_bytes": 1}, "swap disabled"),
+            (events, {"oom_kill": 1}, "recorded OOM kill"),
+            (progress, {"published_rows": seed - 64}, "incomplete acknowledged seed"),
+            (restart, {"teardown_sigkill_sent": False}, "SIGKILL lacks verifier attribution"),
+            (restart, {"exited_before_cleanup": True}, "exited before verifier teardown"),
+        ):
+            with self.subTest(reason=reason), patch.dict(target, changes):
+                with self.assertRaisesRegex(verify.Rejected, reason):
+                    validate_capacity_observations(run, seed, "fixture", set())
+
     def test_backfill_timeline_requires_handoff_and_drain_evidence(self):
         def timeline(pattern, held, cutoff, final, rows, generation):
             opening = dict(state="running", generation=generation - 1, covered_rows=held, committed_rows=cutoff)
@@ -70,8 +99,15 @@ class GateTest(unittest.TestCase):
         published = {"generation": 27}
         validate_backfill_timelines([scattered, clustered], seed, published)
         validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
+        drain_samples = scattered["samples"]
+        drain_samples.insert(5, dict(drain_samples[5], candidate_status_metrics=None))
+        drain_samples[6]["event"] = "drain_poll"
+        validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
+        drain_samples.pop(5)
+        drain_samples[5]["event"] = "after_exhaustion"
         for changes, diagnostic in (
             ({"status": "unavailable", "reason": "old producer"}, "incomplete pin-drain evidence"),
+            ({"status": "pending", "reason": "observation window ended"}, "pin retirement pending"),
             ({"release_http_status": 404}, "missing release or reclamation evidence"),
             ({"reclaimed_bytes": 0}, "missing release or reclamation evidence"),
         ):
@@ -94,7 +130,7 @@ class GateTest(unittest.TestCase):
                         pages=3, rows=rows, probes=[
                             dict(budget=budget - 1, outcome="clean_rejection", pages=0, rows=0),
                             dict(budget=budget, outcome="exhausted", pages=3, rows=rows,
-                                 post_issuance_append_rows=2)])
+                                 post_issuance_append_rows=2, resume_limit=1)])
 
         tied = walk(11, 3)
         tied["sparse_walk"] = dict(walk(314, 4), response_byte_cap=96, first_limit=4, first_rows=2, resume_limit=1)

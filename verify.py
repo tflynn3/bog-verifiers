@@ -804,11 +804,14 @@ def capacity_control_suite(binary, directory):
     cutoff = len(rows) + 1
     status_path = f"{CAPACITY_PATH}?action=status&cutoff={cutoff}"
     start_path = f"{CAPACITY_PATH}?action=start&cutoff={cutoff}"
+    hidden_checks = 0
 
     def hidden(bog):
+        nonlocal hidden_checks
         for method, path in (("GET", status_path), ("POST", start_path)):
             status, _ = bog.request(method, path)
             check(status == 404, f"capacity control with opt-in off: {method} returned HTTP {status}")
+            hidden_checks += 1
 
     def state(bog, method, path):
         status, body, _ = bog.checked_exchange(method, path)
@@ -857,6 +860,7 @@ def capacity_control_suite(binary, directory):
         expect_query(bog, augmented, 0, SECOND, label="ordinary query after compacted restart")
         expect_walk(bog, args, fresh, (1, 2), "paged query after compacted restart")
     return {"default_http_status": 404, "wildcard_opt_in_exit": wildcard_exit,
+            "default_control_404_checks": hidden_checks,
             "snapshot_rows": len(expected), "stale_cursor_rejected": True,
             "initial_generation": initial["generation"], "published": published,
             "fresh_rows": len(fresh), "restart_rows": len(fresh)}

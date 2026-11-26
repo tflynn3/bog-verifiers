@@ -15,7 +15,7 @@ index b60a142..2276b16 100644
 @@ -42 +40 @@ type budgetFixture struct {
 -	seed, want              []row
 +	seed, want, afterIssue  []row
-@@ -60,5 +58,6 @@ type budgetProbe struct {
+@@ -60,5 +58,7 @@ type budgetProbe struct {
 -	Budget  int                 `json:"budget"`
 -	Outcome budgetProbeOutcome  `json:"outcome"`
 -	Pages   int                 `json:"pages"`
@@ -26,6 +26,7 @@ index b60a142..2276b16 100644
 +	Pages        int                 `json:"pages"`
 +	Rows         int                 `json:"rows"`
 +	AppendedRows int                 `json:"post_issuance_append_rows,omitempty"`
++	ResumeLimit  int                 `json:"resume_limit,omitempty"`
 +	Failure      *budgetProbeFailure `json:"failure,omitempty"`
 @@ -169,6 +168,29 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
 -	tied, tiedErr := findBudgetWalk(ctx, client, budgetWalkMax, launch(0))
@@ -105,6 +106,9 @@ index b60a142..2276b16 100644
 @@ -258 +303 @@ func runBudgetWalk(ctx context.Context, raw *http.Client, base string, budget in
 -func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture) budgetProbe {
 +func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture, appendRows func() error) budgetProbe {
+@@ -259 +304 @@ func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture) budgetProbe {
+-	probe := budgetProbe{Budget: budget, Outcome: probeIndeterminate}
++	probe := budgetProbe{Budget: budget, Outcome: probeIndeterminate, ResumeLimit: fixture.resumeLimit}
 @@ -296,0 +342,8 @@ func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixtu
 +		if number == 1 && len(fixture.afterIssue) > 0 {
 +			if err := appendRows(); err != nil {

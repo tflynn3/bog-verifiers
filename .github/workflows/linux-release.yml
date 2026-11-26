@@ -169,43 +169,59 @@ jobs:
             control_status=0
             python3 -B verifiers/release_gate.py control "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" \
               2>&1 | tee "$EVIDENCE/control.log" || control_status=$?
-            capacity_control_available || exit
+            capability_status=0
+            capacity_control_available || capability_status=$?
+            case "$capability_status" in
+              1) exit "$control_status" ;;
+              0) ;;
+              *) exit "$capability_status" ;;
+            esac
             cd candidate || exit
             work=$(mktemp -d "$RUNNER_TEMP/bog-capacity.XXXXXXXX") || exit
+            producer="$RUNNER_TEMP/bog-capacity-producer"
             cleanup() {
               local status=$?
-              rm -rf -- "$work" || status=1
+              if rmdir -- "$work"; then
+                echo "Capacity fixture root cleanup verified." | tee -a "$EVIDENCE/capacity-runner.txt"
+              else
+                {
+                  echo "Capacity fixture root was not empty on producer exit."
+                  ls -la -- "$work"
+                } >> "$EVIDENCE/capacity-runner.txt" 2>&1
+                rm -rf -- "$work"
+                (( status != 0 )) || status=1
+              fi
               exit "$status"
             }
             trap cleanup EXIT
-            go build -trimpath -o "$work/capacity" ./bench/retained-history || exit
+            go build -trimpath -o "$producer" ./bench/retained-history || exit
+            budget=$(PYTHONPATH="$GITHUB_WORKSPACE/verifiers" python3 -B -c \
+              'from release_gate import CAPACITY_WORK_BUDGET; print(CAPACITY_WORK_BUDGET)') || exit
+            "$producer" -help > "$EVIDENCE/capacity-help.txt" 2>&1 || exit
+            if ! grep -Eq '^[[:blank:]]*-query-work-budget([[:blank:]=]|$)' "$EVIDENCE/capacity-help.txt"; then
+              echo "The capacity producer must advertise -query-work-budget for Linux release qualification."
+              exit 1
+            fi
             sudo -n systemd-run --quiet --wait --pipe --collect --expand-environment=no \
               --uid="$(id -u)" --gid="$(id -g)" -p 'Delegate=memory io' -p DelegateSubgroup=runner \
               -p RuntimeMaxSec=24min -p TimeoutStopSec=10s \
               /bin/bash -euo pipefail -c '
-                work=$1 evidence=$2
-                shift 2
+                work=$1 evidence=$2 producer=$3 budget=$4
+                shift 4
                 read -r unified </proc/self/cgroup
                 [[ "$unified" == 0::/*/runner ]]
                 group="/sys/fs/cgroup${unified#0::}"
                 parent="${group%/*}"
                 printf "+memory +io\n" > "$parent/cgroup.subtree_control"
                 {
-                  printf "capacity_mode=live\ncapacity_cgroup=%s\ncapacity_work_dir=%s\n" "$parent" "$work"
+                  printf "capacity_mode=live\ncapacity_cgroup=%s\ncapacity_work_dir=%s\nquery_work_budget=%s\n" "$parent" "$work" "$budget"
                   cat "$parent/cgroup.controllers" "$parent/cgroup.subtree_control"
                   findmnt --target "$work"
                   df -h "$work"
                 } | tee "$evidence/capacity-runner.txt"
-                exec "$work/capacity" "$@" -mode live -cgroup-parent "$parent" \
-                  -work-dir "$work" -report "$evidence/capacity.json"
-              ' capacity "$work" "$EVIDENCE" "${common[@]}" || exit
-            shopt -s nullglob dotglob
-            entries=("$work"/*)
-            if (( ${#entries[@]} != 1 )) || [[ "${entries[0]}" != "$work/capacity" ]]; then
-              echo "Capacity producer left fixture files in $work."
-              exit 1
-            fi
-            echo "Capacity fixture root cleanup verified." | tee -a "$EVIDENCE/capacity-runner.txt"
+                exec "$producer" "$@" -mode live -cgroup-parent "$parent" \
+                  -query-work-budget "$budget" -work-dir "$work" -report "$evidence/capacity.json"
+              ' capacity "$work" "$EVIDENCE" "$producer" "$budget" "${common[@]}" || exit
             exit "$control_status"
           )
           parity() (
@@ -242,7 +258,8 @@ jobs:
             if (( failed != 0 )); then exit "$failed"; fi
             python3 -B "$GITHUB_WORKSPACE/verifiers/release_gate.py" validate \
               "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --arch "$RELEASE_ARCH" \
-              --require-fixture-root-cleanup --require-fixed-boundaries --require-backfill-timelines
+              --require-fixture-root-cleanup --require-fixed-boundaries --require-backfill-timelines \
+              --require-capacity-observations
           } 2>&1 | tee "$EVIDENCE/validation.log"
 
       - name: Race-test release verifier lifecycle
@@ -291,7 +308,8 @@ jobs:
             --arg amd64_digest "$amd64_digest" --arg arm64_digest "$arm64_digest" \
             --arg revision "$REVISION" --arg fixture "$FIXTURE" '
               $amd64.arch == "amd64" and $arm64.arch == "arm64" and
-              ([$amd64, $arm64] | all(.schema_version == 1 and .revision == $revision and .fixture == $fixture and
+              ([$amd64, $arm64] | all(.schema_version == 1 and .current_observations == true and
+                .revision == $revision and .fixture == $fixture and
                 (.binary_sha256 | test("^[0-9a-f]{64}$")))) and
               $amd64.binary_sha256 == $amd64_digest and $arm64.binary_sha256 == $arm64_digest and
               $amd64_digest != $arm64_digest'

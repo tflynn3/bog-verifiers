@@ -240,7 +240,8 @@ producer. The tied fixture must reject cleanly at 10 work units and exhaust
 at 11. The sparse fixture must reject cleanly at 313 and exhaust at 314 with
 a 96-byte response cap and resume limit 1. The walks check exact row order,
 duplicate multiplicity, and snapshot membership after acknowledged appends
-between issuance and resume. Schema version 1 reports record the failure
+between issuance and resume. Current reports record resume limit 1 for each
+successful tied, duplicate, and sparse boundary walk. Schema version 1 reports record the failure
 page, budget, HTTP status, and diagnostic when issuance or continuation fails.
 The durability report must demonstrate prior-process cursor
 rejection and verify readiness and ingest in both filesystem retarget
@@ -254,8 +255,9 @@ capacity producer records clustered and scattered backfill timelines.
 Each proves an acknowledged append and continuation during compaction,
 publication at the exact newer cutoff, exhaustion of the held snapshot,
 and fresh visibility. The workflow builds the capacity producer from the
-dispatched revision so the capacity evidence track supplies the launcher
-and observations. Each fixture records its explicit `fixture.query_work_budget`,
+dispatched revision so the capacity evidence owner supplies the launcher
+and observations. The workflow passes `-query-work-budget 134217728`.
+Each fixture records that value in `fixture.query_work_budget`,
 used for initial queries, continuations, and full restart walks, and the
 peak sampled checkpoint staging bytes. After each held walk exhausts,
 the producer uses the opt-in loopback release action. The gate requires
@@ -264,6 +266,33 @@ the release HTTP status and observed reclaimed bytes in
 positive predecessor pin samples before release and zero afterward. Each
 fixture also requires an exact full walk after restart and successful
 process, cgroup, and fixture root cleanup.
+
+The capacity producer handoff uses these additive fields in each schema v1 result.
+
+- `cgroup.path` identifies the disposable fixture subtree. Read back
+  `cgroup.memory_max_bytes` and `cgroup.memory_swap_max_bytes` from the
+  kernel before launching the candidate. The two scales use distinct subtrees.
+- `cgroup_peak_memory_bytes` and `diagnostics.cgroup_memory_events` come
+  from `memory.peak` and `memory.events` before subtree removal, including
+  on early exit. Qualification requires zero `oom_kill` and `oom_group_kill`
+  when the group counter is present.
+- `diagnostics.seed_progress` reports `acknowledged_rows`, `published_rows`,
+  and the last observed checkpoint `generation`. Update each as acknowledgements
+  and exact checkpoint publications arrive so an early exit preserves progress.
+- The capacity evidence owner keeps missing pin counters pending through the
+  applicable deadline. Poll within the fixture deadline and the 15-minute
+  capture lifetime plus release grace. An observed zero after exhaustion
+  completes the proof. An earlier observation window ending with a missing
+  counter preserves pending evidence for diagnosis.
+- The Linux Release owner supplies `diagnostics.candidates[].teardown_sigkill_sent`
+  from the teardown path for the reaped candidate lifetime. Record attribution
+  only when the verifier's own forced termination accounts for the wait result.
+  Qualification also checks that the candidate was live at teardown and that
+  the kernel recorded zero OOM kills.
+
+Failed runs upload the producer report and logs when available. The workflow
+records the fixture-root check even when the producer exits with an error.
+Historical schema v1 parsing remains available without the current evidence flags.
 
 Restored parity checks legacy WAL replay, append, and restart, then removes the original data and
 bundle and starts the candidate on the verified v1 restore. Ordinary queries

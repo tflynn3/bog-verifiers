@@ -11,6 +11,7 @@ from verify import (PROCESS_LOGS, Rejected, SuiteSkipped, capacity_control_suite
 
 FIXTURE = "linux-release-v1"
 MEMORY_LIMIT = 128 * 1024**2
+CAPACITY_WORK_BUDGET = 134_217_728
 SEED_ROWS = {196_608, 393_216}
 TAIL_ROWS = 2_048
 BATCH_ROWS = 64
@@ -101,6 +102,8 @@ def validate_backfill_timelines(timelines, seed, published, *, require_pin_retir
                   (not require_pin_retirement and stage_bytes is None and storage.get("unavailable")),
                   f"{name}: missing staging observation at {sample['event']}")
         drain = trial["pin_drain"]
+        if require_pin_retirement and drain["status"] == "pending":
+            raise Rejected(f"{name}: pin retirement pending: {drain.get('reason') or 'awaiting a measured zero'}")
         observed = (drain["status"] == "observed" and integer(drain.get("retired_pins_while_held"), 1) and
                     integer(drain.get("retired_pins_after_exhaustion"), 0, 0))
         unavailable = drain["status"] == "unavailable" and isinstance(drain.get("reason"), str) and drain["reason"]
@@ -109,22 +112,71 @@ def validate_backfill_timelines(timelines, seed, published, *, require_pin_retir
         if require_pin_retirement:
             check(integer(drain.get("release_http_status"), 200, 299) and
                   integer(drain.get("reclaimed_bytes"), 1), f"{name}: missing release or reclamation evidence")
+
             def pin_count(sample):
-                return sample.get("candidate_status_metrics", {}).get("retired_generation_pins")
+                return (sample.get("candidate_status_metrics") or {}).get("retired_generation_pins")
 
             start, exhausted, fresh = (samples.index(boundaries[i]) for i in (3, 4, 6))
-            check(any(integer(pin_count(sample), 1) for sample in samples[start:exhausted + 1]) and
-                  any(integer(pin_count(sample), 0, 0) for sample in samples[exhausted + 1:fresh]
-                      if sample["event"] in ("after_exhaustion", "drain_poll")),
+            held_counts = [pin_count(sample) for sample in samples[start:exhausted]]
+            drain_counts = [pin_count(sample) for sample in samples[exhausted + 1:fresh]
+                            if sample["event"] in ("after_exhaustion", "drain_poll") and
+                            integer(pin_count(sample), 0)]
+            check(drain["retired_pins_while_held"] in held_counts and drain_counts and drain_counts[-1] == 0,
                   f"{name}: missing measured positive-to-zero predecessor pins")
     check(generations[0] < generations[1] == published["generation"],
           f"{label}: inconsistent replacement generations")
 
 
-def validate_capacity(evidence, *, require_backfill_timelines=False):
+def validate_capacity_observations(run, seed, label, cgroups):
+    fixture = run["fixture"]
+    check(integer(fixture.get("query_work_budget"), CAPACITY_WORK_BUDGET, CAPACITY_WORK_BUDGET),
+          f"{label}: expected explicit query work budget {CAPACITY_WORK_BUDGET}")
+    group = run.get("cgroup")
+    check(isinstance(group, dict), f"{label}: missing fixture cgroup observations")
+    raw_path = group.get("path")
+    check(isinstance(raw_path, str) and raw_path, f"{label}: missing fixture cgroup path")
+    path = Path(raw_path)
+    root = Path("/sys/fs/cgroup")
+    check(path.is_relative_to(root) and path != root and ".." not in path.parts and path not in cgroups and
+          all(path.parent == previous.parent for previous in cgroups),
+          f"{label}: missing or reused fixture cgroup")
+    cgroups.add(path)
+    check(integer(group.get("memory_max_bytes"), MEMORY_LIMIT, MEMORY_LIMIT) and
+          integer(group.get("memory_swap_max_bytes"), 0, 0), f"{label}: expected 128 MiB with swap disabled")
+
+    diagnostics = run["diagnostics"]
+    events = diagnostics.get("cgroup_memory_events")
+    check(isinstance(events, dict) and {"oom", "oom_kill"} <= events.keys() and
+          all(integer(count, 0) for count in events.values()) and events["oom_kill"] == 0 and
+          events.get("oom_group_kill", 0) == 0, f"{label}: missing memory.events or recorded OOM kill")
+    progress = diagnostics.get("seed_progress")
+    check(isinstance(progress, dict) and integer(progress.get("acknowledged_rows"), seed, seed) and
+          integer(progress.get("published_rows"), seed, seed) and
+          integer(progress.get("generation"), 1, run["compaction"]["generation"] - 1),
+          f"{label}: incomplete acknowledged seed or seed checkpoint")
+
+    candidates = diagnostics.get("candidates")
+    check(isinstance(candidates, list) and all(isinstance(candidate, dict) for candidate in candidates) and
+          [candidate.get("lifetime") for candidate in candidates] == ["startup", "restart"],
+          f"{label}: missing startup or restart teardown evidence")
+    for candidate in candidates:
+        lifetime = candidate["lifetime"]
+        check(candidate.get("reaped") is True and candidate.get("exited_before_cleanup") is False,
+              f"{label}: {lifetime} exited before verifier teardown or was not reaped")
+        signal = candidate.get("exit_signal", "")
+        if signal == "killed":
+            check(integer(candidate.get("exit_code"), -1, -1) and candidate.get("teardown_sigkill_sent") is True,
+                  f"{label}: {lifetime} SIGKILL lacks verifier attribution")
+        else:
+            check(signal == "" and integer(candidate.get("exit_code"), 0, 0) and
+                  not candidate.get("wait_error"), f"{label}: unexpected {lifetime} exit")
+
+
+def validate_capacity(evidence, *, require_backfill_timelines=False, require_capacity_observations=False):
     check(isinstance(evidence, list) and len(evidence) == len(SEED_ROWS),
           "capacity: expected two fixture results")
     seen = set()
+    cgroups = set()
     for run in evidence:
         fixture = run["fixture"]
         seed = fixture["seed_rows"]
@@ -165,6 +217,8 @@ def validate_capacity(evidence, *, require_backfill_timelines=False):
               integer(compaction.get("covered_rows"), seed + BATCH_ROWS, seed + BATCH_ROWS) and
               integer(compaction.get("committed_rows"), total, total), f"{label}: invalid compaction evidence")
         diagnostics = run["diagnostics"]
+        if require_capacity_observations:
+            validate_capacity_observations(run, seed, label, cgroups)
         if require_backfill_timelines:
             check(integer(fixture.get("query_work_budget"), 1), f"{label}: missing explicit query work budget")
             check(integer(diagnostics.get("peak_sampled_checkpoint_staging_bytes"), 0),
@@ -230,13 +284,13 @@ def validate_budget(evidence, *, require_fixed_boundaries=False):
         if require_fixed_boundaries:
             check(budget == boundary and trial_report, f"admission: expected {name} boundary at budget {boundary}")
             exact = next(probe for probe in walk["probes"] if probe["budget"] == boundary)
-            check(integer(exact.get("post_issuance_append_rows"), 2, 2),
-                  f"admission: missing {name} post-issuance appends")
+            check(integer(exact.get("post_issuance_append_rows"), 2, 2) and integer(exact.get("resume_limit"), 1, 1),
+                  f"admission: missing {name} post-issuance appends or resume limit 1")
     if require_fixed_boundaries:
         duplicate = tied.get("duplicate_walk", {})
         check(duplicate.get("outcome") == "exhausted" and "failure" not in duplicate and
               all(integer(duplicate.get(key), value, value) for key, value in
-                  {"budget": 11, "pages": 3, "rows": 3, "post_issuance_append_rows": 2}.items()),
+                  {"budget": 11, "pages": 3, "rows": 3, "post_issuance_append_rows": 2, "resume_limit": 1}.items()),
               "admission: incomplete duplicate-row walk")
     check((require_fixed_boundaries or tied["rejected_budgets"] == tied["first_cursor_budget"] - 1) and
           all(integer(sparse.get(key), value, value) for key, value in
@@ -328,7 +382,7 @@ def record_fixture_root_cleanup(directory, expected, parent):
 
 
 def validate(directory, expected, *, require_fixture_root_cleanup=False, require_fixed_boundaries=False,
-             require_backfill_timelines=False):
+             require_backfill_timelines=False, require_capacity_observations=False):
     statuses = (directory / "producers.txt").read_text().splitlines()
     check(len(statuses) == len(PRODUCERS) and
           set(statuses) == {f"{name} revision={expected['revision']} exit=0" for name in PRODUCERS},
@@ -337,13 +391,17 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
                     require_fixed_boundaries=require_fixed_boundaries)
     validate_durability(directory, expected, require_fixture_root_cleanup=require_fixture_root_cleanup)
     validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected),
-                      require_backfill_timelines=require_backfill_timelines)
+                      require_backfill_timelines=require_backfill_timelines,
+                      require_capacity_observations=require_capacity_observations)
     validate_parity(case_evidence(directory, "parity", "restored_parity", expected),
                     require_writable_restore=require_backfill_timelines)
     control = case_evidence(directory, "control", "capacity_control", expected)
     published = control["published"]
     expanded = "fresh_rows" in control
     covered, committed = (4, 5) if expanded else (3, 3)
+    if require_capacity_observations:
+        check(integer(control.get("default_control_404_checks"), 4, 4),
+              "control: missing default-off status and start probes")
     if expanded or require_backfill_timelines:
         check(integer(control.get("fresh_rows"), 5, 5), "control: incomplete fresh visibility evidence")
     check(integer(control["default_http_status"], 404, 404) and integer(control["wildcard_opt_in_exit"], 1) and
@@ -364,8 +422,10 @@ def produce_control(binary, directory, expected):
     try:
         with tempfile.TemporaryDirectory(prefix="bog-release-control-") as workspace:
             metrics = capacity_control_suite(binary, Path(workspace) / "control")
-        check(not isinstance(metrics, SuiteSkipped), f"release requires capacity control: {getattr(metrics, 'reason', '')}")
-        case.update(status="pass", evidence=metrics)
+        if isinstance(metrics, SuiteSkipped):
+            case.update(status="skip", detail=metrics.reason)
+        else:
+            case.update(status="pass", evidence=metrics)
     except Exception as exc:
         case["detail"] = str(exc)
         raise
@@ -387,6 +447,7 @@ def main():
     parser.add_argument("--require-fixture-root-cleanup", action="store_true")
     parser.add_argument("--require-fixed-boundaries", action="store_true")
     parser.add_argument("--require-backfill-timelines", action="store_true")
+    parser.add_argument("--require-capacity-observations", action="store_true")
     args = parser.parse_args()
     try:
         directory = args.directory.resolve()
@@ -407,8 +468,13 @@ def main():
                   f"candidate binary is not Linux {args.arch}")
             validate(directory, expected, require_fixture_root_cleanup=args.require_fixture_root_cleanup,
                      require_fixed_boundaries=args.require_fixed_boundaries,
-                     require_backfill_timelines=args.require_backfill_timelines)
-            (directory / "qualified.json").write_text(json.dumps({**expected, "arch": args.arch}) + "\n")
+                     require_backfill_timelines=args.require_backfill_timelines,
+                     require_capacity_observations=args.require_capacity_observations)
+            qualification = {**expected, "arch": args.arch}
+            if all((args.require_fixture_root_cleanup, args.require_fixed_boundaries,
+                    args.require_backfill_timelines, args.require_capacity_observations)):
+                qualification["current_observations"] = True
+            (directory / "qualified.json").write_text(json.dumps(qualification) + "\n")
     except (Rejected, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         parser.exit(1, f"release evidence: {exc}\n")
 
