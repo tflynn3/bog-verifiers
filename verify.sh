@@ -69,6 +69,15 @@ if [ -z "$repository$branch$expected" ]; then
       expected=${SLIPWAY_INPUT_TESTEDCOMMIT:-${SLIPWAY_PARAM_COMMIT:-}}
       if [ "$branch" = main ]; then allow_ancestor=true; fi
       ;;
+    pr:post-land)
+      # bog-conductor's post-land QA probe: gate the landed main commit with the PR
+      # profile (240s watchdog). Prefer the commit the conductor landed over the QA
+      # agent's reported testedCommit; main may have advanced past it.
+      repository=${SLIPWAY_PARAM_REPOSITORY:-$factory_repository}
+      branch=${SLIPWAY_PARAM_BRANCH:-main}
+      expected=${SLIPWAY_PARAM_COMMIT:-${SLIPWAY_INPUT_TESTEDCOMMIT:-}}
+      if [ "$branch" = main ]; then allow_ancestor=true; fi
+      ;;
   esac
 fi
 for tool in git go grep python3 timeout; do

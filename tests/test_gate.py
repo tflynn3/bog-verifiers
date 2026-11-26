@@ -92,6 +92,32 @@ class GateTest(unittest.TestCase):
                 self.assertIn("snapshot-pagination", {suite["name"] for suite in report["suites"]})
                 self.assertTrue(all(suite["status"] == "blocked" for suite in report["suites"]))
 
+    def test_post_land_mode_wires_parameter_inputs_to_the_pr_profile(self):
+        # bog-conductor's post-land QA probe is a parameter-only verify step: no repository
+        # lease, mode=post-land, the landed commit as a param and/or the QA step's testedCommit.
+        # Before this mode existed every probe failed with "missing Bog candidate inputs".
+        bundle = str(ROOT / "tests/fixtures/readme-only.bundle")
+        cases = [
+            {"SLIPWAY_PARAM_COMMIT": README_ONLY},
+            {"SLIPWAY_INPUT_TESTEDCOMMIT": README_ONLY},
+            {"SLIPWAY_PARAM_COMMIT": README_ONLY, "SLIPWAY_INPUT_TESTEDCOMMIT": "0" * 40},
+        ]
+        for inputs in cases:
+            with self.subTest(inputs=sorted(inputs)):
+                result = entrypoint(SLIPWAY_PARAM_MODE="post-land", SLIPWAY_PARAM_REPOSITORY=bundle, **inputs)
+                self.assertNotIn("missing Bog candidate inputs", result.stderr)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(f"candidate_sha={README_ONLY} profile=pr", result.stdout)
+                self.assertIn("rejected in build (suites=0): missing ./cmd/bog", result.stderr)
+
+    def test_build_timeout_is_an_infrastructure_error_not_a_rejection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, work = buildable_candidate(Path(directory))
+            timeout = subprocess.TimeoutExpired(["go", "build"], verify.BUILD_TIMEOUT_SECONDS)
+            with patch.object(verify.subprocess, "run", side_effect=timeout):
+                with self.assertRaisesRegex(verify.InfrastructureError, "timed out after"):
+                    verify.build(source, work, work / "build.log")
+
     def test_default_gate_and_comparisons_have_distinct_suite_plans(self):
         def plan(profile):
             result = verify.new_result("0" * 40, None, profile)
