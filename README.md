@@ -21,12 +21,14 @@ the documented WAL and commit marker.
   whose `-help` lacks `-query-max-response-bytes`. Leave the parameter unset
   for baseline runs and unrelated tracks, where that missing flag skips
   only the response byte suite.
-- Set `SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION=1` on the verification step
-  for the live-route change in #19. That run rejects a binary whose `-help`
-  lacks `-query-concurrency`. Older baseline pins, including the helper-only
-  commit `73bf453`, report the admission suite as skipped when the parameter
-  is unset and the flag is absent. Durability and WAL recovery run regardless
-  of the admission result.
+- Set `SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION=1` on the #19 release candidate
+  verification step. The gate requires both `-query-concurrency` and
+  `-query-work-budget` in `-help` and passing reports for both suites. The
+  published report must match the tested SHA, profile, and completion record.
+  Leave the parameter unset for baseline runs and unrelated tracks. Each
+  missing flag marks its own suite as skipped with `coverage: unavailable`
+  in `BOG_RESULT`. The existing query, ingest, pagination, and recovery
+  suites still run.
 - With the same candidate inputs, use `--full`, `--compare`, or
   `SLIPWAY_PARAM_MODE=full` or `compare` for the paired post-cycle matrix and
   WAL handoffs against `4ff49aae9672cf5aec8e3fbd20ffe0a84ae15bc0`.
@@ -67,7 +69,7 @@ the documented WAL and commit marker.
   cursors across two backfill commits. Active walks change page size and
   express the same bounds in different time zones.
 - The work budget suite sets `-query-work-budget=32` when advertised and
-  checks HTTP 422 without rows or `Bog-Next-Cursor` for ordinary scans and
+  checks HTTP 503 without rows or `Bog-Next-Cursor` for ordinary scans and
   for lookahead on first pages and continuations.
 - The admission suite independently detects `-query-concurrency` and sets it
   to 1. An unread response holds the slot through TCP backpressure. Ordinary

@@ -113,15 +113,6 @@ class GateTest(unittest.TestCase):
                                           [name for name in core
                                            if name not in ("snapshot-pagination", "log-replay")]))
 
-    def test_query_limits_plan_exempts_pinned_baselines(self):
-        for sha in (verify.BASELINE_SHA, verify.COMPARISON_BASELINE_SHA, verify.CYCLE7_BASELINE_SHA):
-            for profile in ("pr", "full", "post-cycle", "indexed", "legacy"):
-                with self.subTest(profile=profile, sha=sha):
-                    self.assertNotIn("query-limits", dict(verify.suite_plan(verify.SUITES, profile, sha)))
-                    report = verify.new_result(sha, sha, profile)
-                    self.assertNotIn("query-limits", {suite["name"] for suite in report["suites"]})
-        self.assertIn("query-limits", dict(verify.suite_plan(verify.SUITES, "pr", "0" * 40)))
-
     def test_query_admission_and_work_budget_gate_independently(self):
         budget = "  -query-work-budget int"
         concurrency = "  -query-concurrency int"
@@ -131,11 +122,11 @@ class GateTest(unittest.TestCase):
         for options, help_status, sha, required, limits, admission, diagnostic in (
             ("  -addr string", 0, unrelated, "", "skipped", "skipped", missing),
             (f"{budget}\n  -query-concurrency-extra int", 0, unrelated, "", "run", "skipped", missing),
-            (concurrency, 0, unrelated, "1", "skipped", "run", None),
+            (concurrency, 0, unrelated, "1", "rejected", "run", None),
             (f"{budget}\n{concurrency}", 0, unrelated, "", "run", "run", None),
             ("  -addr string", 0, helper_only, "", "skipped", "skipped", missing),
-            ("  -addr string", 0, verify.CYCLE7_BASELINE_SHA, "", None, "skipped", missing),
-            ("  -addr string", 0, helper_only, "1", "skipped", "rejected", "required for #19 verification"),
+            ("  -addr string", 0, verify.CYCLE7_BASELINE_SHA, "", "skipped", "skipped", missing),
+            ("  -addr string", 0, helper_only, "1", "rejected", "rejected", "required for #19 verification"),
             (budget, 0, unrelated, "1", "run", "rejected", "required for #19 verification"),
             ("  -addr string", 2, unrelated, "", "rejected", "rejected", "Bog -help exited with status 2"),
         ):
@@ -163,12 +154,15 @@ class GateTest(unittest.TestCase):
                     self.assertEqual(verify.main(work, work, sha), int(rejected))
                 report = json.loads((work / "artifacts/result.json").read_text())
                 outcomes = {suite["name"]: suite for suite in report["suites"]}
-                if limits is None:
-                    self.assertNotIn("query-limits", outcomes)
-                else:
-                    self.assertEqual(outcomes["query-limits"]["status"], "rejected" if limits == "run" else limits)
+                self.assertEqual(outcomes["query-limits"]["status"], "rejected" if limits == "run" else limits)
+                if limits == "skipped":
+                    self.assertEqual(outcomes["query-limits"]["coverage"], "unavailable")
+                if limits == "rejected" and required:
+                    self.assertIn("-query-work-budget", outcomes["query-limits"]["diagnostic"])
                 admission_result = outcomes["query-admission"]
                 self.assertEqual(admission_result["status"], "rejected" if admission == "run" else admission)
+                if admission == "skipped":
+                    self.assertEqual(admission_result["coverage"], "unavailable")
                 self.assertIn("query assertions reached" if admission == "run" else diagnostic,
                               admission_result["diagnostic"])
                 self.assertEqual(outcomes["kill-durability"]["status"], "passed")
@@ -180,6 +174,74 @@ class GateTest(unittest.TestCase):
                 if admission == "run":
                     expected_flags.append(("-query-concurrency=1",))
                 self.assertEqual([call.kwargs["flags"] for call in run.call_args_list], expected_flags)
+
+    def test_release_gate_requires_complete_query_admission_evidence(self):
+        sha = "a" * 40
+        for defect in (None, "skipped", "missing", "wrong_status", "rows", "cursor"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                binary = work / "bog"
+                binary.touch()
+
+                def run(*_):
+                    verify.PROCESS_LOGS.get()[1].append({"ready_ms": 1})
+
+                def report(flag, value):
+                    return {
+                        "flag": flag, "flag_value": value,
+                        "rejections": {probe: {"status": 503, "ndjson_rows": 0, "next_cursor": False}
+                                       for probe in ("ordinary", "first_page", "continuation")},
+                    }
+
+                def budget(*args):
+                    run(*args)
+                    return report("-query-work-budget", 32)
+
+                def admission(*args):
+                    run(*args)
+                    if defect == "skipped":
+                        return verify.SuiteSkipped("probe did not run")
+                    if defect == "missing":
+                        return None
+                    result = report("-query-concurrency", 1)
+                    result.update(ingest_during_saturation="passed", snapshot_after_disconnect="passed",
+                                  backfill_after_restart="passed")
+                    mutation = {"wrong_status": ("status", 422), "rows": ("ndjson_rows", 1),
+                                "cursor": ("next_cursor", True)}.get(defect)
+                    if mutation:
+                        key, value = mutation
+                        result["rejections"]["continuation"][key] = value
+                    return result
+
+                suites = (("query-limits", budget), ("query-admission", admission), ("wal-recovery", run))
+                path = work / "artifacts/result.json"
+                with patch.dict(os.environ, {"SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION": "1"}), \
+                     patch.object(verify, "SUITES", suites), \
+                     patch.object(verify, "REQUIRED_SUITES", tuple(name for name, _ in suites)), \
+                     patch.object(verify, "CYCLE7_PROFILES", ()), \
+                     patch.object(verify, "build", return_value=binary):
+                    self.assertEqual(verify.main(work, work, sha), int(defect is not None))
+                    result = json.loads(path.read_text())
+                    self.assertEqual(result["suites"][-1]["status"], "passed")
+                    if defect:
+                        self.assertFalse((work / "passed").exists())
+                    else:
+                        verify.publish_result(work, 0, "", sha, sha)
+                        with self.assertRaisesRegex(verify.InfrastructureError, "tested revision"):
+                            verify.publish_result(work, 0, "", sha, "b" * 40)
+                        completion = work / "passed"
+                        original = completion.read_text()
+                        completion.write_text(f"{sha} {'0' * 64} 3\n")
+                        with self.assertRaisesRegex(verify.InfrastructureError, "completion record"):
+                            verify.publish_result(work, 0, "", sha, sha)
+                        completion.write_text(original)
+                        result["suites"].pop(1)
+                        path.write_text(json.dumps(result))
+                        with self.assertRaisesRegex(verify.Rejected, "passing query-admission report"):
+                            verify.publish_result(work, 0, "", sha, sha)
+                        path.unlink()
+                        with self.assertRaisesRegex(verify.InfrastructureError, "passing suite result is missing"):
+                            verify.publish_result(work, 0, "", sha, sha)
 
     def test_response_byte_suite_requires_the_capability_for_issue_seven(self):
         for flags, required, diagnostic in (

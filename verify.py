@@ -42,6 +42,8 @@ BASELINE_SHA = "25d0c0acc103bd73f0552a8f10240c8d8c1d023d"
 COMPARISON_BASELINE_SHA = "4ff49aae9672cf5aec8e3fbd20ffe0a84ae15bc0"
 CYCLE7_BASELINE_SHA = "be7f937a1025a57166d15888727012ed4989a6b4"
 NEXT_CURSOR = "Bog-Next-Cursor"
+QUERY_ADMISSION_FLAGS = {"query-limits": ("-query-work-budget", 32), "query-admission": ("-query-concurrency", 1)}
+QUERY_REJECTION_PROBES = ("ordinary", "first_page", "continuation")
 MAX_FRAME = 4 * 1024 * 1024
 DEFAULT_QUERY_LIMIT = 500
 MAX_QUERY_LIMIT = 1000
@@ -425,6 +427,7 @@ def expect_query_error(bog, args, expected, label, *, timeout=HTTP_TIMEOUT):
             continue
         check(not (isinstance(value, dict) and {"ts", "line"} <= value.keys()),
               f"{label}: error returned an NDJSON row")
+    return {"status": status, "ndjson_rows": 0, "next_cursor": False}
 
 
 def load_corpus():
@@ -787,37 +790,53 @@ def advertised_flags(binary, directory):
     return set(re.findall(r"^[ \t]*(-[a-z0-9-]+)(?=[ \t=]|$)", help_result.stdout, re.MULTILINE))
 
 
+def query_admission_required():
+    return os.environ.get("SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION") == "1"
+
+
+def query_flag_unavailable(binary, directory, suite):
+    flag, _ = QUERY_ADMISSION_FLAGS[suite]
+    if flag in advertised_flags(binary, directory):
+        return None
+    reason = f"admission coverage unavailable: Bog -help does not list {flag}"
+    check(not query_admission_required(), f"{reason}; required for #19 verification")
+    return SuiteSkipped(reason)
+
+
 def query_limits_suite(binary, directory):
-    if "-query-work-budget" not in advertised_flags(binary, directory):
-        return SuiteSkipped("Bog -help does not list -query-work-budget")
+    unavailable = query_flag_unavailable(binary, directory, "query-limits")
+    if unavailable:
+        return unavailable
 
     directory.mkdir()
-    budget = 32
-    first = Row(1, "@ first match")
-    second = Row(2, "@ second match")
-    last = Row(4 * budget, "@ late match")
+    flag, budget = QUERY_ADMISSION_FLAGS["query-limits"]
+    first = Row(1, "@a")
+    second = Row(2, "@b")
+    last = Row(4 * budget, "@c")
     # A one-character filter cannot use the four-byte Bloom summaries.
     gap = [Row(ns, "scan gap") for ns in range(3, last.ns)]
     args = query_args(0, last.ns + 1, "@")
-    with run_bog(binary, directory / "work-budget", flags=(f"-query-work-budget={budget}",)) as bog:
+    with run_bog(binary, directory / "work-budget", flags=(f"{flag}={budget}",)) as bog:
         bog.ingest([first, second, *gap, last])
-        expect_rows(bog.query(0, last.ns + 1, "@", limit=2), [first, second],
+        expect_rows(bog.query(0, second.ns + 1, "@", limit=2), [first, second],
                     "ordinary query fits the work budget")
         cursor = expect_page(bog, args, [first, second, last], 0, 1, None, "first page fits budget")
-        expect_query_error(bog, {**args, "limit": 3}, 422, "ordinary query exceeds work budget")
-        expect_query_error(bog, {**args, "limit": 2, "page": "1"}, 422,
-                           "first page exceeds work budget during lookahead")
-        expect_query_error(bog, {**args, "limit": 1, "cursor": cursor}, 422,
-                           "continuation exceeds work budget during lookahead")
+        rejections = {
+            "ordinary": expect_query_error(bog, {**args, "limit": 3}, 503,
+                                           "ordinary query exceeds work budget"),
+            "first_page": expect_query_error(bog, {**args, "limit": 2, "page": "1"}, 503,
+                                             "first page exceeds work budget during lookahead"),
+            "continuation": expect_query_error(bog, {**args, "limit": 1, "cursor": cursor}, 503,
+                                               "continuation exceeds work budget during lookahead"),
+        }
         expect_rows(bog.query(last.ns, last.ns + 1, "@"), [last], "query after budget rejection")
+    return {"flag": flag, "flag_value": budget, "rejections": rejections}
 
 
 def query_admission_suite(binary, directory):
-    if "-query-concurrency" not in advertised_flags(binary, directory):
-        reason = "Bog -help does not list -query-concurrency"
-        check(os.environ.get("SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION") != "1",
-              f"{reason}; required for #19 verification")
-        return SuiteSkipped(reason)
+    unavailable = query_flag_unavailable(binary, directory, "query-admission")
+    if unavailable:
+        return unavailable
 
     small = [Row(ns, f"original/{ns}") for ns in (10, 30, 50)]
     backfill = [Row(20, "backfill between pages"), Row(30, "backfill at original timestamp")]
@@ -826,7 +845,8 @@ def query_admission_suite(binary, directory):
     # buffer without exceeding the older 16 MiB estimated response limit.
     padding = "\x01" * (192 * 1024)
     wide = [Row(ns, padding) for ns in range(100, 112)]
-    flags = ("-query-concurrency=1",)
+    flag, slots = QUERY_ADMISSION_FLAGS["query-admission"]
+    flags = (f"{flag}={slots}",)
     with run_bog(binary, directory, flags=flags) as bog:
         bog.ingest(small)
         for start in range(0, len(wide), 3):
@@ -842,13 +862,14 @@ def query_admission_suite(binary, directory):
             with client.getresponse() as held:
                 check(held.status == 200 and held.read(1) == b"{",
                       f"query used to hold the slot did not start an NDJSON response (HTTP {held.status})")
-                expect_query_error(bog, args, 503, "ordinary query during saturation", timeout=2)
-                expect_query_error(bog, {**args, "page": "1", "limit": 1}, 503,
-                                   "first page during saturation", timeout=2)
+                ordinary = expect_query_error(bog, args, 503, "ordinary query during saturation", timeout=2)
+                first_page = expect_query_error(bog, {**args, "page": "1", "limit": 1}, 503,
+                                                "first page during saturation", timeout=2)
                 check(bog.request("GET", "/healthz")[0] == 200, "health failed during query saturation")
                 bog.ingest(backfill)
-                expect_query_error(bog, {**args, "cursor": cursor, "limit": 1}, 503,
-                                   "continuation during saturation after acknowledged backfill", timeout=2)
+                continuation = expect_query_error(bog, {**args, "cursor": cursor, "limit": 1}, 503,
+                                                  "continuation during saturation after acknowledged backfill",
+                                                  timeout=2)
 
         deadline = time.monotonic() + HTTP_TIMEOUT
         expected = oracle(small + backfill, 0, 100)
@@ -869,6 +890,10 @@ def query_admission_suite(binary, directory):
 
     with run_bog(binary, directory, flags=flags) as bog:
         expect_rows(bog.query(0, 100), expected, "acknowledged backfill after SIGKILL and restart")
+    return {"flag": flag, "flag_value": slots,
+            "rejections": {"ordinary": ordinary, "first_page": first_page, "continuation": continuation},
+            "ingest_during_saturation": "passed", "snapshot_after_disconnect": "passed",
+            "backfill_after_restart": "passed"}
 
 
 def query_response_bytes_suite(binary, directory):
@@ -2520,9 +2545,7 @@ CYCLE7_HANDOFF = "cycle7-wal-handoff"
 CYCLE7_PROFILES = ("pr", "full", "post-cycle")
 
 
-def suite_plan(suites, profile, sha):
-    if sha in (BASELINE_SHA, COMPARISON_BASELINE_SHA, CYCLE7_BASELINE_SHA):
-        suites = tuple((name, run) for name, run in suites if name != "query-limits")
+def suite_plan(suites, profile):
     if profile == "legacy":
         return tuple((name, run) for name, run in suites if name not in ("snapshot-pagination", "log-replay"))
     if profile in COMPARISON_SUITES:
@@ -2606,7 +2629,7 @@ def log_tail(path, size):
 
 
 def new_result(requested_sha, tested_sha, profile="pr"):
-    required = suite_plan(tuple((name, None) for name in REQUIRED_SUITES), profile, tested_sha or requested_sha)
+    required = suite_plan(tuple((name, None) for name in REQUIRED_SUITES), profile)
     baseline_sha = {"pr": CYCLE7_BASELINE_SHA, "full": COMPARISON_BASELINE_SHA, "post-cycle": COMPARISON_BASELINE_SHA,
                     "legacy": BASELINE_SHA, "indexed": BASELINE_SHA}.get(profile)
     return {
@@ -2627,6 +2650,27 @@ def new_result(requested_sha, tested_sha, profile="pr"):
     }
 
 
+def require_query_admission_metrics(name, metrics):
+    flag, value = QUERY_ADMISSION_FLAGS[name]
+    expected = {
+        "flag": flag, "flag_value": value,
+        "rejections": {probe: {"status": 503, "ndjson_rows": 0, "next_cursor": False}
+                       for probe in QUERY_REJECTION_PROBES},
+    }
+    if name == "query-admission":
+        expected.update(ingest_during_saturation="passed", snapshot_after_disconnect="passed",
+                        backfill_after_restart="passed")
+    check(metrics == expected, f"#19 {name} report is missing or mismatched")
+
+
+def require_query_admission_report(result):
+    for name in QUERY_ADMISSION_FLAGS:
+        matches = [suite for suite in result["suites"] if suite["name"] == name]
+        check(len(matches) == 1 and matches[0]["status"] == "passed",
+              f"#19 requires one passing {name} report")
+        require_query_admission_metrics(name, matches[0].get("metrics"))
+
+
 def publish_result(work, code, reason, requested_sha, tested_sha, profile="pr"):
     evidence = work / "artifacts"
     evidence.mkdir(exist_ok=True)
@@ -2636,6 +2680,14 @@ def publish_result(work, code, reason, requested_sha, tested_sha, profile="pr"):
     status = {0: "passed", 1: "rejected"}.get(code, "infra_error")
     if code == 0 and result["status"] != "passed":
         raise InfrastructureError("passing suite result is missing")
+    if code == 0 and query_admission_required():
+        if (result.get("requested_sha"), result.get("tested_sha"), result.get("profile")) != (
+                requested_sha, tested_sha, profile):
+            raise InfrastructureError("#19 report does not match the requested and tested revision or profile")
+        require_query_admission_report(result)
+        digest = result["build"]["binary_sha256"]
+        if (work / "passed").read_text().split() != [tested_sha, digest, str(len(result["suites"]))]:
+            raise InfrastructureError("#19 report does not match the completion record")
     result.update(status=status, exit_code=code)
     if reason and "diagnostic" not in result:
         result["diagnostic"] = reason
@@ -2656,7 +2708,7 @@ def main(source, work, sha, profile="pr"):
     build_log = evidence / "build.log"
     result = new_result(sha, sha, profile)
     required = tuple(suite["name"] for suite in result["suites"])
-    suites = suite_plan(SUITES, profile, sha)
+    suites = suite_plan(SUITES, profile)
     result["build"].update(status="running", log="build.log")
 
     def checkpoint():
@@ -2763,6 +2815,9 @@ def main(source, work, sha, profile="pr"):
             else:
                 metrics = run(binary, work / stage)
             if isinstance(metrics, SuiteSkipped):
+                if stage in QUERY_ADMISSION_FLAGS:
+                    check(not query_admission_required(), f"#19 requires {stage}: {metrics.reason}")
+                    suite["coverage"] = "unavailable"
                 suite.update(status="skipped", diagnostic=metrics.reason)
                 completed.append(stage)
                 skipped += 1
@@ -2770,6 +2825,8 @@ def main(source, work, sha, profile="pr"):
                 continue
             if metrics is not None:
                 suite["metrics"] = metrics
+            if stage in QUERY_ADMISSION_FLAGS and query_admission_required():
+                require_query_admission_metrics(stage, metrics)
             if stage == LOG_REPLAY_COMPARISON or (profile == "indexed" and stage == comparison_stage):
                 failed = metrics["failed_targets"]
                 check(not failed, f"{stage} missed {len(failed)} targets: {', '.join(failed)}")
@@ -2809,6 +2866,13 @@ def main(source, work, sha, profile="pr"):
     if tuple(completed) != required:
         finish("infra_error", "required suite execution did not complete")
         return 2
+    if query_admission_required():
+        try:
+            require_query_admission_report(result)
+        except Rejected as exc:
+            reason = diagnostic(exc)
+            finish("rejected", reason)
+            return reject(work, sha, "report", len(completed), reason)
     finish("passed")
     (work / "passed").write_text(f"{sha} {digest} {len(completed)}\n")
     print(f"verified_sha={sha} binary_sha256={digest} suites={len(completed)}")
