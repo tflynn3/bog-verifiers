@@ -125,16 +125,18 @@ class GateTest(unittest.TestCase):
     def test_query_admission_and_work_budget_gate_independently(self):
         budget = "  -query-work-budget int"
         concurrency = "  -query-concurrency int"
-        issue_candidate = "73bf45334ec7067f9ed8fcd06c8ccdef8dca72ef"
+        helper_only = "73bf45334ec7067f9ed8fcd06c8ccdef8dca72ef"
         unrelated = "0" * 40
         missing = "Bog -help does not list -query-concurrency"
         for options, help_status, sha, required, limits, admission, diagnostic in (
             ("  -addr string", 0, unrelated, "", "skipped", "skipped", missing),
             (f"{budget}\n  -query-concurrency-extra int", 0, unrelated, "", "run", "skipped", missing),
-            (concurrency, 0, issue_candidate, "", "skipped", "run", None),
+            (concurrency, 0, unrelated, "1", "skipped", "run", None),
             (f"{budget}\n{concurrency}", 0, unrelated, "", "run", "run", None),
-            ("  -addr string", 0, issue_candidate, "", "skipped", "rejected", missing),
-            (budget, 0, unrelated, "1", "run", "rejected", missing),
+            ("  -addr string", 0, helper_only, "", "skipped", "skipped", missing),
+            ("  -addr string", 0, verify.CYCLE7_BASELINE_SHA, "", None, "skipped", missing),
+            ("  -addr string", 0, helper_only, "1", "skipped", "rejected", "required for #19 verification"),
+            (budget, 0, unrelated, "1", "run", "rejected", "required for #19 verification"),
             ("  -addr string", 2, unrelated, "", "rejected", "rejected", "Bog -help exited with status 2"),
         ):
             with self.subTest(options=options, sha=sha, required=required, help_status=help_status), \
@@ -149,22 +151,28 @@ class GateTest(unittest.TestCase):
                     verify.PROCESS_LOGS.get()[1].append({"ready_ms": 1})
 
                 suites = (("query-limits", verify.query_limits_suite),
-                          ("query-admission", verify.query_admission_suite), ("following", following_suite))
+                          ("query-admission", verify.query_admission_suite),
+                          ("kill-durability", following_suite), ("wal-recovery", following_suite))
                 with patch.dict(os.environ, {"SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION": required}), \
                      patch.object(verify, "SUITES", suites), \
                      patch.object(verify, "REQUIRED_SUITES", tuple(name for name, _ in suites)), \
                      patch.object(verify, "CYCLE7_PROFILES", ()), \
                      patch.object(verify, "build", return_value=binary), \
                      patch.object(verify, "run_bog", side_effect=verify.Rejected("query assertions reached")) as run:
-                    rejected = (limits, admission) != ("skipped", "skipped")
+                    rejected = limits in ("run", "rejected") or admission in ("run", "rejected")
                     self.assertEqual(verify.main(work, work, sha), int(rejected))
                 report = json.loads((work / "artifacts/result.json").read_text())
-                budget_result, admission_result, following_result = report["suites"]
-                self.assertEqual(budget_result["status"], "rejected" if limits == "run" else limits)
+                outcomes = {suite["name"]: suite for suite in report["suites"]}
+                if limits is None:
+                    self.assertNotIn("query-limits", outcomes)
+                else:
+                    self.assertEqual(outcomes["query-limits"]["status"], "rejected" if limits == "run" else limits)
+                admission_result = outcomes["query-admission"]
                 self.assertEqual(admission_result["status"], "rejected" if admission == "run" else admission)
                 self.assertIn("query assertions reached" if admission == "run" else diagnostic,
                               admission_result["diagnostic"])
-                self.assertEqual(following_result["status"], "passed")
+                self.assertEqual(outcomes["kill-durability"]["status"], "passed")
+                self.assertEqual(outcomes["wal-recovery"]["status"], "passed")
                 self.assertEqual((work / "passed").exists(), not rejected)
                 expected_flags = []
                 if limits == "run":

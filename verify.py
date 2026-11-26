@@ -41,7 +41,6 @@ COMMIT_MAGIC = b"BOGCMT01"
 BASELINE_SHA = "25d0c0acc103bd73f0552a8f10240c8d8c1d023d"
 COMPARISON_BASELINE_SHA = "4ff49aae9672cf5aec8e3fbd20ffe0a84ae15bc0"
 CYCLE7_BASELINE_SHA = "be7f937a1025a57166d15888727012ed4989a6b4"
-QUERY_ADMISSION_CANDIDATE_SHA = "73bf45334ec7067f9ed8fcd06c8ccdef8dca72ef"
 NEXT_CURSOR = "Bog-Next-Cursor"
 MAX_FRAME = 4 * 1024 * 1024
 DEFAULT_QUERY_LIMIT = 500
@@ -813,10 +812,11 @@ def query_limits_suite(binary, directory):
         expect_rows(bog.query(last.ns, last.ns + 1, "@"), [last], "query after budget rejection")
 
 
-def query_admission_suite(binary, directory, *, required=False):
+def query_admission_suite(binary, directory):
     if "-query-concurrency" not in advertised_flags(binary, directory):
         reason = "Bog -help does not list -query-concurrency"
-        check(not required, reason)
+        check(os.environ.get("SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION") != "1",
+              f"{reason}; required for #19 verification")
         return SuiteSkipped(reason)
 
     small = [Row(ns, f"original/{ns}") for ns in (10, 30, 50)]
@@ -2760,10 +2760,6 @@ def main(source, work, sha, profile="pr"):
                 metrics = run(binary, work / stage, rounds=56)
             elif stage == "kill-durability" and profile == "legacy":
                 metrics = run(binary, work / stage, paged=False)
-            elif stage == "query-admission":
-                admission_required = (sha == QUERY_ADMISSION_CANDIDATE_SHA
-                                      or os.environ.get("SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION") == "1")
-                metrics = run(binary, work / stage, required=admission_required)
             else:
                 metrics = run(binary, work / stage)
             if isinstance(metrics, SuiteSkipped):

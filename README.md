@@ -21,10 +21,12 @@ the documented WAL and commit marker.
   whose `-help` lacks `-query-max-response-bytes`. Leave the parameter unset
   for baseline runs and unrelated tracks, where that missing flag skips
   only the response byte suite.
-- The admission suite is required for the #19 candidate at `73bf453`. Set
-  `SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION=1` on subsequent #19 candidate runs
-  to reject a binary whose `-help` lacks `-query-concurrency`. On other runs,
-  a missing flag skips only the admission suite.
+- Set `SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION=1` on the verification step
+  for the live-route change in #19. That run rejects a binary whose `-help`
+  lacks `-query-concurrency`. Older baseline pins, including the helper-only
+  commit `73bf453`, report the admission suite as skipped when the parameter
+  is unset and the flag is absent. Durability and WAL recovery run regardless
+  of the admission result.
 - With the same candidate inputs, use `--full`, `--compare`, or
   `SLIPWAY_PARAM_MODE=full` or `compare` for the paired post-cycle matrix and
   WAL handoffs against `4ff49aae9672cf5aec8e3fbd20ffe0a84ae15bc0`.
