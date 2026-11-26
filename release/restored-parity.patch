@@ -1,23 +1,26 @@
+diff --git a/verify/release/parity_linux_test.go b/verify/release/parity_linux_test.go
+index 2620d5d..6d9e5c3 100644
 --- a/verify/release/parity_linux_test.go
 +++ b/verify/release/parity_linux_test.go
-@@ -12,0 +13 @@
-+	"os/exec"
-@@ -57,5 +58,9 @@
+@@ -22,0 +23 @@ import (
++	querymodel "bog/verify/query-model"
+@@ -57,5 +58,10 @@ type parityProof struct {
 -	Point          backup.Point `json:"verified_point"`
 -	CapturedRows   int          `json:"captured_rows"`
 -	PostRestore204 bool         `json:"post_restore_204"`
 -	PostAppendRows int          `json:"post_append_rows"`
 -	RestartRows    int          `json:"restart_rows"`
-+	Point               backup.Point   `json:"verified_point"`
-+	CapturedRows        int            `json:"captured_rows"`
-+	PostRestore204      bool           `json:"post_restore_204"`
-+	LegacyRows          int            `json:"legacy_rows"`
-+	UnpagedChecks       int            `json:"unpaged_checks"`
-+	StaleCursorRejected bool           `json:"stale_cursor_rejected"`
-+	Resource            *resourceProof `json:"retained_resource_admission,omitempty"`
-+	PostAppendRows      int            `json:"post_append_rows"`
-+	RestartRows         int            `json:"restart_rows"`
-@@ -90,0 +96,29 @@
++	Point               backup.Point      `json:"verified_point"`
++	CapturedRows        int               `json:"captured_rows"`
++	PostRestore204      bool              `json:"post_restore_204"`
++	LegacyRows          int               `json:"legacy_rows"`
++	UnpagedChecks       int               `json:"unpaged_checks"`
++	StaleCursorRejected bool              `json:"stale_cursor_rejected"`
++	Resource            *resourceProof    `json:"retained_resource_admission,omitempty"`
++	Replacement         *replacementProof `json:"live_replacement,omitempty"`
++	PostAppendRows      int               `json:"post_append_rows"`
++	RestartRows         int               `json:"restart_rows"`
+@@ -90,0 +97,29 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 +	legacy := filepath.Join(root, "legacy")
 +	if err := os.Mkdir(legacy, 0700); err != nil {
 +		return proof, err
@@ -47,31 +50,66 @@
 +			return proof, err
 +		}
 +	}
-@@ -99 +133 @@
+@@ -99 +134 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -		if err := checkRestoredWalks(ctx, pager, rows); err != nil {
 +		if err := checkQueries(base, rows); err != nil {
-@@ -108 +142 @@
+@@ -108 +143 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
 +		if err := checkQueries(base, augmented); err != nil {
-@@ -129,5 +163,2 @@
--		pager, err := newReleasePager(base, client, restoredPageCap)
--		if err != nil {
--			return err
--		}
--		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
+@@ -128,0 +164,112 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 +		proof.StaleCursorRejected = true
 +		if err := checkQueries(base, augmented); err != nil {
-@@ -140,0 +172,99 @@
++			return err
++		}
++		proof.RestartRows = len(augmented)
++		return nil
++	})
++	if err != nil {
++		err = fmt.Errorf("restart with acknowledged post-restore write: %w", err)
 +	}
 +	if err == nil {
 +		proof.Resource, err = probeRestoredAdmission(ctx, binary, dir, client, flags, point, augmented)
 +	}
++	if err == nil {
++		proof.Replacement, err = probeReplacement(ctx, binary, dir, client, flags, augmented)
++	}
 +	return proof, err
 +}
 +
++func parityRowsFor(appendOrder []row, filter string) ([]row, error) {
++	start, err := time.Parse(time.RFC3339Nano, fixtureStart)
++	if err != nil {
++		return nil, err
++	}
++	end, err := time.Parse(time.RFC3339Nano, fixtureEnd)
++	if err != nil {
++		return nil, err
++	}
++	var log querymodel.Log
++	batch := make([]querymodel.Row, 0, len(appendOrder))
++	for _, r := range appendOrder {
++		ts, err := time.Parse(time.RFC3339Nano, r.TS)
++		if err != nil {
++			return nil, err
++		}
++		batch = append(batch, querymodel.Row{Time: ts, Line: r.Line})
++	}
++	entries, err := log.Match(log.Append(batch), querymodel.Filter{Start: start, End: end, Contains: filter})
++	if err != nil {
++		return nil, err
++	}
++	want := make([]row, 0, len(entries))
++	for _, entry := range entries {
++		want = append(want, row{entry.Time.Format(time.RFC3339Nano), entry.Line})
++	}
++	return want, nil
++}
++
 +func checkUnpaged(ctx context.Context, client *http.Client, base string, rows []row) error {
-+	want := slices.Clone(rows)
-+	slices.SortStableFunc(want, func(a, b row) int { return strings.Compare(a.TS, b.TS) })
++	want, err := parityRowsFor(rows, "")
++	if err != nil {
++		return err
++	}
 +	// The response byte cap can trim the ordinary prefix. Its first two
 +	// rows fit, so compare that exact prefix and require no cursor.
 +	path := strings.Replace(queryPath("", 2, ""), "&page=1", "", 1)
@@ -99,14 +137,11 @@
 +
 +func probeRestoredAdmission(ctx context.Context, binary, dir string, client *http.Client, flags []string, point backup.Point, rows []row) (*resourceProof, error) {
 +	proof := &resourceProof{Status: "fail"}
-+	help, err := exec.CommandContext(ctx, binary, "-help").CombinedOutput()
++	enabled, err := advertisesFlag(ctx, binary, tailLimitFlag)
 +	if err != nil {
-+		return proof, fmt.Errorf("probe retained resource flags: %w", err)
++		return proof, err
 +	}
-+	if !slices.ContainsFunc(strings.Split(string(help), "\n"), func(line string) bool {
-+		name, _, _ := strings.Cut(strings.TrimSpace(line), " ")
-+		return name == tailLimitFlag
-+	}) {
++	if !enabled {
 +		proof.Status, proof.Detail = "skip", "candidate does not advertise "+tailLimitFlag
 +		return proof, nil
 +	}
@@ -134,10 +169,8 @@
 +		if proof.RejectedHTTPStatus != http.StatusServiceUnavailable {
 +			return fmt.Errorf("tail admission: expected HTTP 503, got %d (%v)", proof.RejectedHTTPStatus, ingestErr)
 +		}
-+		pager, err := newReleasePager(base, client, restoredPageCap)
-+		if err != nil {
-+			return err
-+		}
+@@ -133 +280,13 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+-		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
 +		return checkRestoredWalks(ctx, pager, rows)
 +	}); err != nil {
 +		return proof, err
@@ -151,13 +184,221 @@
 +	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
 +		pager, err := newReleasePager(base, client, restoredPageCap)
 +		if err != nil {
-+			return err
-+		}
+@@ -136 +295,4 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+-		proof.RestartRows = len(augmented)
 +		if err := checkRestoredWalks(ctx, pager, rows); err != nil {
 +			return err
 +		}
 +		proof.RestartRows = len(rows)
+@@ -139,2 +301,2 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+-	if err != nil {
+-		err = fmt.Errorf("restart with acknowledged post-restore write: %w", err)
++	if err == nil {
++		proof.Status = "pass"
+@@ -147,5 +309,3 @@ func checkRestoredWalks(ctx context.Context, pager *releasePager, appendOrder []
+-		var want []row
+-		for _, r := range appendOrder {
+-			if strings.Contains(r.Line, filter) {
+-				want = append(want, r)
+-			}
++		want, err := parityRowsFor(appendOrder, filter)
++		if err != nil {
++			return err
+@@ -153 +312,0 @@ func checkRestoredWalks(ctx context.Context, pager *releasePager, appendOrder []
+-		slices.SortStableFunc(want, func(a, b row) int { return strings.Compare(a.TS, b.TS) })
+@@ -164,2 +323,5 @@ func checkRestoredWalk(ctx context.Context, pager *releasePager, filter string,
+-	seen := make(map[string]bool)
+-	cursor := ""
++	return resumeRestoredWalk(ctx, pager, filter, limit, want, "")
++}
++
++func resumeRestoredWalk(ctx context.Context, pager *releasePager, filter string, limit int, want []row, cursor string) error {
++	seen := map[string]bool{cursor: true}
+@@ -172,2 +334,2 @@ func checkRestoredWalk(ctx context.Context, pager *releasePager, filter string,
+-		if n > limit {
+-			return fmt.Errorf("page %d exceeded row limit", number)
++		if n > limit || (len(want) > 0 && n == 0) {
++			return fmt.Errorf("page %d: invalid row count %d with limit %d and %d remaining", number, n, limit, len(want))
+diff --git a/verify/release/replacement_linux_test.go b/verify/release/replacement_linux_test.go
+new file mode 100644
+index 0000000..6282dc0
+--- /dev/null
++++ b/verify/release/replacement_linux_test.go
+@@ -0,0 +1,177 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"fmt"
++	"net/http"
++	"os/exec"
++	"slices"
++	"strconv"
++	"strings"
++	"time"
++)
++
++const replacementFlag = "-enable-capacity-control"
++
++type replacementState struct {
++	State         string `json:"state"`
++	Generation    uint64 `json:"generation"`
++	CoveredRows   int    `json:"covered_rows"`
++	CommittedRows int    `json:"committed_rows"`
++}
++
++type replacementProof struct {
++	Status           string           `json:"status"`
++	Detail           string           `json:"detail,omitempty"`
++	Initial          replacementState `json:"initial"`
++	Published        replacementState `json:"published"`
++	AppendHTTPStatus int              `json:"append_http_status"`
++	SnapshotRows     int              `json:"snapshot_rows"`
++	FreshRows        int              `json:"fresh_rows"`
++	RestartRows      int              `json:"restart_rows"`
++}
++
++func advertisesFlag(ctx context.Context, binary, flag string) (bool, error) {
++	help, err := exec.CommandContext(ctx, binary, "-help").CombinedOutput()
++	if err != nil {
++		return false, fmt.Errorf("probe %s: %w: %.200s", flag, err, help)
++	}
++	for line := range strings.SplitSeq(string(help), "\n") {
++		fields := strings.Fields(line)
++		if len(fields) > 0 {
++			name, _, _ := strings.Cut(fields[0], "=")
++			if name == flag {
++				return true, nil
++			}
++		}
++	}
++	return false, nil
++}
++
++func probeReplacement(ctx context.Context, binary, dir string, client *http.Client, flags []string, rows []row) (proof *replacementProof, err error) {
++	proof = &replacementProof{Status: "fail"}
++	defer func() {
++		if err != nil {
++			proof.Detail = err.Error()
++		}
++	}()
++	enabled, err := advertisesFlag(ctx, binary, replacementFlag)
++	if err != nil {
++		return proof, err
++	}
++	if !enabled {
++		proof.Status, proof.Detail = "skip", "candidate does not advertise "+replacementFlag
++		return proof, nil
++	}
++	want, err := parityRowsFor(rows, "")
++	if err != nil {
++		return proof, err
++	}
++	backfill := []row{{want[0].TS, "replacement backfill [match]"}, {rows[1].TS, "replacement tie [match]"}}
++	augmented := append(slices.Clone(rows), backfill...)
++	initialCutoff := len(rows)
++	cutoff := len(augmented)
++	err = serveDirectory(ctx, binary, dir, client, append(slices.Clone(flags), replacementFlag), func(base string) error {
++		if proof.Initial, err = readReplacement(ctx, client, base, http.MethodGet, "status", 0); err != nil {
++			return err
++		}
++		if proof.Initial.CommittedRows != initialCutoff || proof.Initial.CoveredRows > initialCutoff {
++			return fmt.Errorf("unexpected initial restored compaction state: %+v", proof.Initial)
++		}
++
++		pager, err := newReleasePager(base, client, restoredPageCap)
++		if err != nil {
++			return err
++		}
++		first, _, err := pager.fetch(ctx, "", 1, "")
++		if err != nil {
++			return fmt.Errorf("open restored snapshot: %w", err)
++		}
++		if len(first.Rows) != 1 || first.NextCursor == "" {
++			return fmt.Errorf("expected one restored row and a cursor before replacement")
++		}
++		if err := checkPageRows(first.Rows, want[:1]); err != nil {
++			return err
++		}
++		proof.AppendHTTPStatus, err = ingest(ctx, client, base, backfill)
++		if err != nil {
++			return err
++		}
++		if _, err := readReplacement(ctx, client, base, http.MethodPost, "start", cutoff); err != nil {
++			return err
++		}
++		wait, cancel := context.WithTimeout(ctx, 10*time.Second)
++		defer cancel()
++		ticker := time.NewTicker(20 * time.Millisecond)
++		defer ticker.Stop()
++		for {
++			proof.Published, err = readReplacement(wait, client, base, http.MethodGet, "status", cutoff)
++			if err != nil {
++				return err
++			}
++			if proof.Published.State == "complete" && proof.Published.Generation > proof.Initial.Generation {
++				break
++			}
++			select {
++			case <-wait.Done():
++				return fmt.Errorf("wait for restored generation replacement: %w", wait.Err())
++			case <-ticker.C:
++			}
++		}
++		if proof.Published.CoveredRows != cutoff || proof.Published.CommittedRows != cutoff {
++			return fmt.Errorf("unexpected restored compaction cutoff: %+v", proof.Published)
++		}
++		if err := resumeRestoredWalk(ctx, pager, "", 2, want[1:], first.NextCursor); err != nil {
++			return fmt.Errorf("resume restored snapshot after replacement: %w", err)
++		}
++		proof.SnapshotRows = len(want)
++		if err := checkUnpaged(ctx, client, base, augmented); err != nil {
++			return err
++		}
++		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
++			return fmt.Errorf("fresh walk after replacement: %w", err)
++		}
++		proof.FreshRows = cutoff
++		return nil
++	})
++	if err != nil {
++		return proof, err
++	}
++	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
++		pager, err := newReleasePager(base, client, restoredPageCap)
++		if err != nil {
++			return err
++		}
++		if err := checkUnpaged(ctx, client, base, augmented); err != nil {
++			return err
++		}
++		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
++			return fmt.Errorf("restart after replacement: %w", err)
++		}
++		proof.RestartRows = cutoff
 +		return nil
 +	})
 +	if err == nil {
 +		proof.Status = "pass"
++	}
++	return proof, err
++}
++
++func readReplacement(ctx context.Context, client *http.Client, base, method, action string, cutoff int) (replacementState, error) {
++	var state replacementState
++	res, err := request(ctx, client, method, base+"/_capacity/compaction?action="+action+"&cutoff="+strconv.Itoa(cutoff), nil)
++	if err != nil {
++		return state, fmt.Errorf("restored compaction %s: %w", action, err)
++	}
++	if res.status < 200 || res.status >= 300 {
++		return state, fmt.Errorf("restored compaction %s: HTTP %d: %.200q", action, res.status, res.body)
++	}
++	if err := json.Unmarshal(res.body, &state); err != nil {
++		return state, fmt.Errorf("decode restored compaction %s: %w", action, err)
++	}
++	if state.State != "running" && state.State != "complete" || state.CoveredRows < 0 {
++		return state, fmt.Errorf("invalid restored compaction %s state: %+v", action, state)
++	}
++	return state, nil
++}

@@ -203,9 +203,9 @@ jobs:
             go run ./verify/release validate -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
               -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
               -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
+            if (( failed != 0 )); then exit "$failed"; fi
             python3 -B "$GITHUB_WORKSPACE/verifiers/release_gate.py" validate \
-              "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --arch "$RELEASE_ARCH" || failed=1
-            exit "$failed"
+              "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --arch "$RELEASE_ARCH"
           } 2>&1 | tee "$EVIDENCE/validation.log"
 
       - name: Race-test release verifier lifecycle
@@ -242,11 +242,17 @@ jobs:
           MATRIX_RESULT: ${{ needs.verify.result }}
         run: |
           [[ "$MATRIX_RESULT" == success ]]
-          amd64=$(cat evidence/linux-release-evidence-amd64/qualified.json)
-          arm64=$(cat evidence/linux-release-evidence-arm64/qualified.json)
+          amd64_dir=evidence/linux-release-evidence-amd64
+          arm64_dir=evidence/linux-release-evidence-arm64
+          amd64=$(cat "$amd64_dir/qualified.json")
+          arm64=$(cat "$arm64_dir/qualified.json")
+          read -r amd64_digest _ < "$amd64_dir/binary.sha256"
+          read -r arm64_digest _ < "$arm64_dir/binary.sha256"
           jq -en --argjson amd64 "$amd64" --argjson arm64 "$arm64" \
+            --arg amd64_digest "$amd64_digest" --arg arm64_digest "$arm64_digest" \
             --arg revision "$REVISION" --arg fixture "$FIXTURE" '
               $amd64.arch == "amd64" and $arm64.arch == "arm64" and
-              ([$amd64, $arm64] | all(.revision == $revision and .fixture == $fixture and
+              ([$amd64, $arm64] | all(.schema_version == 1 and .revision == $revision and .fixture == $fixture and
                 (.binary_sha256 | test("^[0-9a-f]{64}$")))) and
-              $amd64.binary_sha256 != $arm64.binary_sha256'
+              $amd64.binary_sha256 == $amd64_digest and $arm64.binary_sha256 == $arm64_digest and
+              $amd64_digest != $arm64_digest'

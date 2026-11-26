@@ -257,7 +257,14 @@ limit, Bog must reject a whole two-row batch with HTTP 503, preserve the WAL
 and commit marker, and serve the exact acknowledged rows before and after
 restart.
 
-Candidates without the tail limit flag skip that probe. The existing short
-Slipway capacity suite still discovers `-enable-capacity-control` before
-running. The manually dispatched release gate requires every required case to
-pass. Missing or skipped evidence leaves the revision unqualified.
+The restored-store replacement probe holds a cursor before an acknowledged
+backfill, publishes a newer generation, and checks that the held cursor
+finishes over the original rows. Fresh ordinary queries and framed walks
+compare against the independent append-log oracle immediately after
+publication and after restart. The parity report adds a `live_replacement`
+object under schema version 1.
+
+The resource and replacement probes discover their flags in candidate help.
+Missing flags skip the corresponding probe. The short Slipway capacity
+suite also discovers `-enable-capacity-control` before running. The manually
+dispatched release gate requires passing evidence from both probes.

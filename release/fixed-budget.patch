@@ -1,6 +1,36 @@
+diff --git a/verify/release/admission.go b/verify/release/admission.go
+index 801486d..4c3fe00 100644
+--- a/verify/release/admission.go
++++ b/verify/release/admission.go
+@@ -363 +363,2 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
+-		FixedBudgetWalk budgetWalkProof `json:"fixed_budget_walk"`
++		FixedBudgetWalk       budgetWalkProof `json:"fixed_budget_walk"`
++		FramedBudgetRejection bool            `json:"framed_budget_rejection"`
+@@ -369,3 +370,16 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
+-		result, err := requireRejection(ctx, client, base+queryPath("", 1, budgetFilter))
+-		budgetProof.rejection = result
+-		return err
++		started := time.Now()
++		pager, err := newReleasePager(base, client, 0)
++		if err != nil {
++			return err
++		}
++		_, res, err := pager.fetch(ctx, budgetFilter, 1, "")
++		if res == nil || res.StatusCode != http.StatusServiceUnavailable {
++			return fmt.Errorf("expected HTTP 503 budget rejection: %v", err)
++		}
++		budgetProof.HTTPStatus = res.StatusCode
++		budgetProof.ElapsedMS = time.Since(started).Milliseconds()
++		if err := checkBudgetRejection(res, err); err != nil {
++			return err
++		}
++		budgetProof.FramedBudgetRejection = true
++		return nil
+diff --git a/verify/release/budget_walk.go b/verify/release/budget_walk.go
+index 57460af..6c268d0 100644
 --- a/verify/release/budget_walk.go
 +++ b/verify/release/budget_walk.go
-@@ -19,0 +20,7 @@
+@@ -19,0 +20,7 @@ const (
 +type budgetPageFailure struct {
 +	Budget     int    `json:"budget"`
 +	Page       int    `json:"page"`
@@ -8,7 +38,7 @@
 +	Detail     string `json:"detail"`
 +}
 +
-@@ -21,4 +28,8 @@
+@@ -21,4 +28,8 @@ type budgetWalkStats struct {
 -	FirstCursorBudget int `json:"first_cursor_budget"`
 -	RejectedBudgets   int `json:"rejected_budgets"`
 -	Pages             int `json:"pages"`
@@ -21,24 +51,29 @@
 +	RejectedBudgets     int                `json:"rejected_budgets"`
 +	Pages               int                `json:"pages"`
 +	Rows                int                `json:"rows"`
-@@ -118,0 +130,4 @@
+@@ -118,0 +130,4 @@ func findSparseBudgetWalk(ctx context.Context, client *http.Client, maxBudget in
 +		if err != nil {
 +			proof.budgetWalkStats = trial
 +			return proof, err
 +		}
-@@ -121 +136,3 @@
+@@ -121 +136,3 @@ func findSparseBudgetWalk(ctx context.Context, client *http.Client, maxBudget in
 -			proof.FirstRows = fixture.firstRows
 +			if trial.FirstCursorBudget != 0 {
 +				proof.FirstRows = fixture.firstRows
 +			}
-@@ -126,3 +142,0 @@
--		}
+@@ -127,3 +143,0 @@ func findSparseBudgetWalk(ctx context.Context, client *http.Client, maxBudget in
 -		if err != nil {
 -			return proof, err
-@@ -172 +186 @@
+-		}
+@@ -164 +178,3 @@ func checkBudgetRejection(res *http.Response, err error) error {
+-	if !ok || httpErr.Cause != nil || httpErr.Body != budgetRejectionBody ||
++	framed := res.ProtoMajor >= 2 || res.ContentLength >= 0 ||
++		(len(res.TransferEncoding) == 1 && res.TransferEncoding[0] == "chunked")
++	if !framed || !ok || httpErr.Cause != nil || httpErr.Body != budgetRejectionBody ||
+@@ -172 +188 @@ func checkBudgetRejection(res *http.Response, err error) error {
 -func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture, proof *budgetWalkStats) error {
 +func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture, proof *budgetWalkStats) (err error) {
-@@ -175 +189,13 @@
+@@ -175 +191,13 @@ func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixtu
 -	for number, offset := 1, 0; offset < len(fixture.want); number++ {
 +	number, status := 1, 0
 +	defer func() {
@@ -53,22 +88,27 @@
 +		}
 +	}()
 +	for offset := 0; offset < len(fixture.want); number++ {
-@@ -181,0 +208,4 @@
+@@ -181,0 +210,4 @@ func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixtu
 +		status = 0
 +		if res != nil {
 +			status = res.StatusCode
 +		}
-@@ -218,0 +249,4 @@
+@@ -218,0 +251,4 @@ func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixtu
 +		if number > 1 {
 +			proof.ContinuationPages++
 +		}
 +		proof.Terminal = cursor == ""
+diff --git a/verify/release/budget_walk_test.go b/verify/release/budget_walk_test.go
+index 93d6204..345e5cd 100644
 --- a/verify/release/budget_walk_test.go
 +++ b/verify/release/budget_walk_test.go
-@@ -142 +142 @@
+@@ -4,0 +5,2 @@ import (
++
++	"bog/internal/client"
+@@ -142 +144 @@ func TestFindSparseBudgetWalk(t *testing.T) {
 -				budgetWalkStats: budgetWalkStats{tc.threshold, rejected, 3, 4},
 +				budgetWalkStats: budgetWalkStats{FirstCursorBudget: tc.threshold, RejectedBudgets: rejected, Pages: 3, Rows: 4, ContinuationPages: 2, Terminal: true},
-@@ -181,5 +181,5 @@
+@@ -181,5 +183,5 @@ func TestFindBudgetWalk(t *testing.T) {
 -		{"first budget", 0, 3, []page{first, second, last}, budgetWalkStats{1, 0, 3, 3}, ""},
 -		{"search stops at first cursor", 2, 4, []page{first, second, last}, budgetWalkStats{3, 2, 3, 3}, ""},
 -		{"inclusive upper bound", 2, 3, []page{first, second, last}, budgetWalkStats{3, 2, 3, 3}, ""},
@@ -79,10 +119,10 @@
 +		{"inclusive upper bound", 2, 3, []page{first, second, last}, budgetWalkStats{FirstCursorBudget: 3, RejectedBudgets: 2, Pages: 3, Rows: 3, ContinuationPages: 2, Terminal: true}, ""},
 +		{"no cursor within bound", 3, 3, nil, budgetWalkStats{FirstCursorBudget: 0, RejectedBudgets: 3, Pages: 0, Rows: 0, ContinuationPages: 0, Terminal: false}, "no first-page cursor"},
 +		{"partial rejection", 1, 3, []page{{status: 503, body: rejection.body + "{\"t"}}, budgetWalkStats{FirstCursorBudget: 0, RejectedBudgets: 1, Pages: 0, Rows: 0, ContinuationPages: 0, Terminal: false}, "unclean HTTP 503"},
-@@ -189 +189 @@
+@@ -189 +191 @@ func TestFindBudgetWalk(t *testing.T) {
 -		{"success without first cursor", 1, 3, []page{{status: 200, body: firstRow, ndjson: true}}, budgetWalkStats{0, 1, 0, 0}, "missing continuation cursor"},
 +		{"success without first cursor", 1, 3, []page{{status: 200, body: firstRow, ndjson: true}}, budgetWalkStats{FirstCursorBudget: 0, RejectedBudgets: 1, Pages: 0, Rows: 0, ContinuationPages: 0, Terminal: false}, "missing continuation cursor"},
-@@ -192,10 +192,10 @@
+@@ -192,10 +194,10 @@ func TestFindBudgetWalk(t *testing.T) {
 -		{"empty continuation", 0, 3, []page{first, {status: 200, cursor: new(secondToken), ndjson: true}}, budgetWalkStats{1, 0, 1, 1}, "empty query page with next cursor"},
 -		{"repeated cursor", 0, 3, []page{first, {status: 200, body: secondRow, cursor: new(firstToken), ndjson: true}}, budgetWalkStats{1, 0, 1, 1}, "next cursor does not advance pagination"},
 -		{"early termination", 0, 3, []page{first, {status: 200, body: secondRow, ndjson: true}}, budgetWalkStats{1, 0, 1, 1}, "missing continuation cursor"},
@@ -103,20 +143,35 @@
 +		{"truncated HTTP body", 0, 3, []page{first, second, {status: 200, body: lastRow, ndjson: true, truncate: true}}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 2, Rows: 2, ContinuationPages: 1, Terminal: false}, "unexpected EOF"},
 +		{"terminal cursor", 0, 3, []page{first, second, {status: 200, body: lastRow, cursor: new(strings.Repeat("C", 44)), ndjson: true}}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 2, Rows: 2, ContinuationPages: 1, Terminal: false}, "issued a cursor after the final row"},
 +		{"empty terminal cursor header", 0, 3, []page{first, second, {status: 200, body: lastRow, cursor: new(""), ndjson: true}}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 2, Rows: 2, ContinuationPages: 1, Terminal: false}, "invalid next cursor header"},
-@@ -270,0 +271,2 @@
+@@ -270,0 +273,2 @@ func TestFindBudgetWalk(t *testing.T) {
 +			// Wire-level tests assert the additional diagnostic fields.
 +			got.IssuanceFailure, got.ContinuationFailure = nil, nil
-@@ -340 +342,2 @@
+@@ -340 +344,2 @@ func TestBudgetWalkRejectsNonAdjacentCursorRepeat(t *testing.T) {
 -	if stats != (budgetWalkStats{1, 0, 2, 2}) || requests.Load() != 3 {
 +	stats.ContinuationFailure = nil
 +	if stats != (budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 2, Rows: 2, ContinuationPages: 1, Terminal: false}) || requests.Load() != 3 {
+@@ -343,0 +349,13 @@ func TestBudgetWalkRejectsNonAdjacentCursorRepeat(t *testing.T) {
++
++func TestBudgetRejectionRequiresFraming(t *testing.T) {
++	body := budgetRejectionBody
++	err := &client.HTTPError{StatusCode: 503, Body: body}
++	response := &http.Response{ProtoMajor: 1, ContentLength: -1}
++	if problem := checkBudgetRejection(response, err); problem == nil {
++		t.Fatal("accepted close-delimited budget rejection")
++	}
++	response.ContentLength = int64(len(body))
++	if problem := checkBudgetRejection(response, err); problem != nil {
++		t.Fatalf("rejected length-framed budget error: %v", problem)
++	}
++}
+diff --git a/verify/release/pages_wire_test.go b/verify/release/pages_wire_test.go
+index eab4338..34a4387 100644
 --- a/verify/release/pages_wire_test.go
 +++ b/verify/release/pages_wire_test.go
-@@ -164 +164 @@
+@@ -164 +164 @@ func TestFixedBudgetWireVerdict(t *testing.T) {
 -				if verdictErr != nil || verdict.Status != "pass" || stats != (budgetWalkStats{1, 0, 3, 3}) || calls.Load() != 4 {
 +				if verdictErr != nil || verdict.Status != "pass" || stats != (budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 3, Rows: 3, ContinuationPages: 2, Terminal: true}) || calls.Load() != 4 {
-@@ -167,0 +168,9 @@
-+			}
+@@ -168,0 +169,9 @@ func TestFixedBudgetWireVerdict(t *testing.T) {
 +			failure := stats.ContinuationFailure
 +			other := stats.IssuanceFailure
 +			if tc.failPage == 1 {
@@ -125,3 +180,4 @@
 +			if failure == nil || other != nil || failure.Budget != 1 ||
 +				failure.Page != tc.failPage || !strings.Contains(failure.Detail, tc.problem) {
 +				t.Fatalf("wrong observed page failure: %+v, other=%+v", failure, other)
++			}

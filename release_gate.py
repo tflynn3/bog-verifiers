@@ -104,6 +104,7 @@ def validate_capacity(evidence):
 def validate_budget(evidence):
     check(integer(evidence.get("http_status"), 503, 503) and
           integer(evidence.get("ndjson_rows"), 0, 0) and evidence.get("next_cursor") is False and
+          evidence.get("framed_budget_rejection") is True and
           integer(evidence.get("elapsed_ms"), 0, 1999), "admission: incomplete work budget rejection")
     tied = evidence["fixed_budget_walk"]
     sparse = tied["sparse_walk"]
@@ -139,6 +140,18 @@ def validate_parity(evidence):
           integer(resource.get("rejected_http_status"), 503, 503) and
           resource.get("unchanged_wal") is True and integer(resource.get("restart_rows"), 7, 7),
           "parity: incomplete retained tail admission or restart evidence")
+    replacement = evidence["live_replacement"]
+    initial, published = replacement["initial"], replacement["published"]
+    before, after = evidence["post_append_rows"], evidence["post_append_rows"] + 2
+    check(replacement["status"] == "pass" and integer(initial.get("generation"), 0) and
+          integer(initial.get("covered_rows"), 0, before) and
+          integer(initial.get("committed_rows"), before, before) and published["state"] == "complete" and
+          integer(published.get("generation"), initial["generation"] + 1) and
+          all(integer(published.get(key), after, after) for key in ("covered_rows", "committed_rows")) and
+          integer(replacement.get("append_http_status"), 204, 204) and
+          integer(replacement.get("snapshot_rows"), before, before) and
+          all(integer(replacement.get(key), after, after) for key in ("fresh_rows", "restart_rows")),
+          "parity: incomplete restored generation replacement or snapshot evidence")
 
 
 def validate_durability(directory, expected):
