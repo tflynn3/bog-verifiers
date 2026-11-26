@@ -1,34 +1,52 @@
 diff --git a/verify/release/admission.go b/verify/release/admission.go
-index 5e65629..a32f059 100644
+index 5e65629..cdc9620 100644
 --- a/verify/release/admission.go
 +++ b/verify/release/admission.go
-@@ -338 +338,5 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
+@@ -112,0 +113,4 @@ func requireRejection(ctx context.Context, client *http.Client, target string) (
++	return requireRejectionBody(ctx, client, target, "")
++}
++
++func requireRejectionBody(ctx context.Context, client *http.Client, target, expectedBody string) (rejection, error) {
+@@ -129,0 +134,3 @@ func requireRejection(ctx context.Context, client *http.Client, target string) (
++	if expectedBody != "" && (!strings.HasPrefix(res.contentType, "text/plain") || string(res.body) != expectedBody) {
++		return evidence, fmt.Errorf("unexpected HTTP 503 body or content type: %.200q (%q)", res.body, res.contentType)
++	}
+@@ -338 +345,6 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
 -	budgetErr := serve(ctx, binary, client, []string{"-query-concurrency=1", "-query-work-budget=1"}, func(base string) error {
 +	var budget struct {
 +		rejection
 +		FixedPagination fixedBudgetProof `json:"fixed_budget_pagination"`
++		FixedWalk       fixedBudgetProof `json:"fixed_budget_walk"`
 +	}
 +	budgetErr := serve(ctx, binary, client, []string{"-query-concurrency=1", fixedBudgetFlag + "=1"}, func(base string) error {
-@@ -342,2 +346,3 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
+@@ -342,2 +354,3 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
 -		result, err := requireRejection(ctx, client, base+queryPath("", 1, budgetFilter))
 -		return record(cases, "work_budget", result, err)
 +		var err error
-+		budget.rejection, err = requireRejection(ctx, client, base+queryPath("", 1, budgetFilter))
++		budget.rejection, err = requireRejectionBody(ctx, client, base+queryPath("", 1, budgetFilter), "query work budget exhausted\n")
 +		return err
-@@ -345,2 +350,2 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
+@@ -345,2 +358,10 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
 -	if _, ok := cases["work_budget"]; !ok {
 -		budgetErr = record(cases, "work_budget", nil, budgetErr)
 +	if budgetErr == nil {
-+		budget.FixedPagination, budgetErr = probeFixedBudget(ctx, binary, client)
-@@ -348 +353 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
++		budget.FixedPagination, budgetErr = probeFixedBudget(ctx, binary, client, []row{
++			{fixtureStart, "first"},
++			{"2020-01-01T00:00:01Z", strings.Repeat("x", fixedBudgetPadding)},
++		})
++	}
++	if budgetErr == nil {
++		budget.FixedWalk, budgetErr = probeFixedBudget(ctx, binary, client, []row{
++			{fixtureStart, "c"}, {fixtureStart, "a"}, {fixtureStart, "b"},
++		})
+@@ -348 +369 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
 -	return errors.Join(saturationErr, budgetErr)
 +	return errors.Join(saturationErr, record(cases, "work_budget", budget, budgetErr))
 diff --git a/verify/release/fixed_budget.go b/verify/release/fixed_budget.go
 new file mode 100644
-index 0000000..afe745b
+index 0000000..f6a86c5
 --- /dev/null
 +++ b/verify/release/fixed_budget.go
-@@ -0,0 +1,127 @@
+@@ -0,0 +1,135 @@
 +package main
 +
 +import (
@@ -46,22 +64,18 @@ index 0000000..afe745b
 +)
 +
 +type fixedBudgetProof struct {
-+	Budget         int  `json:"budget"`
-+	RejectedBudget int  `json:"rejected_budget"`
-+	RejectedHTTP   int  `json:"rejected_http_status"`
-+	FirstRows      int  `json:"first_rows"`
-+	ResumedRows    int  `json:"resumed_rows"`
-+	Terminal       bool `json:"terminal"`
++	Budget            int  `json:"budget"`
++	RejectedBudget    int  `json:"rejected_budget"`
++	RejectedHTTP      int  `json:"rejected_http_status"`
++	FirstRows         int  `json:"first_rows"`
++	ResumedRows       int  `json:"resumed_rows"`
++	Terminal          bool `json:"terminal"`
++	ContinuationPages int  `json:"continuation_pages"`
 +}
 +
-+// Find the first-page budget boundary over HTTP. The second row is much more
-+// expensive to prepare, so issuing a cursor without reserving a continuation
-+// can succeed at a budget that cannot deliver the final row.
-+func probeFixedBudget(ctx context.Context, binary string, client *http.Client) (proof fixedBudgetProof, err error) {
-+	rows := []row{
-+		{fixtureStart, "first"},
-+		{"2020-01-01T00:00:01Z", strings.Repeat("x", fixedBudgetPadding)},
-+	}
++// Find the first-page budget boundary over HTTP and finish the walk with
++// the same process and budget at which the first cursor was issued.
++func probeFixedBudget(ctx context.Context, binary string, client *http.Client, rows []row) (proof fixedBudgetProof, err error) {
 +	firstPath := queryPath("", 1, "")
 +	probe := func(budget int, verify func(string, response) error) error {
 +		flags := []string{fmt.Sprintf("%s=%d", fixedBudgetFlag, budget)}
@@ -123,6 +137,9 @@ index 0000000..afe745b
 +		if !rejected(res) {
 +			return fmt.Errorf("expected a clean budget rejection, got HTTP %d: %.200s", res.status, res.body)
 +		}
++		if len(rows) != 2 {
++			return nil
++		}
 +		// A short ordinary query still fits. The paged request has to
 +		// reserve the more expensive next response before it can succeed.
 +		ordinary, err := request(ctx, client, http.MethodGet, base+strings.Replace(firstPath, "&page=1", "", 1), nil)
@@ -138,16 +155,25 @@ index 0000000..afe745b
 +			return err
 +		}
 +		proof.FirstRows = 1
-+		last, err := request(ctx, client, http.MethodGet, base+queryPath(first.cursor, 1, ""), nil)
-+		if err != nil {
-+			return err
-+		}
-+		if err := requireRow(last, rows[1]); err != nil {
-+			return err
-+		}
-+		proof.ResumedRows, proof.Terminal = 1, !last.cursorHeader
-+		if !proof.Terminal {
-+			return errors.New("full final page supplied a continuation")
++		seen := map[string]bool{first.cursor: true}
++		cursor := first.cursor
++		for i, want := range rows[1:] {
++			res, err := request(ctx, client, http.MethodGet, base+queryPath(cursor, 1, ""), nil)
++			if err != nil {
++				return err
++			}
++			if err := requireRow(res, want); err != nil {
++				return fmt.Errorf("continuation %d: %w", i+1, err)
++			}
++			more := i+2 < len(rows)
++			if res.cursorHeader != more || (more && (res.cursor == "" || seen[res.cursor])) {
++				return fmt.Errorf("continuation %d: expected a fresh cursor=%t", i+1, more)
++			}
++			seen[res.cursor] = true
++			cursor = res.cursor
++			proof.ContinuationPages++
++			proof.ResumedRows++
++			proof.Terminal = !more
 +		}
 +		return nil
 +	})

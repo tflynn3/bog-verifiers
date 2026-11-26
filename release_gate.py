@@ -93,12 +93,14 @@ def validate_budget(evidence):
     check(integer(evidence.get("http_status"), 503, 503) and
           integer(evidence.get("ndjson_rows"), 0, 0) and evidence.get("next_cursor") is False and
           integer(evidence.get("elapsed_ms"), 0, 1999), "admission: incomplete work budget rejection")
-    fixed = evidence["fixed_budget_pagination"]
-    budget = fixed.get("budget")
-    check(integer(budget, 2, 16_384) and integer(fixed.get("rejected_budget"), budget - 1, budget - 1) and
-          integer(fixed.get("rejected_http_status"), 503, 503) and integer(fixed.get("first_rows"), 1, 1) and
-          integer(fixed.get("resumed_rows"), 1, 1) and fixed.get("terminal") is True,
-          "admission: missing measured cursor budget or terminal continuation")
+    for name, continuations in (("fixed_budget_pagination", 1), ("fixed_budget_walk", 2)):
+        fixed = evidence[name]
+        budget = fixed.get("budget")
+        check(integer(budget, 2, 16_384) and integer(fixed.get("rejected_budget"), budget - 1, budget - 1) and
+              integer(fixed.get("rejected_http_status"), 503, 503) and integer(fixed.get("first_rows"), 1, 1) and
+              integer(fixed.get("resumed_rows"), continuations, continuations) and
+              integer(fixed.get("continuation_pages"), continuations, continuations) and fixed.get("terminal") is True,
+              f"admission: incomplete {name} evidence")
 
 
 def validate_parity(evidence):
@@ -124,6 +126,11 @@ def validate(directory, expected):
           set(statuses) == {f"{name} revision={expected['revision']} exit=0" for name in PRODUCERS},
           "missing, repeated or failing release producer status")
     validate_budget(case_evidence(directory, "admission", "work_budget", expected))
+    ready = case_evidence(directory, "durability", "descriptor_bound_readiness", expected)
+    check(integer(ready.get("initial_http_status"), 200, 200) and
+          integer(ready.get("full_http_status"), 503, 503) and ready.get("full_reason") == "low_disk_headroom" and
+          integer(ready.get("recovered_http_status"), 200, 200) and ready.get("recovered_reason") == "ready",
+          "durability: incomplete descriptor-bound readiness evidence")
     validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected))
     validate_parity(case_evidence(directory, "parity", "restored_parity", expected))
     control = case_evidence(directory, "control", "capacity_control", expected)

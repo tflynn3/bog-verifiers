@@ -236,7 +236,16 @@ identity, reports, producer statuses, and logs.
 The admission report preserves the existing saturation and work-budget
 rejections. Its `work_budget` case also records the measured budget for a
 one-row first page, a clean HTTP 503 one unit below it, and a full terminal
-continuation at the same fixed budget.
+continuation at the same fixed budget. A separate three-row walk measures its
+own first-page boundary and checks both continuations at that budget, in
+append order across tied timestamps.
+
+The durability report also checks `GET /ready` while the original data
+directory path is absent. After moving the directory within the private
+tmpfs, the producer fills that filesystem and requires HTTP 503 with
+`low_disk_headroom`. Freeing the space must return HTTP 200 with `ready`
+while the original path is still absent. A candidate without `GET /ready`
+skips this case in the producer. Release qualification requires it to pass.
 
 The capacity report must show both 196,608 and 393,216 retained rows under a
 128 MiB cgroup memory limit, exact recovery after restart, a published
