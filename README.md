@@ -21,6 +21,10 @@ the documented WAL and commit marker.
   whose `-help` lacks `-query-max-response-bytes`. Leave the parameter unset
   for baseline runs and unrelated tracks, where that missing flag skips
   only the response byte suite.
+- The admission suite is required for the #19 candidate at `73bf453`. Set
+  `SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION=1` on subsequent #19 candidate runs
+  to reject a binary whose `-help` lacks `-query-concurrency`. On other runs,
+  a missing flag skips only the admission suite.
 - With the same candidate inputs, use `--full`, `--compare`, or
   `SLIPWAY_PARAM_MODE=full` or `compare` for the paired post-cycle matrix and
   WAL handoffs against `4ff49aae9672cf5aec8e3fbd20ffe0a84ae15bc0`.
@@ -60,13 +64,16 @@ the documented WAL and commit marker.
   mismatched, and pre-restart tokens. The verifier walks established and fresh
   cursors across two backfill commits. Active walks change page size and
   express the same bounds in different time zones.
-- A candidate-only suite sets `-query-work-budget=32` and checks HTTP 422
-  for ordinary scans and for lookahead on first pages and continuations.
-  It sets `-query-concurrency=1`, holds the query slot with a slow reader, and
-  checks HTTP 503 while ingest and health still respond. Both errors must
-  omit rows and `Bog-Next-Cursor`. After the slot is released, the active
-  cursor excludes the backfill acknowledged during saturation and a fresh
-  walk includes it. Pinned historical baselines retain their existing suites.
+- The work budget suite sets `-query-work-budget=32` when advertised and
+  checks HTTP 422 without rows or `Bog-Next-Cursor` for ordinary scans and
+  for lookahead on first pages and continuations.
+- The admission suite independently detects `-query-concurrency` and sets it
+  to 1. An unread response holds the slot through TCP backpressure. Ordinary
+  queries, first pages, and continuations must return HTTP 503 within two
+  seconds without NDJSON or `Bog-Next-Cursor`, while health and ingest still
+  succeed. After the held client disconnects, a retry succeeds, the existing
+  cursor excludes the backfill, and a fresh walk includes it. The verifier
+  also checks that the acknowledged backfill survives SIGKILL and restart.
 - The response byte suite counts raw UTF-8 NDJSON, including JSON escapes
   and record newlines. It checks the exact-fit ordinary prefix and HTTP 422
   with no rows or cursor when the first matching record exceeds the cap by

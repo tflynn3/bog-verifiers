@@ -122,39 +122,56 @@ class GateTest(unittest.TestCase):
                     self.assertNotIn("query-limits", {suite["name"] for suite in report["suites"]})
         self.assertIn("query-limits", dict(verify.suite_plan(verify.SUITES, "pr", "0" * 40)))
 
-    def test_query_limits_gate_checks_candidate_help_before_running_assertions(self):
+    def test_query_admission_and_work_budget_gate_independently(self):
         budget = "  -query-work-budget int"
         concurrency = "  -query-concurrency int"
-        for options, exit_code, status, diagnostic in (
-            ("  -addr string", 0, "skipped", "-query-work-budget, -query-concurrency"),
-            (f"{budget}\n  -query-concurrency-extra int", 0, "skipped", "-query-concurrency"),
-            (f"{budget}\n{concurrency}", 0, "rejected", "query assertions reached"),
-            ("  -addr string", 2, "rejected", "Bog -help exited with status 2"),
+        issue_candidate = "73bf45334ec7067f9ed8fcd06c8ccdef8dca72ef"
+        unrelated = "0" * 40
+        missing = "Bog -help does not list -query-concurrency"
+        for options, help_status, sha, required, limits, admission, diagnostic in (
+            ("  -addr string", 0, unrelated, "", "skipped", "skipped", missing),
+            (f"{budget}\n  -query-concurrency-extra int", 0, unrelated, "", "run", "skipped", missing),
+            (concurrency, 0, issue_candidate, "", "skipped", "run", None),
+            (f"{budget}\n{concurrency}", 0, unrelated, "", "run", "run", None),
+            ("  -addr string", 0, issue_candidate, "", "skipped", "rejected", missing),
+            (budget, 0, unrelated, "1", "run", "rejected", missing),
+            ("  -addr string", 2, unrelated, "", "rejected", "rejected", "Bog -help exited with status 2"),
         ):
-            with self.subTest(options=options, exit_code=exit_code), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(options=options, sha=sha, required=required, help_status=help_status), \
+                 tempfile.TemporaryDirectory() as directory:
                 work = Path(directory)
                 binary = work / "bog"
                 binary.write_text(f"#!/bin/sh\n[ \"$1\" = -help ] || exit 3\n"
-                                  f"cat >&2 <<'HELP'\nUsage of bog:\n{options}\nHELP\nexit {exit_code}\n")
+                                  f"cat >&2 <<'HELP'\nUsage of bog:\n{options}\nHELP\nexit {help_status}\n")
                 binary.chmod(0o755)
 
                 def following_suite(*_):
                     verify.PROCESS_LOGS.get()[1].append({"ready_ms": 1})
 
-                suites = (("query-limits", verify.query_limits_suite), ("following", following_suite))
-                with patch.object(verify, "SUITES", suites), \
-                     patch.object(verify, "REQUIRED_SUITES", ("query-limits", "following")), \
+                suites = (("query-limits", verify.query_limits_suite),
+                          ("query-admission", verify.query_admission_suite), ("following", following_suite))
+                with patch.dict(os.environ, {"SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION": required}), \
+                     patch.object(verify, "SUITES", suites), \
+                     patch.object(verify, "REQUIRED_SUITES", tuple(name for name, _ in suites)), \
                      patch.object(verify, "CYCLE7_PROFILES", ()), \
                      patch.object(verify, "build", return_value=binary), \
                      patch.object(verify, "run_bog", side_effect=verify.Rejected("query assertions reached")) as run:
-                    self.assertEqual(verify.main(work, work, "0" * 40), int(status == "rejected"))
+                    rejected = (limits, admission) != ("skipped", "skipped")
+                    self.assertEqual(verify.main(work, work, sha), int(rejected))
                 report = json.loads((work / "artifacts/result.json").read_text())
-                limits, following = report["suites"]
-                self.assertEqual(limits["status"], status)
-                self.assertIn(diagnostic, limits["diagnostic"])
-                self.assertEqual(following["status"], "passed")
-                self.assertEqual((work / "passed").exists(), status == "skipped")
-                self.assertEqual(run.call_count, int(options == f"{budget}\n{concurrency}"))
+                budget_result, admission_result, following_result = report["suites"]
+                self.assertEqual(budget_result["status"], "rejected" if limits == "run" else limits)
+                self.assertEqual(admission_result["status"], "rejected" if admission == "run" else admission)
+                self.assertIn("query assertions reached" if admission == "run" else diagnostic,
+                              admission_result["diagnostic"])
+                self.assertEqual(following_result["status"], "passed")
+                self.assertEqual((work / "passed").exists(), not rejected)
+                expected_flags = []
+                if limits == "run":
+                    expected_flags.append(("-query-work-budget=32",))
+                if admission == "run":
+                    expected_flags.append(("-query-concurrency=1",))
+                self.assertEqual([call.kwargs["flags"] for call in run.call_args_list], expected_flags)
 
     def test_response_byte_suite_requires_the_capability_for_issue_seven(self):
         for flags, required, diagnostic in (
@@ -341,7 +358,7 @@ class GateTest(unittest.TestCase):
     def test_registered_noop_cannot_pass_a_required_suite(self):
         with tempfile.TemporaryDirectory() as directory:
             source, work = buildable_candidate(Path(directory))
-            suites = tuple((name, lambda *_: None) for name in verify.REQUIRED_SUITES)
+            suites = tuple((name, lambda *_, **__: None) for name in verify.REQUIRED_SUITES)
             with patch.object(verify, "SUITES", suites), \
                  patch.object(verify, "build_baseline", return_value=work / "bog"):
                 self.assertEqual(verify.main(source, work, "0" * 40), 2)

@@ -41,6 +41,7 @@ COMMIT_MAGIC = b"BOGCMT01"
 BASELINE_SHA = "25d0c0acc103bd73f0552a8f10240c8d8c1d023d"
 COMPARISON_BASELINE_SHA = "4ff49aae9672cf5aec8e3fbd20ffe0a84ae15bc0"
 CYCLE7_BASELINE_SHA = "be7f937a1025a57166d15888727012ed4989a6b4"
+QUERY_ADMISSION_CANDIDATE_SHA = "73bf45334ec7067f9ed8fcd06c8ccdef8dca72ef"
 NEXT_CURSOR = "Bog-Next-Cursor"
 MAX_FRAME = 4 * 1024 * 1024
 DEFAULT_QUERY_LIMIT = 500
@@ -193,9 +194,9 @@ class Bog:
         status, data, _ = self.checked_exchange(method, target, body)
         return status, data
 
-    def checked_exchange(self, method, target, body=None, *, connection=None):
+    def checked_exchange(self, method, target, body=None, *, connection=None, timeout=HTTP_TIMEOUT):
         try:
-            return self.exchange(method, target, body, connection=connection)
+            return self.exchange(method, target, body, timeout=timeout, connection=connection)
         except (OSError, http.client.HTTPException) as exc:
             raise Rejected(f"{method} {target} failed: {exc}; {self.log_tail()}") from exc
 
@@ -410,9 +411,13 @@ def expect_bad_query(bog, args, label):
     check(headers.get_all(NEXT_CURSOR) is None, f"{label}: rejected query returned {NEXT_CURSOR}")
 
 
-def expect_query_error(bog, args, expected, label):
-    status, body, headers = bog.checked_exchange("GET", query_target(args))
+def expect_query_error(bog, args, expected, label, *, timeout=HTTP_TIMEOUT):
+    started = time.monotonic()
+    status, body, headers = bog.checked_exchange("GET", query_target(args), timeout=timeout)
     check(status == expected, f"{label}: expected HTTP {expected}, got {status}: {body[:150]!r}")
+    if expected == 503:
+        check(time.monotonic() - started < timeout, f"{label}: response took at least {timeout}s")
+        check(headers.get_content_type() != "application/x-ndjson", f"{label}: error used NDJSON media type")
     check(headers.get_all(NEXT_CURSOR) is None, f"{label}: error returned {NEXT_CURSOR}")
     for line in body.split(b"\n"):
         try:
@@ -784,10 +789,8 @@ def advertised_flags(binary, directory):
 
 
 def query_limits_suite(binary, directory):
-    advertised = advertised_flags(binary, directory)
-    missing = [flag for flag in ("-query-work-budget", "-query-concurrency") if flag not in advertised]
-    if missing:
-        return SuiteSkipped(f"Bog -help does not list {', '.join(missing)}")
+    if "-query-work-budget" not in advertised_flags(binary, directory):
+        return SuiteSkipped("Bog -help does not list -query-work-budget")
 
     directory.mkdir()
     budget = 32
@@ -809,14 +812,22 @@ def query_limits_suite(binary, directory):
                            "continuation exceeds work budget during lookahead")
         expect_rows(bog.query(last.ns, last.ns + 1, "@"), [last], "query after budget rejection")
 
+
+def query_admission_suite(binary, directory, *, required=False):
+    if "-query-concurrency" not in advertised_flags(binary, directory):
+        reason = "Bog -help does not list -query-concurrency"
+        check(not required, reason)
+        return SuiteSkipped(reason)
+
     small = [Row(ns, f"original/{ns}") for ns in (10, 30, 50)]
     backfill = [Row(20, "backfill between pages"), Row(30, "backfill at original timestamp")]
     args = query_args(0, 100)
-    # A response larger than the TCP send buffer holds the query in its write
-    # loop while the client leaves the body unread with a small receive window.
-    padding = "x" * (1024 * 1024)
+    # Each control byte takes six bytes in JSON. This fills the TCP send
+    # buffer without exceeding the older 16 MiB estimated response limit.
+    padding = "\x01" * (192 * 1024)
     wide = [Row(ns, padding) for ns in range(100, 112)]
-    with run_bog(binary, directory / "query-slots", flags=("-query-concurrency=1",)) as bog:
+    flags = ("-query-concurrency=1",)
+    with run_bog(binary, directory, flags=flags) as bog:
         bog.ingest(small)
         for start in range(0, len(wide), 3):
             bog.ingest(wide[start:start + 3])
@@ -831,25 +842,33 @@ def query_limits_suite(binary, directory):
             with client.getresponse() as held:
                 check(held.status == 200 and held.read(1) == b"{",
                       f"query used to hold the slot did not start an NDJSON response (HTTP {held.status})")
-                expect_query_error(bog, args, 503, "ordinary query during saturation")
+                expect_query_error(bog, args, 503, "ordinary query during saturation", timeout=2)
                 expect_query_error(bog, {**args, "page": "1", "limit": 1}, 503,
-                                   "first page during saturation")
+                                   "first page during saturation", timeout=2)
                 check(bog.request("GET", "/healthz")[0] == 200, "health failed during query saturation")
                 bog.ingest(backfill)
                 expect_query_error(bog, {**args, "cursor": cursor, "limit": 1}, 503,
-                                   "continuation during saturation after acknowledged backfill")
+                                   "continuation during saturation after acknowledged backfill", timeout=2)
 
         deadline = time.monotonic() + HTTP_TIMEOUT
+        expected = oracle(small + backfill, 0, 100)
         while True:
-            status, body = bog.request("GET", query_target(args))
+            remaining = deadline - time.monotonic()
+            check(remaining > 0, "closed query did not release its slot")
+            status, body, headers = bog.checked_exchange("GET", query_target(args), timeout=remaining)
             if status != 503:
                 check(status == 200, f"query after slot release returned {status}: {body[:150]!r}")
+                check(headers.get_all(NEXT_CURSOR) is None, f"ordinary retry returned {NEXT_CURSOR}")
+                expect_rows(decode_rows(body), expected, "ordinary retry after slot release")
                 break
-            check(time.monotonic() < deadline, "closed query did not release its slot")
             time.sleep(0.01)
         expect_walk(bog, args, small, (1,), "captured snapshot after saturated backfill",
                     position=1, cursor=cursor)
-        expect_walk(bog, args, oracle(small + backfill, 0, 100), (1,), "fresh snapshot after backfill")
+        expect_walk(bog, args, expected, (1,), "fresh snapshot after backfill")
+        bog.kill()
+
+    with run_bog(binary, directory, flags=flags) as bog:
+        expect_rows(bog.query(0, 100), expected, "acknowledged backfill after SIGKILL and restart")
 
 
 def query_response_bytes_suite(binary, directory):
@@ -2458,6 +2477,7 @@ SUITES = (
     ("query-oracle", corpus_suite),
     ("snapshot-pagination", pagination_suite),
     ("query-limits", query_limits_suite),
+    ("query-admission", query_admission_suite),
     ("query-response-bytes", query_response_bytes_suite),
     ("archived-corpus", replay_corpus_suite),
     ("request-rejection", rejection_suite),
@@ -2474,6 +2494,7 @@ REQUIRED_SUITES = (
     "query-oracle",
     "snapshot-pagination",
     "query-limits",
+    "query-admission",
     "query-response-bytes",
     "archived-corpus",
     "request-rejection",
@@ -2739,6 +2760,10 @@ def main(source, work, sha, profile="pr"):
                 metrics = run(binary, work / stage, rounds=56)
             elif stage == "kill-durability" and profile == "legacy":
                 metrics = run(binary, work / stage, paged=False)
+            elif stage == "query-admission":
+                admission_required = (sha == QUERY_ADMISSION_CANDIDATE_SHA
+                                      or os.environ.get("SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION") == "1")
+                metrics = run(binary, work / stage, required=admission_required)
             else:
                 metrics = run(binary, work / stage)
             if isinstance(metrics, SuiteSkipped):
