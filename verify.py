@@ -798,9 +798,12 @@ def capacity_control_suite(binary, directory):
         return SuiteSkipped(f"Bog -help does not list {CAPACITY_FLAG}")
     directory.mkdir()
     store = directory / "store"
-    status_path = f"{CAPACITY_PATH}?action=status&cutoff=3"
-    start_path = f"{CAPACITY_PATH}?action=start&cutoff=3"
     rows = [Row(2, "later"), Row(1, "duplicate"), Row(1, "duplicate")]
+    backfill = Row(0, "backfill")
+    tail = Row(1, "uncovered tie")
+    cutoff = len(rows) + 1
+    status_path = f"{CAPACITY_PATH}?action=status&cutoff={cutoff}"
+    start_path = f"{CAPACITY_PATH}?action=start&cutoff={cutoff}"
 
     def hidden(bog):
         for method, path in (("GET", status_path), ("POST", start_path)):
@@ -824,31 +827,39 @@ def capacity_control_suite(binary, directory):
         hidden(bog)
     with run_bog(binary, store, host="0.0.0.0", ready=False, flags=(CAPACITY_FLAG,)) as bog:
         wildcard_exit = bog.process.returncode
+        check(wildcard_exit == 1, f"capacity opt-in on wildcard exited with status {wildcard_exit}")
+    args = query_args(0, SECOND)
+    expected = oracle(rows, 0, SECOND)
+    augmented = [*rows, backfill, tail]
+    fresh = oracle(augmented, 0, SECOND)
     with run_bog(binary, store, flags=(CAPACITY_FLAG,)) as bog:
         initial = state(bog, "GET", f"{CAPACITY_PATH}?action=status&cutoff=0")
         bog.ingest(rows)
-        args = query_args(0, SECOND)
-        expected = oracle(rows, 0, SECOND)
         cursor = expect_page(bog, args, expected, 0, 1, None, "first page before compaction")
+        bog.ingest([backfill])
+        bog.ingest([tail])
         published = state(bog, "POST", start_path)
         deadline = time.monotonic() + HTTP_TIMEOUT
         while published["state"] == "running" and time.monotonic() < deadline:
             time.sleep(0.02)
             published = state(bog, "GET", status_path)
         check(published["state"] == "complete" and published["generation"] == initial["generation"] + 1 and
-              published["covered_rows"] == published["committed_rows"] == len(rows),
+              published["covered_rows"] == cutoff and published["committed_rows"] == len(augmented),
               f"capacity control did not publish the requested cutoff: {published!r}")
         expect_walk(bog, args, expected, (1,), "held cursor after compaction", position=1, cursor=cursor)
+        expect_query(bog, augmented, 0, SECOND, label="ordinary query after compaction")
+        expect_walk(bog, args, fresh, (1, 2), "fresh paged query after compaction")
+        stale_cursor = expect_page(bog, args, fresh, 0, 1, None, "first page before restart")
         bog.kill()
     with run_bog(binary, store) as bog:
         hidden(bog)
-        expect_bad_query(bog, {**args, "cursor": cursor}, "pre-compaction cursor after restart")
-        expect_query(bog, rows, 0, SECOND, label="ordinary query after compacted restart")
-        expect_walk(bog, query_args(0, SECOND), oracle(rows, 0, SECOND), (1, 2),
-                    "paged query after compacted restart")
+        expect_bad_query(bog, {**args, "cursor": stale_cursor}, "prior-process cursor after restart")
+        expect_query(bog, augmented, 0, SECOND, label="ordinary query after compacted restart")
+        expect_walk(bog, args, fresh, (1, 2), "paged query after compacted restart")
     return {"default_http_status": 404, "wildcard_opt_in_exit": wildcard_exit,
             "snapshot_rows": len(expected), "stale_cursor_rejected": True,
-            "initial_generation": initial["generation"], "published": published, "restart_rows": len(rows)}
+            "initial_generation": initial["generation"], "published": published,
+            "fresh_rows": len(fresh), "restart_rows": len(fresh)}
 
 
 def query_admission_required():

@@ -11,7 +11,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import verify
-from release_gate import (FIXTURE_ROOT_CLEANUP, record_fixture_root_cleanup, validate_budget,
+from release_gate import (FIXTURE_ROOT_CLEANUP, record_fixture_root_cleanup, validate_backfill_timelines, validate_budget,
                           validate_budget_trials, validate_durability)
 
 README_ONLY = "7655ed627bccad30700b8de4b6f47c8d7d5d8579"
@@ -43,6 +43,37 @@ def buildable_candidate(root):
 
 
 class GateTest(unittest.TestCase):
+    def test_backfill_timeline_requires_handoff_and_drain_evidence(self):
+        def timeline(pattern, held, cutoff, final, rows, generation):
+            opening = dict(state="running", generation=generation - 1, covered_rows=held, committed_rows=cutoff)
+            overlap = dict(opening, committed_rows=cutoff + 64)
+            complete = dict(state="complete", generation=generation, covered_rows=cutoff, committed_rows=final)
+            samples = [dict(event=event, status=status, filesystem=dict(checkpoint_staging_apparent_bytes=0))
+                       for event, status in (("held_capture", None), ("compaction_start", opening),
+                                             ("overlap", overlap), ("publication", complete),
+                                             ("held_exhausted", None), ("after_exhaustion", complete),
+                                             ("fresh_visible", None))]
+            return dict(pattern=pattern, status="pass", held_cutoff=held, requested_cutoff=cutoff,
+                        expected_committed_rows=final, held_rows_checked=rows, held_cursor_exhausted=True,
+                        fresh_backfill_visible=True, acknowledged_backfill=dict(
+                            rows=final - held, batches=(final - held) // 64, first_ack_ns=1, last_ack_ns=3),
+                        publication=dict(generation=generation, observed_lag_lower_bound_ns=2,
+                                         observed_lag_upper_bound_ns=4), samples=samples,
+                        pin_drain=dict(status="observed", retired_pins_while_held=1,
+                                       retired_pins_after_exhaustion=0))
+
+        seed = 196_608
+        clustered = timeline("clustered", seed - 128, seed - 64, seed, 9, 25)
+        scattered = timeline("scattered", seed, seed + 64, seed + 2048, 9 * seed // 16 - 3, 27)
+        published = {"generation": 27}
+        validate_backfill_timelines([scattered, clustered], seed, published)
+        with patch.dict(clustered["samples"][3]["status"], covered_rows=seed):
+            with self.assertRaisesRegex(verify.Rejected, "invalid overlap or publication cutoff"):
+                validate_backfill_timelines([clustered, scattered], seed, published)
+        with patch.dict(scattered["pin_drain"], retired_pins_after_exhaustion=1):
+            with self.assertRaisesRegex(verify.Rejected, "incomplete pin-drain evidence"):
+                validate_backfill_timelines([clustered, scattered], seed, published)
+
     def test_native_release_requires_fixed_boundaries_and_snapshot_walks(self):
         def walk(budget, rows):
             return dict(first_cursor_budget=budget, exact_threshold_budget=budget, rejected_budgets=1,

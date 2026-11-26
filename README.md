@@ -249,10 +249,15 @@ root and records `fixture_root_cleanup` in the schema v1 durability report.
 New native qualifications require that case to pass. Historical reports may
 omit it, and an explicit cleanup failure rejects either report format.
 
-The capacity producer must show live generation replacement with an
-acknowledged backfill, the original cursor's terminal walk, a fresh query,
-and full restart recovery at 196,608 and 393,216 seed rows under the 128 MiB
-cgroup limit. Each fixture requires successful process and cgroup cleanup.
+At both 196,608 and 393,216 seed rows under the 128 MiB cgroup limit, the
+capacity producer records clustered and scattered backfill timelines.
+Each proves an acknowledged append and continuation during compaction,
+publication at the exact newer cutoff, exhaustion of the held snapshot,
+and fresh visibility. The timelines record staging observations and a
+positive-to-zero retired pin count when the runtime exposes that metric,
+or a reason when pin drain could not be observed. Each fixture also
+requires an exact full walk after restart and successful process, cgroup,
+and fixture root cleanup.
 
 Restored parity checks legacy WAL replay, append, and restart, then removes the original data and
 bundle and starts the candidate on the verified v1 restore. Ordinary queries
@@ -267,15 +272,16 @@ limit, Bog must reject a whole two-row batch with HTTP 503, preserve the WAL
 and commit marker, and serve the exact acknowledged rows before and after
 restart.
 
-The restored-store replacement probe holds a cursor before an acknowledged
-backfill, publishes a newer generation, and checks that the held cursor
-finishes over the original rows. Fresh ordinary queries and framed walks
-compare against the independent append-log oracle immediately after
-publication and after restart. The parity report adds a `live_replacement`
-object under schema version 1.
+The small replacement probe runs on the full legacy WAL before the
+isolated v1 restore test. The full WAL supplies the prefix needed to
+publish a new v1 checkpoint. The probe checks the held cursor and fresh
+ordinary and framed HTTP queries after replacement and restart. The
+schema v1 report identifies the store in its existing `live_replacement`
+object.
 
-The resource and replacement probes discover their flags in candidate help.
-Missing flags skip the corresponding probe. The short Slipway capacity
-suite also discovers `-enable-capacity-control` before running, then checks
-that a held cursor survives compaction and expires after restart. The manually
-dispatched release gate requires passing evidence from both probes.
+Candidate help gates the retained-history probes. The short Slipway suite
+skips when the candidate lacks `-enable-capacity-control`. With the flag
+available, it checks the disabled default, wildcard bind rejection, the
+exact cutoff with an uncovered tail, held and fresh HTTP ordering, and
+restart parity. The manually dispatched release gate requires the
+composed revision and passing evidence on both native architectures.

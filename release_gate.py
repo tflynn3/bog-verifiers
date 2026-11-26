@@ -50,7 +50,66 @@ def integer(value, low, high=None):
     return type(value) is int and value >= low and (high is None or value <= high)
 
 
-def validate_capacity(evidence):
+def validate_backfill_timelines(timelines, seed, published):
+    label = f"capacity ({seed} rows)"
+    check(isinstance(timelines, list) and len(timelines) == 2,
+          f"{label}: expected clustered and scattered backfill timelines")
+    by_pattern = {trial["pattern"]: trial for trial in timelines}
+    bounds = {
+        "clustered": (seed - 2 * BATCH_ROWS, seed - BATCH_ROWS, seed, 9),
+        "scattered": (seed, seed + BATCH_ROWS, seed + TAIL_ROWS, 9 * seed // 16 - 3),
+    }
+    check(by_pattern.keys() == bounds.keys(), f"{label}: missing or repeated backfill pattern")
+    generations = []
+    for pattern, (held, cutoff, final, rows) in bounds.items():
+        trial = by_pattern[pattern]
+        name = f"{label}, {pattern}"
+        check(trial["status"] == "pass" and "failure" not in trial and
+              trial["held_cursor_exhausted"] is True and trial["fresh_backfill_visible"] is True and
+              all(integer(trial.get(key), want, want) for key, want in {
+                  "held_cutoff": held, "requested_cutoff": cutoff, "expected_committed_rows": final,
+                  "held_rows_checked": rows}.items()), f"{name}: incomplete backfill walk")
+        acks = trial["acknowledged_backfill"]
+        check(integer(acks.get("rows"), final - held, final - held) and
+              integer(acks.get("batches"), (final - held) // BATCH_ROWS, (final - held) // BATCH_ROWS) and
+              integer(acks.get("first_ack_ns"), 0) and integer(acks.get("last_ack_ns"), acks["first_ack_ns"]),
+              f"{name}: incomplete append acknowledgements")
+        publication = trial["publication"]
+        generations.append(publication["generation"])
+        lower = publication["observed_lag_lower_bound_ns"]
+        check(integer(lower, 0) and integer(publication.get("observed_lag_upper_bound_ns"), lower),
+              f"{name}: invalid publication timing")
+        samples = trial["samples"]
+        events = ("held_capture", "compaction_start", "overlap", "publication",
+                  "held_exhausted", "after_exhaustion", "fresh_visible")
+        boundaries = [sample for sample in samples if sample["event"] in events]
+        check(tuple(sample["event"] for sample in boundaries) == events,
+              f"{name}: missing or out-of-order timeline boundaries")
+        opening, overlap, complete = (boundaries[i]["status"] for i in (1, 2, 3))
+        check(opening["state"] == overlap["state"] == "running" and
+              integer(opening.get("generation"), 1) and overlap["generation"] == opening["generation"] and
+              opening["covered_rows"] == overlap["covered_rows"] == held and opening["committed_rows"] == cutoff and
+              integer(overlap.get("committed_rows"), cutoff + BATCH_ROWS, final) and
+              complete["state"] == "complete" and integer(complete.get("generation"), opening["generation"] + 1) and
+              complete["generation"] == publication["generation"] and complete["covered_rows"] == cutoff and
+              integer(complete.get("committed_rows"), overlap["committed_rows"], final),
+              f"{name}: invalid overlap or publication cutoff")
+        for sample in boundaries:
+            storage = sample["filesystem"]
+            stage_bytes = storage.get("checkpoint_staging_apparent_bytes")
+            check(integer(stage_bytes, 0) or
+                  (stage_bytes is None and storage.get("unavailable")),
+                  f"{name}: missing staging observation at {sample['event']}")
+        drain = trial["pin_drain"]
+        check((drain["status"] == "observed" and integer(drain.get("retired_pins_while_held"), 1) and
+               integer(drain.get("retired_pins_after_exhaustion"), 0, 0)) or
+              (drain["status"] == "unavailable" and isinstance(drain.get("reason"), str) and drain["reason"]),
+              f"{name}: incomplete pin-drain evidence")
+    check(generations[0] < generations[1] == published["generation"],
+          f"{label}: inconsistent replacement generations")
+
+
+def validate_capacity(evidence, *, require_backfill_timelines=False):
     check(isinstance(evidence, list) and len(evidence) == len(SEED_ROWS),
           "capacity: expected two fixture results")
     seen = set()
@@ -94,6 +153,8 @@ def validate_capacity(evidence):
               integer(compaction.get("covered_rows"), seed + BATCH_ROWS, seed + BATCH_ROWS) and
               integer(compaction.get("committed_rows"), total, total), f"{label}: invalid compaction evidence")
         diagnostics = run["diagnostics"]
+        if require_backfill_timelines or "backfill_timelines" in diagnostics:
+            validate_backfill_timelines(diagnostics.get("backfill_timelines"), seed, compaction)
         for phase in ("after_publication_continuation", "fresh_backfill", "restart_walk"):
             query = diagnostics["queries"][phase]
             last = query["last"]
@@ -166,7 +227,9 @@ def validate_budget(evidence, *, require_fixed_boundaries=False):
           "admission: missing budget boundary or sparse byte-trim evidence")
 
 
-def validate_parity(evidence):
+def validate_parity(evidence, *, require_writable_restore=False):
+    if require_writable_restore or "restore_status" in evidence:
+        check(evidence.get("restore_status") == "pass", "parity: writable restore did not pass")
     point = evidence["verified_point"]
     generation = point["Generation"]
     check(isinstance(generation, list) and len(generation) == 32 and
@@ -196,7 +259,10 @@ def validate_parity(evidence):
           "parity: incomplete retained tail admission or restart evidence")
     replacement = evidence["live_replacement"]
     initial, published = replacement["initial"], replacement["published"]
-    before, after = evidence["post_append_rows"], evidence["post_append_rows"] + 2
+    if require_writable_restore or "store" in replacement:
+        check(replacement.get("store") == "legacy_wal", "parity: replacement requires a full WAL")
+    before = evidence["legacy_restart_rows"] if "store" in replacement else evidence["post_append_rows"]
+    after = before + 2
     check(replacement["status"] == "pass" and integer(initial.get("generation"), 0) and
           integer(initial.get("covered_rows"), 0, before) and
           integer(initial.get("committed_rows"), before, before) and published["state"] == "complete" and
@@ -205,7 +271,7 @@ def validate_parity(evidence):
           integer(replacement.get("append_http_status"), 204, 204) and
           integer(replacement.get("snapshot_rows"), before, before) and
           all(integer(replacement.get(key), after, after) for key in ("fresh_rows", "restart_rows")),
-          "parity: incomplete restored generation replacement or snapshot evidence")
+          "parity: incomplete generation replacement or snapshot evidence")
 
 
 def validate_durability(directory, expected, *, require_fixture_root_cleanup=False):
@@ -241,7 +307,8 @@ def record_fixture_root_cleanup(directory, expected, parent):
     passing_case(report, "durability", FIXTURE_ROOT_CLEANUP)
 
 
-def validate(directory, expected, *, require_fixture_root_cleanup=False, require_fixed_boundaries=False):
+def validate(directory, expected, *, require_fixture_root_cleanup=False, require_fixed_boundaries=False,
+             require_backfill_timelines=False):
     statuses = (directory / "producers.txt").read_text().splitlines()
     check(len(statuses) == len(PRODUCERS) and
           set(statuses) == {f"{name} revision={expected['revision']} exit=0" for name in PRODUCERS},
@@ -249,16 +316,23 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
     validate_budget(case_evidence(directory, "admission", "work_budget", expected),
                     require_fixed_boundaries=require_fixed_boundaries)
     validate_durability(directory, expected, require_fixture_root_cleanup=require_fixture_root_cleanup)
-    validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected))
-    validate_parity(case_evidence(directory, "parity", "restored_parity", expected))
+    validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected),
+                      require_backfill_timelines=require_backfill_timelines)
+    validate_parity(case_evidence(directory, "parity", "restored_parity", expected),
+                    require_writable_restore=require_backfill_timelines)
     control = case_evidence(directory, "control", "capacity_control", expected)
     published = control["published"]
+    expanded = "fresh_rows" in control
+    covered, committed = (4, 5) if expanded else (3, 3)
+    if expanded or require_backfill_timelines:
+        check(integer(control.get("fresh_rows"), 5, 5), "control: incomplete fresh visibility evidence")
     check(integer(control["default_http_status"], 404, 404) and integer(control["wildcard_opt_in_exit"], 1) and
           integer(control["initial_generation"], 0) and published["state"] == "complete" and
           integer(published["generation"], control["initial_generation"] + 1) and
-          integer(published["covered_rows"], 3, 3) and integer(published["committed_rows"], 3, 3) and
-          integer(control["restart_rows"], 3, 3), "control: incomplete loopback or restart evidence")
-    if "snapshot_rows" in control or "stale_cursor_rejected" in control:
+          integer(published["covered_rows"], covered, covered) and
+          integer(published["committed_rows"], committed, committed) and
+          integer(control["restart_rows"], committed, committed), "control: incomplete loopback or restart evidence")
+    if expanded or "snapshot_rows" in control or "stale_cursor_rejected" in control:
         check(integer(control.get("snapshot_rows"), 3, 3) and control.get("stale_cursor_rejected") is True,
               "control: incomplete cursor evidence across compaction and restart")
 
@@ -292,6 +366,7 @@ def main():
     parser.add_argument("--fixture-parent", type=Path)
     parser.add_argument("--require-fixture-root-cleanup", action="store_true")
     parser.add_argument("--require-fixed-boundaries", action="store_true")
+    parser.add_argument("--require-backfill-timelines", action="store_true")
     args = parser.parse_args()
     try:
         directory = args.directory.resolve()
@@ -311,7 +386,8 @@ def main():
             check(header[:6] == b"\x7fELF\x02\x01" and int.from_bytes(header[18:20], "little") == machine,
                   f"candidate binary is not Linux {args.arch}")
             validate(directory, expected, require_fixture_root_cleanup=args.require_fixture_root_cleanup,
-                     require_fixed_boundaries=args.require_fixed_boundaries)
+                     require_fixed_boundaries=args.require_fixed_boundaries,
+                     require_backfill_timelines=args.require_backfill_timelines)
             (directory / "qualified.json").write_text(json.dumps({**expected, "arch": args.arch}) + "\n")
     except (Rejected, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         parser.exit(1, f"release evidence: {exc}\n")
