@@ -129,7 +129,7 @@ def validate_budget_trials(walk, name, rows, budget):
           f"admission: unproven {name} budget boundary")
 
 
-def validate_budget(evidence):
+def validate_budget(evidence, *, require_fixed_boundaries=False):
     check(integer(evidence.get("http_status"), 503, 503) and
           integer(evidence.get("ndjson_rows"), 0, 0) and evidence.get("next_cursor") is False and
           integer(evidence.get("elapsed_ms"), 0, 1999), "admission: incomplete work budget rejection")
@@ -138,7 +138,7 @@ def validate_budget(evidence):
     trial_report = "probes" in tied or "probes" in sparse
     check(evidence.get("framed_budget_rejection", trial_report) is True,
           "admission: missing framed work budget rejection")
-    for name, walk, rows in (("tied", tied, 3), ("sparse", sparse, 4)):
+    for name, walk, rows, boundary in (("tied", tied, 3, 11), ("sparse", sparse, 4, 314)):
         budget = walk.get("first_cursor_budget")
         check(integer(budget, 2, 2048) and integer(walk.get("rejected_budgets"), 1, budget - 1) and
               integer(walk.get("rows"), rows, rows) and integer(walk.get("pages"), 3, 3) and not
@@ -149,7 +149,18 @@ def validate_budget(evidence):
         else:
             check(integer(walk.get("continuation_pages"), 2, 2) and walk.get("terminal") is True,
                   f"admission: incomplete {name} continuation evidence")
-    check(tied["rejected_budgets"] == tied["first_cursor_budget"] - 1 and
+        if require_fixed_boundaries:
+            check(budget == boundary and trial_report, f"admission: expected {name} boundary at budget {boundary}")
+            exact = next(probe for probe in walk["probes"] if probe["budget"] == boundary)
+            check(integer(exact.get("post_issuance_append_rows"), 2, 2),
+                  f"admission: missing {name} post-issuance appends")
+    if require_fixed_boundaries:
+        duplicate = tied.get("duplicate_walk", {})
+        check(duplicate.get("outcome") == "exhausted" and "failure" not in duplicate and
+              all(integer(duplicate.get(key), value, value) for key, value in
+                  {"budget": 11, "pages": 3, "rows": 3, "post_issuance_append_rows": 2}.items()),
+              "admission: incomplete duplicate-row walk")
+    check((require_fixed_boundaries or tied["rejected_budgets"] == tied["first_cursor_budget"] - 1) and
           all(integer(sparse.get(key), value, value) for key, value in
               {"response_byte_cap": 96, "first_limit": 4, "first_rows": 2, "resume_limit": 1}.items()),
           "admission: missing budget boundary or sparse byte-trim evidence")
@@ -230,12 +241,13 @@ def record_fixture_root_cleanup(directory, expected, parent):
     passing_case(report, "durability", FIXTURE_ROOT_CLEANUP)
 
 
-def validate(directory, expected, *, require_fixture_root_cleanup=False):
+def validate(directory, expected, *, require_fixture_root_cleanup=False, require_fixed_boundaries=False):
     statuses = (directory / "producers.txt").read_text().splitlines()
     check(len(statuses) == len(PRODUCERS) and
           set(statuses) == {f"{name} revision={expected['revision']} exit=0" for name in PRODUCERS},
           "missing, repeated or failing release producer status")
-    validate_budget(case_evidence(directory, "admission", "work_budget", expected))
+    validate_budget(case_evidence(directory, "admission", "work_budget", expected),
+                    require_fixed_boundaries=require_fixed_boundaries)
     validate_durability(directory, expected, require_fixture_root_cleanup=require_fixture_root_cleanup)
     validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected))
     validate_parity(case_evidence(directory, "parity", "restored_parity", expected))
@@ -279,6 +291,7 @@ def main():
     parser.add_argument("--arch", choices=("amd64", "arm64"))
     parser.add_argument("--fixture-parent", type=Path)
     parser.add_argument("--require-fixture-root-cleanup", action="store_true")
+    parser.add_argument("--require-fixed-boundaries", action="store_true")
     args = parser.parse_args()
     try:
         directory = args.directory.resolve()
@@ -297,7 +310,8 @@ def main():
             machine = {"amd64": 62, "arm64": 183}[args.arch]
             check(header[:6] == b"\x7fELF\x02\x01" and int.from_bytes(header[18:20], "little") == machine,
                   f"candidate binary is not Linux {args.arch}")
-            validate(directory, expected, require_fixture_root_cleanup=args.require_fixture_root_cleanup)
+            validate(directory, expected, require_fixture_root_cleanup=args.require_fixture_root_cleanup,
+                     require_fixed_boundaries=args.require_fixed_boundaries)
             (directory / "qualified.json").write_text(json.dumps({**expected, "arch": args.arch}) + "\n")
     except (Rejected, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         parser.exit(1, f"release evidence: {exc}\n")

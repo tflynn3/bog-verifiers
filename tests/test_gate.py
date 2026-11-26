@@ -11,8 +11,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import verify
-from release_gate import (FIXTURE_ROOT_CLEANUP, record_fixture_root_cleanup, validate_budget_trials,
-                          validate_durability)
+from release_gate import (FIXTURE_ROOT_CLEANUP, record_fixture_root_cleanup, validate_budget,
+                          validate_budget_trials, validate_durability)
 
 README_ONLY = "7655ed627bccad30700b8de4b6f47c8d7d5d8579"
 
@@ -43,6 +43,29 @@ def buildable_candidate(root):
 
 
 class GateTest(unittest.TestCase):
+    def test_native_release_requires_fixed_boundaries_and_snapshot_walks(self):
+        def walk(budget, rows):
+            return dict(first_cursor_budget=budget, exact_threshold_budget=budget, rejected_budgets=1,
+                        pages=3, rows=rows, probes=[
+                            dict(budget=budget - 1, outcome="clean_rejection", pages=0, rows=0),
+                            dict(budget=budget, outcome="exhausted", pages=3, rows=rows,
+                                 post_issuance_append_rows=2)])
+
+        tied = walk(11, 3)
+        tied["sparse_walk"] = dict(walk(314, 4), response_byte_cap=96, first_limit=4, first_rows=2, resume_limit=1)
+        tied["duplicate_walk"] = dict(tied["probes"][1])
+        report = dict(http_status=503, ndjson_rows=0, next_cursor=False, elapsed_ms=1, fixed_budget_walk=tied)
+        validate_budget(report, require_fixed_boundaries=True)
+
+        for target, changes, reason in (
+            (tied["sparse_walk"], walk(315, 4), "expected sparse boundary at budget 314"),
+            (tied["probes"][1], {"post_issuance_append_rows": 0}, "missing tied post-issuance appends"),
+            (tied["duplicate_walk"], {"outcome": "issued_cursor"}, "incomplete duplicate-row walk"),
+        ):
+            with self.subTest(reason=reason), patch.dict(target, changes):
+                with self.assertRaisesRegex(verify.Rejected, reason):
+                    validate_budget(report, require_fixed_boundaries=True)
+
     def test_fixed_budget_trials_require_each_issued_cursor_to_exhaust(self):
         trials = [dict(budget=3, outcome="exhausted", pages=3, rows=4),
                   dict(budget=1, outcome="clean_rejection", pages=0, rows=0),

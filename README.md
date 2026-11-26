@@ -234,13 +234,15 @@ binary digests. The `linux-release-evidence-amd64` and
 `linux-release-evidence-arm64` artifacts contain the reports, build metadata,
 digests, and logs.
 
-The workflow runs the candidate checkout's #70 production-client paging
-probe and #53 Linux durability producer. Budget-1 exhaustion, tied rows, and a sparse
-byte-trimmed walk must return the expected framed responses. A cursor issued
-at a fixed budget must reach terminal exhaustion at the same budget. The
-walk reports keep schema version 1 and add the observed failure page,
-budget, HTTP status, and diagnostic for unexpected issuance or continuation
-failures. The durability report must demonstrate prior-process cursor
+The workflow runs the pinned #70 production-client paging probe against the
+candidate binary and runs the candidate checkout's #53 Linux durability
+producer. The tied fixture must reject cleanly at 10 work units and exhaust
+at 11. The sparse fixture must reject cleanly at 313 and exhaust at 314 with
+a 96-byte response cap and resume limit 1. The walks check exact row order,
+duplicate multiplicity, and snapshot membership after acknowledged appends
+between issuance and resume. Schema version 1 reports record the failure
+page, budget, HTTP status, and diagnostic when issuance or continuation fails.
+The durability report must demonstrate prior-process cursor
 rejection and verify readiness and ingest in both filesystem retarget
 directions. The native workflow checks that the producer removed its fixture
 root and records `fixture_root_cleanup` in the schema v1 durability report.
