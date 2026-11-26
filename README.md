@@ -21,6 +21,11 @@ the documented WAL and commit marker.
   whose `-help` lacks `-query-max-response-bytes`. Leave the parameter unset
   for baseline runs and unrelated tracks, where that missing flag skips
   only the response byte suite.
+- Set `SLIPWAY_PARAM_REQUIRE_READY=1` for the readiness candidate and
+  `SLIPWAY_PARAM_REQUIRE_RESPONSE_LENGTH=1` for the explicit response
+  framing candidate. By default a 404 from `/ready` skips the readiness
+  suite, and legacy framing on both HTTP versions skips the large-response
+  length suite. The byte-cap and ENOSPC recovery suites run independently.
 - Set `SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION=1` on the #19 release candidate
   verification step. The gate requires both `-query-concurrency` and
   `-query-work-budget` in `-help` and passing reports for both suites. The
@@ -67,7 +72,8 @@ the documented WAL and commit marker.
   more than 1,000 ties, equivalent time zones, and malformed, tampered,
   mismatched, and pre-restart tokens. The verifier walks established and fresh
   cursors across two backfill commits. Active walks change page size and
-  express the same bounds in different time zones.
+  express the same bounds in different time zones. Two live processes with
+  identical histories reject each other's tokens and resume their own.
 - The work budget suite sets `-query-work-budget=32` when advertised and
   checks HTTP 503 without rows or `Bog-Next-Cursor` for ordinary scans and
   for lookahead on first pages and continuations.
@@ -78,12 +84,14 @@ the documented WAL and commit marker.
   succeed. After the held client disconnects, a retry succeeds, the existing
   cursor excludes the backfill, and a fresh walk includes it. The verifier
   also checks that the acknowledged backfill survives SIGKILL and restart.
-- The response byte suite counts raw UTF-8 NDJSON, including JSON escapes
-  and record newlines. It checks the exact-fit ordinary prefix and HTTP 422
-  with no rows or cursor when the first matching record exceeds the cap by
-  one byte. A snapshot walk crosses a byte cut within tied duplicates,
-  excludes matching backfill acknowledged after its first page, and ends
-  without a cursor. A fresh walk includes the backfill.
+- The response byte suite uses HTTP/1.0 and HTTP/1.1 to check the exact-fit
+  NDJSON prefix, including JSON escapes and record newlines. It verifies
+  `Content-Length` on successful responses, including empty pages, and
+  requires HTTP 422 without rows or a cursor for oversized first matches
+  on ordinary queries, first pages, and continuations. An active snapshot
+  crosses a byte cut within tied duplicates and excludes later backfill.
+  A fresh walk includes the backfill. A separate probe checks explicit
+  framing on ordinary and paged responses above Go's buffering threshold.
 - Eight writers and overlapping readers check that batches are visible whole.
   Each writer queries immediately after each observed 204 and checks that its
   whole batch is visible. Cross-batch ties are tested with serial POSTs.
@@ -101,7 +109,10 @@ the documented WAL and commit marker.
 - Offline copies check historical surrogate replay, truncation of uncommitted
   suffixes, and startup refusal for committed corruption or invalid markers
   with file preservation. The default gate also covers exclusive directory
-  locking and concurrent ENOSPC rejections.
+  locking and concurrent ENOSPC rejections. On builds that expose `/ready`,
+  a failed append on a full volume changes readiness from 200 to 503
+  while `/healthz` and queries stay available. After space is freed and the
+  append is retried successfully, readiness returns to 200 in the same process.
 - The Linux log replay builds 65,573 rows per run from seeded selections of
   captured Apache access, Git daemon, and multiline application logs, and
   authored syslog messages. It uses fresh stores for steady and shuffled

@@ -201,6 +201,22 @@ class Bog:
         except (OSError, http.client.HTTPException) as exc:
             raise Rejected(f"{method} {target} failed: {exc}; {self.log_tail()}") from exc
 
+    def http10_get(self, target):
+        # Read to EOF so Content-Length cannot hide bytes beyond the declared body.
+        try:
+            with socket.create_connection(("127.0.0.1", self.port), HTTP_TIMEOUT) as peer:
+                peer.sendall(f"GET {target} HTTP/1.0\r\nConnection: close\r\n\r\n".encode("ascii"))
+                with peer.makefile("rb") as response:
+                    status_line = response.readline(4096)
+                    match = re.fullmatch(rb"HTTP/1\.[01] ([1-5][0-9]{2}) [^\r\n]*\r\n", status_line)
+                    check(match is not None, f"HTTP/1.0 GET {target}: invalid status line {status_line[:100]!r}")
+                    headers = http.client.parse_headers(response)
+                    body = response.read(16 * 1024 * 1024 + 1)
+                    check(len(body) <= 16 * 1024 * 1024, f"HTTP/1.0 GET {target} exceeded response read cap")
+                    return int(match[1]), body, headers
+        except (OSError, http.client.HTTPException) as exc:
+            raise Rejected(f"HTTP/1.0 GET {target} failed: {exc}; {self.log_tail()}") from exc
+
     def log_tail(self):
         tail = " ".join(log_tail(self.log_path, 1200).split())
         return tail or "(empty process log)"
@@ -412,12 +428,15 @@ def expect_bad_query(bog, args, label):
     check(headers.get_all(NEXT_CURSOR) is None, f"{label}: rejected query returned {NEXT_CURSOR}")
 
 
-def expect_query_error(bog, args, expected, label, *, timeout=HTTP_TIMEOUT):
+def expect_query_error(bog, args, expected, label, *, timeout=HTTP_TIMEOUT, http10=False):
     started = time.monotonic()
-    status, body, headers = bog.checked_exchange("GET", query_target(args), timeout=timeout)
+    target = query_target(args)
+    status, body, headers = (bog.http10_get(target) if http10
+                             else bog.checked_exchange("GET", target, timeout=timeout))
     check(status == expected, f"{label}: expected HTTP {expected}, got {status}: {body[:150]!r}")
     if expected == 503:
         check(time.monotonic() - started < timeout, f"{label}: response took at least {timeout}s")
+    if expected in (422, 503):
         check(headers.get_content_type() != "application/x-ndjson", f"{label}: error used NDJSON media type")
     check(headers.get_all(NEXT_CURSOR) is None, f"{label}: error returned {NEXT_CURSOR}")
     for line in body.split(b"\n"):
@@ -713,7 +732,9 @@ def pagination_suite(binary, directory):
             cases.append((0, width * minute + ns, "cutoff/", (1, 3),
                           f"old cutoff at {width} minutes plus {ns}ns"))
 
-    with run_bog(binary, directory) as bog:
+    directory.mkdir()
+    issuer = directory / "issuer"
+    with run_bog(binary, issuer) as bog:
         for batch in batches:
             bog.ingest(batch)
         for start, end, literal, limits, label in cases:
@@ -750,6 +771,16 @@ def pagination_suite(binary, directory):
         snapshot_shifted = query_args(snapshot_start, snapshot_end, offset=-450)
         original = oracle(rows, snapshot_start, snapshot_end)
         active = expect_page(bog, snapshot_args, original, 0, 2, None, "first page before backfill")
+        with run_bog(binary, directory / "other-issuer") as other:
+            for batch in batches:
+                other.ingest(batch)
+            foreign = expect_page(other, snapshot_args, original, 0, 2, None, "second issuer first page")
+            expect_bad_query(other, {**snapshot_args, "cursor": active}, "first issuer cursor at second issuer")
+            expect_bad_query(bog, {**snapshot_args, "cursor": foreign}, "second issuer cursor at first issuer")
+            expect_walk(other, snapshot_args, original, (2,), "second issuer resumes its cursor",
+                        position=2, cursor=foreign)
+            expect_walk(bog, snapshot_args, original, (2,), "first issuer resumes its cursor",
+                        position=2, cursor=active)
         late = [Row(snapshot_start + i, f"backfilled snapshot row {i}") for i in (100, 60, 30, 5, 15, 20)]
         late.append(Row(11, "backfilled row at the cursor's timestamp"))
         pending = [Row(snapshot_start + i, f"concurrent backfill row {i}") for i in (55, 1, 95)]
@@ -771,7 +802,7 @@ def pagination_suite(binary, directory):
         expect_walk(bog, args, oracle(rows, 11, 12), (1000,), "fresh tied walk after backfill")
         bog.kill()
 
-    with run_bog(binary, directory) as bog:
+    with run_bog(binary, issuer) as bog:
         expect_bad_query(bog, continuation, "cursor from the previous process")
         expect_bad_query(bog, {**snapshot_args, "cursor": active}, "backfill cursor from the previous process")
         expect_bad_query(bog, {**snapshot_args, "cursor": second_cursor},
@@ -896,6 +927,29 @@ def query_admission_suite(binary, directory):
             "backfill_after_restart": "passed"}
 
 
+def expect_response_length(headers, body, label):
+    lengths = headers.get_all("Content-Length")
+    check(lengths is not None and len(lengths) == 1 and re.fullmatch(r"[0-9]+", lengths[0])
+          and lengths[0].lstrip("0") == str(len(body)).lstrip("0"),
+          f"{label}: expected one Content-Length for {len(body)} bytes, got {lengths!r}")
+    check(headers.get_all("Transfer-Encoding") is None, f"{label}: unexpected Transfer-Encoding")
+
+
+def expect_framed_query(bog, args, expected, label, *, http10=False):
+    target = query_target(args)
+    status, body, headers = bog.http10_get(target) if http10 else bog.checked_exchange("GET", target)
+    check(status == 200, f"{label}: expected HTTP 200, got {status}: {body[:150]!r}")
+    expect_response_length(headers, body, label)
+    check(headers.get_content_type() == "application/x-ndjson", f"{label}: expected NDJSON media type")
+    check(body.count(b"\n") == len(expected) and (not body or body.endswith(b"\n")),
+          f"{label}: expected {len(expected)} complete newline-terminated records")
+    expect_rows(decode_rows(body), expected, label)
+    cursors = headers.get_all(NEXT_CURSOR)
+    if cursors is not None:
+        check(len(cursors) == 1 and bool(cursors[0].strip()), f"{label}: invalid {NEXT_CURSOR}")
+    return body, cursors[0] if cursors else None
+
+
 def query_response_bytes_suite(binary, directory):
     flag = "-query-max-response-bytes"
     if flag not in advertised_flags(binary, directory):
@@ -915,18 +969,11 @@ def query_response_bytes_suite(binary, directory):
     oversized_base = Row(4, "hit/oversized " + escaped)
     oversized_args = query_args(4, 6, "hit/", limit=10)
 
-    def expect_ndjson(bog, params, expected, label):
-        body, cursor = bog.query_ndjson(params)
-        check(body.endswith(b"\n") and body.count(b"\n") == len(expected),
-              f"{label}: expected {len(expected)} complete newline-terminated records")
-        expect_rows(decode_rows(body), expected, label)
-        return body, cursor
-
     # Measure actual response framing and escaping with space for both records.
     with run_bog(binary, directory / "measure", flags=(f"{flag}=4096",)) as bog:
         bog.ingest([first, duplicate, oversized_base])
-        prefix, _ = expect_ndjson(bog, args, original[:2], "measure prefix")
-        oversized_wire, _ = expect_ndjson(bog, oversized_args, [oversized_base], "measure oversized row")
+        prefix, _ = expect_framed_query(bog, args, original[:2], "measure prefix")
+        oversized_wire, _ = expect_framed_query(bog, oversized_args, [oversized_base], "measure oversized row")
     cap = len(prefix)
     padding = cap + 1 - len(oversized_wire)
     if padding <= 0:
@@ -936,26 +983,80 @@ def query_response_bytes_suite(binary, directory):
     with run_bog(binary, directory / "capped", flags=(f"{flag}={cap}",)) as bog:
         bog.ingest(original[:2])
         bog.ingest([*original[2:], oversized, Row(5, "hit/after oversized row")])
-        body, cursor = expect_ndjson(bog, args, original[:2], "ordinary byte-limited prefix")
-        check(len(body) == cap, f"ordinary prefix used {len(body)} bytes, expected {cap}")
-        check(cursor is None, f"ordinary prefix returned {NEXT_CURSOR}")
-        for paging in ({}, {"page": "1"}):
-            expect_query_error(bog, {**oversized_args, **paging}, 422,
-                               f"{'paged' if paging else 'ordinary'} oversized first match")
+        walks = []
+        for http10 in (False, True):
+            protocol = "HTTP/1.0" if http10 else "HTTP/1.1"
+            body, cursor = expect_framed_query(bog, args, original[:2], f"{protocol} ordinary capped prefix",
+                                               http10=http10)
+            check(len(body) == cap and cursor is None, f"{protocol}: expected an exact-cap ordinary prefix")
+            for paging in ({}, {"page": "1"}):
+                mode = "paged" if paging else "ordinary"
+                expect_query_error(bog, {**oversized_args, **paging}, 422,
+                                   f"{protocol} {mode} oversized first match", http10=http10)
 
-        params = {**args, "page": "1"}
+            across = query_args(last.ns, 6, "hit/")
+            _, cursor = expect_framed_query(bog, {**across, "page": "1", "limit": 1}, [last],
+                                            f"{protocol} page before oversized row", http10=http10)
+            check(cursor is not None, f"{protocol}: expected a cursor before the oversized row")
+            expect_query_error(bog, {**across, "cursor": cursor}, 422,
+                               f"{protocol} continuation with an oversized first match", http10=http10)
+            _, cursor = expect_framed_query(bog, {**args, "contains": "missing", "page": "1"}, [],
+                                            f"{protocol} empty terminal page", http10=http10)
+            check(cursor is None, f"{protocol}: empty page returned {NEXT_CURSOR}")
+            walks.append((http10, protocol, {**args, "page": "1"}))
+
         for start, end in ((0, 2), (2, 4), (4, 5)):
-            label = f"byte-limited snapshot at row offset {start}"
-            body, cursor = expect_ndjson(bog, params, original[start:end], label)
-            check(len(body) <= cap, f"{label}: returned {len(body)} bytes with a cap of {cap}")
-            check((cursor is not None) == (end < len(original)),
-                  f"{label}: {NEXT_CURSOR} must be present exactly when rows remain")
+            for i, (http10, protocol, params) in enumerate(walks):
+                label = f"{protocol} byte-limited snapshot at row offset {start}"
+                body, cursor = expect_framed_query(bog, params, original[start:end], label, http10=http10)
+                check(len(body) <= cap, f"{label}: returned {len(body)} bytes with a cap of {cap}")
+                check((cursor is not None) == (end < len(original)),
+                      f"{label}: {NEXT_CURSOR} must be present exactly when rows remain")
+                walks[i] = (http10, protocol, {**args, "cursor": cursor})
             if start == 0:
                 bog.ingest(backfill)
-            params = {**args, "cursor": cursor}
 
-        expect_walk(bog, args, oracle(original + backfill, 0, 4, "hit/"), (1,),
-                    "fresh snapshot sees both matching backfills")
+        fresh = oracle(original + backfill, 0, 4, "hit/")
+        params = {**args, "page": "1", "limit": 1}
+        for i, row in enumerate(fresh):
+            _, cursor = expect_framed_query(bog, params, [row], f"fresh snapshot row {i}")
+            check((cursor is not None) == (i + 1 < len(fresh)), f"fresh snapshot row {i}: wrong cursor presence")
+            params = {**args, "cursor": cursor, "limit": 1}
+
+
+def large_response_length_suite(binary, directory):
+    # Go supplies Content-Length automatically for small buffered responses.
+    # A larger body distinguishes implementations with explicit framing.
+    rows = [Row(i, "x" * 3072) for i in (1, 2)]
+    args = query_args(0, 3)
+    with run_bog(binary, directory) as bog:
+        bog.ingest(rows)
+        status, body, headers = bog.checked_exchange("GET", query_target(args))
+        check(status == 200, f"large query framing probe returned HTTP {status}: {body[:150]!r}")
+        expect_rows(decode_rows(body), rows, "large query framing probe")
+        if headers.get_all("Content-Length") is None and headers.get_all("Transfer-Encoding") == ["chunked"]:
+            reason = "large HTTP/1.1 query uses legacy chunked framing"
+            check(os.environ.get("SLIPWAY_PARAM_REQUIRE_RESPONSE_LENGTH") != "1", reason)
+            # An implementation can advertise length on HTTP/1.0 independently.
+            status, body, headers = bog.http10_get(query_target(args))
+            check(status == 200, f"HTTP/1.0 framing probe returned HTTP {status}: {body[:150]!r}")
+            expect_rows(decode_rows(body), rows, "HTTP/1.0 large query framing probe")
+            if headers.get_all("Content-Length") is None and headers.get_all("Transfer-Encoding") is None:
+                return SuiteSkipped(reason)
+            raise Rejected("large query framing differs between HTTP/1.0 and HTTP/1.1")
+        expect_response_length(headers, body, "large HTTP/1.1 ordinary query")
+
+        for http10 in (False, True):
+            protocol = "HTTP/1.0" if http10 else "HTTP/1.1"
+            if http10:
+                _, cursor = expect_framed_query(bog, args, rows, f"{protocol} large ordinary query", http10=True)
+                check(cursor is None, f"{protocol}: ordinary query returned {NEXT_CURSOR}")
+            _, cursor = expect_framed_query(bog, {**args, "page": "1", "limit": 1}, rows[:1],
+                                           f"{protocol} large first page", http10=http10)
+            check(cursor is not None, f"{protocol}: expected a cursor on the large first page")
+            _, cursor = expect_framed_query(bog, {**args, "cursor": cursor}, rows[1:],
+                                           f"{protocol} large terminal page", http10=http10)
+            check(cursor is None, f"{protocol}: terminal page returned {NEXT_CURSOR}")
 
 
 def rejection_suite(binary, directory):
@@ -1621,6 +1722,42 @@ def enospc_suite(binary, directory):
             expect_rows(bog.query(0, 41), history + resumed, "ENOSPC new durable write after second restart")
     return {"available": True, "capacity_bytes": capacity, "kernel_errno": errno.ENOSPC,
             "rejected_writers": len(payloads)}
+
+
+def storage_readiness_suite(binary, directory):
+    with run_bog(binary, directory) as bog:
+        status, body = bog.request("GET", "/ready")
+        if status == 404:
+            reason = "GET /ready is unavailable"
+            check(os.environ.get("SLIPWAY_PARAM_REQUIRE_READY") != "1", reason)
+            return SuiteSkipped(reason)
+        check(status == 200, f"/ready on an empty writable store returned HTTP {status}: {body[:150]!r}")
+
+    mount, capacity = bounded_mount()
+    history = [Row(1, "acknowledged before storage pressure")]
+    retry = [Row(2, "storage pressure retry " + "x" * 8192)]
+    payload = encode_rows(retry)
+    with tempfile.TemporaryDirectory(prefix="bog-ready-", dir=mount) as tmp:
+        filler = Path(tmp) / "filler"
+        with run_bog(binary, Path(tmp) / "store") as bog:
+            bog.ingest(history)
+            status, body = bog.request("GET", "/ready")
+            check(status == 200, f"/ready before storage pressure returned HTTP {status}: {body[:150]!r}")
+            fill_blocks(filler, capacity)
+            require_full_blocks(filler)
+            status, body = bog.request("POST", "/ingest", payload)
+            check(status == 503, f"storage pressure ingest returned HTTP {status}: {body[:150]!r}")
+            status, body = bog.request("GET", "/ready")
+            check(status == 503, f"/ready after ENOSPC returned HTTP {status}: {body[:150]!r}")
+            status, body = bog.request("GET", "/healthz")
+            check(status == 200, f"/healthz under storage pressure returned HTTP {status}: {body[:150]!r}")
+            expect_rows(bog.query(0, 3), history, "acknowledged history under storage pressure")
+
+            filler.unlink()
+            bog.ingest(retry)
+            status, body = bog.request("GET", "/ready")
+            check(status == 200, f"/ready after a successful retry returned HTTP {status}: {body[:150]!r}")
+            expect_rows(bog.query(0, 3), history + retry, "history after storage pressure clears")
 
 
 def require_full_blocks(path):
@@ -2504,6 +2641,7 @@ SUITES = (
     ("query-limits", query_limits_suite),
     ("query-admission", query_admission_suite),
     ("query-response-bytes", query_response_bytes_suite),
+    ("large-response-length", large_response_length_suite),
     ("archived-corpus", replay_corpus_suite),
     ("request-rejection", rejection_suite),
     ("concurrent-snapshots", concurrency_suite),
@@ -2512,6 +2650,7 @@ SUITES = (
     ("wal-recovery", recovery_suite),
     ("historical-surrogates", historical_surrogate_suite),
     ("enospc-recovery", enospc_suite),
+    ("storage-readiness", storage_readiness_suite),
     ("performance-smoke", performance_suite),
     ("log-replay", log_replay_suite),
 )
@@ -2521,6 +2660,7 @@ REQUIRED_SUITES = (
     "query-limits",
     "query-admission",
     "query-response-bytes",
+    "large-response-length",
     "archived-corpus",
     "request-rejection",
     "concurrent-snapshots",
@@ -2529,6 +2669,7 @@ REQUIRED_SUITES = (
     "wal-recovery",
     "historical-surrogates",
     "enospc-recovery",
+    "storage-readiness",
     "performance-smoke",
     "log-replay",
 )
