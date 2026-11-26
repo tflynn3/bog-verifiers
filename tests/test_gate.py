@@ -113,7 +113,7 @@ class GateTest(unittest.TestCase):
                                           [name for name in core
                                            if name not in ("snapshot-pagination", "log-replay")]))
 
-    def test_query_limits_only_exempt_pinned_baselines(self):
+    def test_query_limits_plan_exempts_pinned_baselines(self):
         for sha in (verify.BASELINE_SHA, verify.COMPARISON_BASELINE_SHA, verify.CYCLE7_BASELINE_SHA):
             for profile in ("pr", "full", "post-cycle", "indexed", "legacy"):
                 with self.subTest(profile=profile, sha=sha):
@@ -121,6 +121,40 @@ class GateTest(unittest.TestCase):
                     report = verify.new_result(sha, sha, profile)
                     self.assertNotIn("query-limits", {suite["name"] for suite in report["suites"]})
         self.assertIn("query-limits", dict(verify.suite_plan(verify.SUITES, "pr", "0" * 40)))
+
+    def test_query_limits_gate_checks_candidate_help_before_running_assertions(self):
+        budget = "  -query-work-budget int"
+        concurrency = "  -query-concurrency int"
+        for options, exit_code, status, diagnostic in (
+            ("  -addr string", 0, "skipped", "-query-work-budget, -query-concurrency"),
+            (f"{budget}\n  -query-concurrency-extra int", 0, "skipped", "-query-concurrency"),
+            (f"{budget}\n{concurrency}", 0, "rejected", "query assertions reached"),
+            ("  -addr string", 2, "rejected", "Bog -help exited with status 2"),
+        ):
+            with self.subTest(options=options, exit_code=exit_code), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                binary = work / "bog"
+                binary.write_text(f"#!/bin/sh\n[ \"$1\" = -help ] || exit 3\n"
+                                  f"cat >&2 <<'HELP'\nUsage of bog:\n{options}\nHELP\nexit {exit_code}\n")
+                binary.chmod(0o755)
+
+                def following_suite(*_):
+                    verify.PROCESS_LOGS.get()[1].append({"ready_ms": 1})
+
+                suites = (("query-limits", verify.query_limits_suite), ("following", following_suite))
+                with patch.object(verify, "SUITES", suites), \
+                     patch.object(verify, "REQUIRED_SUITES", ("query-limits", "following")), \
+                     patch.object(verify, "CYCLE7_PROFILES", ()), \
+                     patch.object(verify, "build", return_value=binary), \
+                     patch.object(verify, "run_bog", side_effect=verify.Rejected("query assertions reached")) as run:
+                    self.assertEqual(verify.main(work, work, "0" * 40), int(status == "rejected"))
+                report = json.loads((work / "artifacts/result.json").read_text())
+                limits, following = report["suites"]
+                self.assertEqual(limits["status"], status)
+                self.assertIn(diagnostic, limits["diagnostic"])
+                self.assertEqual(following["status"], "passed")
+                self.assertEqual((work / "passed").exists(), status == "skipped")
+                self.assertEqual(run.call_count, int(options == f"{budget}\n{concurrency}"))
 
     def test_timing_sample_cap_preserves_quantiles_from_all_requests(self):
         times = [0.001] * 97 + [0.010] * 2 + [0.100]

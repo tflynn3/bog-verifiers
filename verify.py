@@ -74,6 +74,11 @@ class InfrastructureError(Exception):
     pass
 
 
+@dataclasses.dataclass(frozen=True)
+class SuiteSkipped:
+    reason: str
+
+
 def check(condition, reason):
     if not condition:
         raise Rejected(reason)
@@ -765,6 +770,17 @@ def pagination_suite(binary, directory):
 
 
 def query_limits_suite(binary, directory):
+    help_result = subprocess.run(
+        [str(binary), "-help"], cwd=directory.parent, stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", timeout=START_TIMEOUT,
+    )
+    check(help_result.returncode == 0,
+          f"Bog -help exited with status {help_result.returncode}: {help_result.stdout[-200:]!r}")
+    advertised = set(re.findall(r"^[ \t]*(-[a-z0-9-]+)(?=[ \t=]|$)", help_result.stdout, re.MULTILINE))
+    missing = [flag for flag in ("-query-work-budget", "-query-concurrency") if flag not in advertised]
+    if missing:
+        return SuiteSkipped(f"Bog -help does not list {', '.join(missing)}")
+
     directory.mkdir()
     budget = 32
     first = Row(1, "@ first match")
@@ -2590,6 +2606,7 @@ def main(source, work, sha, profile="pr"):
         return 2
 
     completed = []
+    skipped = 0
     rejected = []
     errors = []
     baselines = {}
@@ -2652,6 +2669,12 @@ def main(source, work, sha, profile="pr"):
                 metrics = run(binary, work / stage, paged=False)
             else:
                 metrics = run(binary, work / stage)
+            if isinstance(metrics, SuiteSkipped):
+                suite.update(status="skipped", diagnostic=metrics.reason)
+                completed.append(stage)
+                skipped += 1
+                print(f"SKIP {stage}: {metrics.reason}")
+                continue
             if metrics is not None:
                 suite["metrics"] = metrics
             if stage == LOG_REPLAY_COMPARISON or (profile == "indexed" and stage == comparison_stage):
@@ -2680,7 +2703,7 @@ def main(source, work, sha, profile="pr"):
             checkpoint()
 
     print(f"candidate_sha={sha} binary_sha256={digest} "
-          f"suites_passed={len(completed)}/{len(required)} "
+          f"suites_passed={len(completed) - skipped}/{len(required)} suites_skipped={skipped} "
           f"suites_rejected={len(rejected)} suites_infra_error={len(errors)}")
     if errors:
         finish("infra_error", f"required suites with infrastructure errors: {', '.join(errors)}")
