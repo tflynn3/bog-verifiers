@@ -156,6 +156,37 @@ class GateTest(unittest.TestCase):
                 self.assertEqual((work / "passed").exists(), status == "skipped")
                 self.assertEqual(run.call_count, int(options == f"{budget}\n{concurrency}"))
 
+    def test_response_byte_suite_requires_the_capability_for_issue_seven(self):
+        for flags, required, diagnostic in (
+            ({"-query-max-response-bytes-extra"}, "", None),
+            (set(), "1", "Bog -help does not list -query-max-response-bytes"),
+            ({"-query-max-response-bytes"}, "", "response byte assertions reached"),
+            ({"-query-max-response-bytes"}, "1", "response byte assertions reached"),
+        ):
+            with self.subTest(flags=flags, required=required), tempfile.TemporaryDirectory() as directory:
+                work = Path(directory)
+                binary = work / "bog"
+                binary.touch()
+
+                def following(*_):
+                    verify.PROCESS_LOGS.get()[1].append({"ready_ms": 1})
+
+                suites = (("query-response-bytes", verify.query_response_bytes_suite), ("following", following))
+                with patch.dict(os.environ, {"SLIPWAY_PARAM_REQUIRE_QUERY_RESPONSE_BYTES": required}), \
+                     patch.object(verify, "SUITES", suites), \
+                     patch.object(verify, "REQUIRED_SUITES", tuple(name for name, _ in suites)), \
+                     patch.object(verify, "CYCLE7_PROFILES", ()), \
+                     patch.object(verify, "build", return_value=binary), \
+                     patch.object(verify, "advertised_flags", return_value=flags), \
+                     patch.object(verify, "run_bog", side_effect=verify.Rejected("response byte assertions reached")):
+                    self.assertEqual(verify.main(work, work, "0" * 40), int(diagnostic is not None))
+                response_bytes, other = json.loads((work / "artifacts/result.json").read_text())["suites"]
+                self.assertEqual(other["status"], "passed")
+                self.assertEqual(response_bytes["status"], "rejected" if diagnostic else "skipped")
+                if diagnostic:
+                    self.assertIn(diagnostic, (work / "rejection").read_text())
+                self.assertEqual((work / "passed").exists(), diagnostic is None)
+
     def test_timing_sample_cap_preserves_quantiles_from_all_requests(self):
         times = [0.001] * 97 + [0.010] * 2 + [0.100]
         metrics = verify.latency_metrics(times, sample_limit=4)

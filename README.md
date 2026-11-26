@@ -16,6 +16,11 @@ the documented WAL and commit marker.
   `SLIPWAY_PARAM_REPOSITORY`. Run the same entrypoint on the baseline and
   each PR head. The fetched history must contain the Cycle 7 reference for
   the paired smoke and WAL handoffs.
+- Set `SLIPWAY_PARAM_REQUIRE_QUERY_RESPONSE_BYTES=1` on the candidate
+  verification step for the PR implementing #7. That run rejects a binary
+  whose `-help` lacks `-query-max-response-bytes`. Leave the parameter unset
+  for baseline runs and unrelated tracks, where that missing flag skips
+  only the response byte suite.
 - With the same candidate inputs, use `--full`, `--compare`, or
   `SLIPWAY_PARAM_MODE=full` or `compare` for the paired post-cycle matrix and
   WAL handoffs against `4ff49aae9672cf5aec8e3fbd20ffe0a84ae15bc0`.
@@ -62,6 +67,12 @@ the documented WAL and commit marker.
   omit rows and `Bog-Next-Cursor`. After the slot is released, the active
   cursor excludes the backfill acknowledged during saturation and a fresh
   walk includes it. Pinned historical baselines retain their existing suites.
+- The response byte suite counts raw UTF-8 NDJSON, including JSON escapes
+  and record newlines. It checks the exact-fit ordinary prefix and HTTP 422
+  with no rows or cursor when the first matching record exceeds the cap by
+  one byte. A snapshot walk crosses a byte cut within tied duplicates,
+  excludes matching backfill acknowledged after its first page, and ends
+  without a cursor. A fresh walk includes the backfill.
 - Eight writers and overlapping readers check that batches are visible whole.
   Each writer queries immediately after each observed 204 and checks that its
   whole batch is visible. Cross-batch ties are tested with serial POSTs.

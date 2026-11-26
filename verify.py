@@ -309,13 +309,17 @@ class Bog:
         return rows
 
     def query_page(self, args):
+        body, cursor = self.query_ndjson(args)
+        return decode_rows(body), cursor
+
+    def query_ndjson(self, args):
         status, body, headers = self.checked_exchange("GET", query_target(args))
         check(status == 200, f"query returned {status}: {body[:200]!r}")
         cursors = headers.get_all(NEXT_CURSOR)
         if cursors is not None:
             check(len(cursors) == 1 and bool(cursors[0].strip()),
                   f"expected a single nonempty {NEXT_CURSOR}")
-        return decode_rows(body), cursors[0] if cursors else None
+        return body, cursors[0] if cursors else None
 
 
 def query_args(start, end, contains="", limit=None, offset=0):
@@ -769,14 +773,18 @@ def pagination_suite(binary, directory):
                     (1000,), "fresh full walk after WAL replay")
 
 
-def query_limits_suite(binary, directory):
+def advertised_flags(binary, directory):
     help_result = subprocess.run(
         [str(binary), "-help"], cwd=directory.parent, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace", timeout=START_TIMEOUT,
     )
     check(help_result.returncode == 0,
           f"Bog -help exited with status {help_result.returncode}: {help_result.stdout[-200:]!r}")
-    advertised = set(re.findall(r"^[ \t]*(-[a-z0-9-]+)(?=[ \t=]|$)", help_result.stdout, re.MULTILINE))
+    return set(re.findall(r"^[ \t]*(-[a-z0-9-]+)(?=[ \t=]|$)", help_result.stdout, re.MULTILINE))
+
+
+def query_limits_suite(binary, directory):
+    advertised = advertised_flags(binary, directory)
     missing = [flag for flag in ("-query-work-budget", "-query-concurrency") if flag not in advertised]
     if missing:
         return SuiteSkipped(f"Bog -help does not list {', '.join(missing)}")
@@ -842,6 +850,68 @@ def query_limits_suite(binary, directory):
         expect_walk(bog, args, small, (1,), "captured snapshot after saturated backfill",
                     position=1, cursor=cursor)
         expect_walk(bog, args, oracle(small + backfill, 0, 100), (1,), "fresh snapshot after backfill")
+
+
+def query_response_bytes_suite(binary, directory):
+    flag = "-query-max-response-bytes"
+    if flag not in advertised_flags(binary, directory):
+        reason = f"Bog -help does not list {flag}"
+        check(os.environ.get("SLIPWAY_PARAM_REQUIRE_QUERY_RESPONSE_BYTES") != "1", reason)
+        return SuiteSkipped(reason)
+
+    directory.mkdir()
+    escaped = '"\\\n\té' * 48
+    first = Row(2, "hit/a " + escaped)
+    duplicate = Row(2, "hit/b " + escaped)
+    fourth = Row(2, "hit/c " + escaped)
+    last = Row(3, "hit/end")
+    original = [first, duplicate, duplicate, fourth, last]
+    backfill = [Row(1, "hit/early backfill"), Row(2, "hit/tied backfill")]
+    args = query_args(0, 4, "hit/", limit=10)
+    oversized_base = Row(4, "hit/oversized " + escaped)
+    oversized_args = query_args(4, 6, "hit/", limit=10)
+
+    def expect_ndjson(bog, params, expected, label):
+        body, cursor = bog.query_ndjson(params)
+        check(body.endswith(b"\n") and body.count(b"\n") == len(expected),
+              f"{label}: expected {len(expected)} complete newline-terminated records")
+        expect_rows(decode_rows(body), expected, label)
+        return body, cursor
+
+    # Measure actual response framing and escaping with space for both records.
+    with run_bog(binary, directory / "measure", flags=(f"{flag}=4096",)) as bog:
+        bog.ingest([first, duplicate, oversized_base])
+        prefix, _ = expect_ndjson(bog, args, original[:2], "measure prefix")
+        oversized_wire, _ = expect_ndjson(bog, oversized_args, [oversized_base], "measure oversized row")
+    cap = len(prefix)
+    padding = cap + 1 - len(oversized_wire)
+    if padding <= 0:
+        raise InfrastructureError("response byte cap fixture has no room for oversized row padding")
+    oversized = Row(oversized_base.ns, oversized_base.line + "x" * padding)
+
+    with run_bog(binary, directory / "capped", flags=(f"{flag}={cap}",)) as bog:
+        bog.ingest(original[:2])
+        bog.ingest([*original[2:], oversized, Row(5, "hit/after oversized row")])
+        body, cursor = expect_ndjson(bog, args, original[:2], "ordinary byte-limited prefix")
+        check(len(body) == cap, f"ordinary prefix used {len(body)} bytes, expected {cap}")
+        check(cursor is None, f"ordinary prefix returned {NEXT_CURSOR}")
+        for paging in ({}, {"page": "1"}):
+            expect_query_error(bog, {**oversized_args, **paging}, 422,
+                               f"{'paged' if paging else 'ordinary'} oversized first match")
+
+        params = {**args, "page": "1"}
+        for start, end in ((0, 2), (2, 4), (4, 5)):
+            label = f"byte-limited snapshot at row offset {start}"
+            body, cursor = expect_ndjson(bog, params, original[start:end], label)
+            check(len(body) <= cap, f"{label}: returned {len(body)} bytes with a cap of {cap}")
+            check((cursor is not None) == (end < len(original)),
+                  f"{label}: {NEXT_CURSOR} must be present exactly when rows remain")
+            if start == 0:
+                bog.ingest(backfill)
+            params = {**args, "cursor": cursor}
+
+        expect_walk(bog, args, oracle(original + backfill, 0, 4, "hit/"), (1,),
+                    "fresh snapshot sees both matching backfills")
 
 
 def rejection_suite(binary, directory):
@@ -2388,6 +2458,7 @@ SUITES = (
     ("query-oracle", corpus_suite),
     ("snapshot-pagination", pagination_suite),
     ("query-limits", query_limits_suite),
+    ("query-response-bytes", query_response_bytes_suite),
     ("archived-corpus", replay_corpus_suite),
     ("request-rejection", rejection_suite),
     ("concurrent-snapshots", concurrency_suite),
@@ -2403,6 +2474,7 @@ REQUIRED_SUITES = (
     "query-oracle",
     "snapshot-pagination",
     "query-limits",
+    "query-response-bytes",
     "archived-corpus",
     "request-rejection",
     "concurrent-snapshots",
