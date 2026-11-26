@@ -142,7 +142,7 @@ def decode_rows(body):
 class Bog:
     """Public CLI and HTTP binding used by every workload."""
 
-    def __init__(self, binary, directory, log_path):
+    def __init__(self, binary, directory, log_path, *, flags=()):
         directory.mkdir(exist_ok=True)
         self.directory_name = directory.name
         with socket.socket() as probe:
@@ -153,7 +153,7 @@ class Bog:
         with log_path.open("wb") as log:
             try:
                 self.process = subprocess.Popen(
-                    [str(binary), "-addr", f"127.0.0.1:{self.port}", "-data-dir", str(directory)],
+                    [str(binary), "-addr", f"127.0.0.1:{self.port}", "-data-dir", str(directory), *flags],
                     cwd=directory, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                 )
             except (FileNotFoundError, PermissionError) as exc:
@@ -327,14 +327,14 @@ def query_target(args):
 
 
 @contextlib.contextmanager
-def run_bog(binary, directory, *, ready=True):
+def run_bog(binary, directory, *, ready=True, flags=()):
     log_dir, cases = PROCESS_LOGS.get()
     path = log_dir / f"bog-{len(cases):02d}.log"
     case = {"store": directory.name, "log": str(path.relative_to(log_dir.parent)),
             "expected_ready": ready}
     cases.append(case)
     try:
-        bog = Bog(binary, directory, path)
+        bog = Bog(binary, directory, path, flags=flags)
         try:
             bog.startup_seconds = bog.wait_startup(ready)
             case["ready_ms"] = milliseconds(bog.startup_seconds) if ready else None
@@ -399,6 +399,19 @@ def expect_bad_query(bog, args, label):
     status, body, headers = bog.checked_exchange("GET", query_target(args))
     check(status == 400, f"{label}: expected HTTP 400, got {status}: {body[:150]!r}")
     check(headers.get_all(NEXT_CURSOR) is None, f"{label}: rejected query returned {NEXT_CURSOR}")
+
+
+def expect_query_error(bog, args, expected, label):
+    status, body, headers = bog.checked_exchange("GET", query_target(args))
+    check(status == expected, f"{label}: expected HTTP {expected}, got {status}: {body[:150]!r}")
+    check(headers.get_all(NEXT_CURSOR) is None, f"{label}: error returned {NEXT_CURSOR}")
+    for line in body.split(b"\n"):
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        check(not (isinstance(value, dict) and {"ts", "line"} <= value.keys()),
+              f"{label}: error returned an NDJSON row")
 
 
 def load_corpus():
@@ -749,6 +762,70 @@ def pagination_suite(binary, directory):
                          "cursor opened during backfill from the previous process")
         expect_walk(bog, query_args(beginning, end_of_time), oracle(rows, beginning, end_of_time),
                     (1000,), "fresh full walk after WAL replay")
+
+
+def query_limits_suite(binary, directory):
+    directory.mkdir()
+    budget = 32
+    first = Row(1, "@ first match")
+    second = Row(2, "@ second match")
+    last = Row(4 * budget, "@ late match")
+    # A one-character filter cannot use the four-byte Bloom summaries.
+    gap = [Row(ns, "scan gap") for ns in range(3, last.ns)]
+    args = query_args(0, last.ns + 1, "@")
+    with run_bog(binary, directory / "work-budget", flags=(f"-query-work-budget={budget}",)) as bog:
+        bog.ingest([first, second, *gap, last])
+        expect_rows(bog.query(0, last.ns + 1, "@", limit=2), [first, second],
+                    "ordinary query fits the work budget")
+        cursor = expect_page(bog, args, [first, second, last], 0, 1, None, "first page fits budget")
+        expect_query_error(bog, {**args, "limit": 3}, 422, "ordinary query exceeds work budget")
+        expect_query_error(bog, {**args, "limit": 2, "page": "1"}, 422,
+                           "first page exceeds work budget during lookahead")
+        expect_query_error(bog, {**args, "limit": 1, "cursor": cursor}, 422,
+                           "continuation exceeds work budget during lookahead")
+        expect_rows(bog.query(last.ns, last.ns + 1, "@"), [last], "query after budget rejection")
+
+    small = [Row(ns, f"original/{ns}") for ns in (10, 30, 50)]
+    backfill = [Row(20, "backfill between pages"), Row(30, "backfill at original timestamp")]
+    args = query_args(0, 100)
+    # A response larger than the TCP send buffer holds the query in its write
+    # loop while the client leaves the body unread with a small receive window.
+    padding = "x" * (1024 * 1024)
+    wide = [Row(ns, padding) for ns in range(100, 112)]
+    with run_bog(binary, directory / "query-slots", flags=("-query-concurrency=1",)) as bog:
+        bog.ingest(small)
+        for start in range(0, len(wide), 3):
+            bog.ingest(wide[start:start + 3])
+        cursor = expect_page(bog, args, small, 0, 1, None, "first page before saturation")
+        with socket.socket() as peer, contextlib.closing(
+                http.client.HTTPConnection("127.0.0.1", bog.port, timeout=HTTP_TIMEOUT)) as client:
+            peer.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
+            peer.settimeout(HTTP_TIMEOUT)
+            peer.connect(("127.0.0.1", bog.port))
+            client.sock = peer
+            client.request("GET", query_target(query_args(100, 112)))
+            with client.getresponse() as held:
+                check(held.status == 200 and held.read(1) == b"{",
+                      f"query used to hold the slot did not start an NDJSON response (HTTP {held.status})")
+                expect_query_error(bog, args, 503, "ordinary query during saturation")
+                expect_query_error(bog, {**args, "page": "1", "limit": 1}, 503,
+                                   "first page during saturation")
+                check(bog.request("GET", "/healthz")[0] == 200, "health failed during query saturation")
+                bog.ingest(backfill)
+                expect_query_error(bog, {**args, "cursor": cursor, "limit": 1}, 503,
+                                   "continuation during saturation after acknowledged backfill")
+
+        deadline = time.monotonic() + HTTP_TIMEOUT
+        while True:
+            status, body = bog.request("GET", query_target(args))
+            if status != 503:
+                check(status == 200, f"query after slot release returned {status}: {body[:150]!r}")
+                break
+            check(time.monotonic() < deadline, "closed query did not release its slot")
+            time.sleep(0.01)
+        expect_walk(bog, args, small, (1,), "captured snapshot after saturated backfill",
+                    position=1, cursor=cursor)
+        expect_walk(bog, args, oracle(small + backfill, 0, 100), (1,), "fresh snapshot after backfill")
 
 
 def rejection_suite(binary, directory):
@@ -2294,6 +2371,7 @@ def paired_performance_suite(baseline, candidate, directory, *, indexed, baselin
 SUITES = (
     ("query-oracle", corpus_suite),
     ("snapshot-pagination", pagination_suite),
+    ("query-limits", query_limits_suite),
     ("archived-corpus", replay_corpus_suite),
     ("request-rejection", rejection_suite),
     ("concurrent-snapshots", concurrency_suite),
@@ -2308,6 +2386,7 @@ SUITES = (
 REQUIRED_SUITES = (
     "query-oracle",
     "snapshot-pagination",
+    "query-limits",
     "archived-corpus",
     "request-rejection",
     "concurrent-snapshots",
@@ -2332,7 +2411,9 @@ CYCLE7_HANDOFF = "cycle7-wal-handoff"
 CYCLE7_PROFILES = ("pr", "full", "post-cycle")
 
 
-def suite_plan(suites, profile):
+def suite_plan(suites, profile, sha):
+    if sha in (BASELINE_SHA, COMPARISON_BASELINE_SHA, CYCLE7_BASELINE_SHA):
+        suites = tuple((name, run) for name, run in suites if name != "query-limits")
     if profile == "legacy":
         return tuple((name, run) for name, run in suites if name not in ("snapshot-pagination", "log-replay"))
     if profile in COMPARISON_SUITES:
@@ -2416,7 +2497,7 @@ def log_tail(path, size):
 
 
 def new_result(requested_sha, tested_sha, profile="pr"):
-    required = suite_plan(tuple((name, None) for name in REQUIRED_SUITES), profile)
+    required = suite_plan(tuple((name, None) for name in REQUIRED_SUITES), profile, tested_sha or requested_sha)
     baseline_sha = {"pr": CYCLE7_BASELINE_SHA, "full": COMPARISON_BASELINE_SHA, "post-cycle": COMPARISON_BASELINE_SHA,
                     "legacy": BASELINE_SHA, "indexed": BASELINE_SHA}.get(profile)
     return {
@@ -2466,7 +2547,7 @@ def main(source, work, sha, profile="pr"):
     build_log = evidence / "build.log"
     result = new_result(sha, sha, profile)
     required = tuple(suite["name"] for suite in result["suites"])
-    suites = suite_plan(SUITES, profile)
+    suites = suite_plan(SUITES, profile, sha)
     result["build"].update(status="running", log="build.log")
 
     def checkpoint():

@@ -55,6 +55,13 @@ the documented WAL and commit marker.
   mismatched, and pre-restart tokens. The verifier walks established and fresh
   cursors across two backfill commits. Active walks change page size and
   express the same bounds in different time zones.
+- A candidate-only suite sets `-query-work-budget=32` and checks HTTP 422
+  for ordinary scans and for lookahead on first pages and continuations.
+  It sets `-query-concurrency=1`, holds the query slot with a slow reader, and
+  checks HTTP 503 while ingest and health still respond. Both errors must
+  omit rows and `Bog-Next-Cursor`. After the slot is released, the active
+  cursor excludes the backfill acknowledged during saturation and a fresh
+  walk includes it. Pinned historical baselines retain their existing suites.
 - Eight writers and overlapping readers check that batches are visible whole.
   Each writer queries immediately after each observed 204 and checks that its
   whole batch is visible. Cross-batch ties are tested with serial POSTs.

@@ -113,6 +113,15 @@ class GateTest(unittest.TestCase):
                                           [name for name in core
                                            if name not in ("snapshot-pagination", "log-replay")]))
 
+    def test_query_limits_only_exempt_pinned_baselines(self):
+        for sha in (verify.BASELINE_SHA, verify.COMPARISON_BASELINE_SHA, verify.CYCLE7_BASELINE_SHA):
+            for profile in ("pr", "full", "post-cycle", "indexed", "legacy"):
+                with self.subTest(profile=profile, sha=sha):
+                    self.assertNotIn("query-limits", dict(verify.suite_plan(verify.SUITES, profile, sha)))
+                    report = verify.new_result(sha, sha, profile)
+                    self.assertNotIn("query-limits", {suite["name"] for suite in report["suites"]})
+        self.assertIn("query-limits", dict(verify.suite_plan(verify.SUITES, "pr", "0" * 40)))
+
     def test_timing_sample_cap_preserves_quantiles_from_all_requests(self):
         times = [0.001] * 97 + [0.010] * 2 + [0.100]
         metrics = verify.latency_metrics(times, sample_limit=4)
