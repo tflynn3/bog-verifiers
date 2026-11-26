@@ -29,6 +29,10 @@ the documented WAL and commit marker.
   missing flag marks its own suite as skipped with `coverage: unavailable`
   in `BOG_RESULT`. The existing query, ingest, pagination, and recovery
   suites still run.
+- Set `SLIPWAY_PARAM_REQUIRE_RESTORED_IMAGE_GUARD=1` on the candidate
+  verification step for the restored-image guard. With the parameter unset,
+  the startup suite records a skip if every image probe reaches HTTP bind,
+  the behavior of candidates that predate the guard.
 - With the same candidate inputs, use `--full`, `--compare`, or
   `SLIPWAY_PARAM_MODE=full` or `compare` for the paired post-cycle matrix and
   WAL handoffs against `4ff49aae9672cf5aec8e3fbd20ffe0a84ae15bc0`.
@@ -102,6 +106,11 @@ the documented WAL and commit marker.
   suffixes, and startup refusal for committed corruption or invalid markers
   with file preservation. The default gate also covers exclusive directory
   locking and concurrent ENOSPC rejections.
+- The startup suite checks an empty store, crash recovery of acknowledged
+  rows, and the same legacy WAL with a valid v1 offline checkpoint. Restored,
+  mixed, and single-marker layouts must exit with an operator-facing remedy
+  before attempting to bind HTTP, preserving the file inventory and SHA-256
+  digests.
 - The Linux log replay builds 65,573 rows per run from seeded selections of
   captured Apache access, Git daemon, and multiline application logs, and
   authored syslog messages. It uses fresh stores for steady and shuffled

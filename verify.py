@@ -149,12 +149,14 @@ def decode_rows(body):
 class Bog:
     """Public CLI and HTTP binding used by every workload."""
 
-    def __init__(self, binary, directory, log_path, *, flags=()):
+    def __init__(self, binary, directory, log_path, *, flags=(), port=None):
         directory.mkdir(exist_ok=True)
         self.directory_name = directory.name
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            self.port = probe.getsockname()[1]
+        if port is None:
+            with socket.socket() as probe:
+                probe.bind(("127.0.0.1", 0))
+                port = probe.getsockname()[1]
+        self.port = port
         self.log_path = log_path
         self.started = time.monotonic()
         with log_path.open("wb") as log:
@@ -338,14 +340,14 @@ def query_target(args):
 
 
 @contextlib.contextmanager
-def run_bog(binary, directory, *, ready=True, flags=()):
+def run_bog(binary, directory, *, ready=True, flags=(), port=None):
     log_dir, cases = PROCESS_LOGS.get()
     path = log_dir / f"bog-{len(cases):02d}.log"
     case = {"store": directory.name, "log": str(path.relative_to(log_dir.parent)),
             "expected_ready": ready}
     cases.append(case)
     try:
-        bog = Bog(binary, directory, path, flags=flags)
+        bog = Bog(binary, directory, path, flags=flags, port=port)
         try:
             bog.startup_seconds = bog.wait_startup(ready)
             case["ready_ms"] = milliseconds(bog.startup_seconds) if ready else None
@@ -1440,6 +1442,106 @@ def wal_frame(payload):
     return header + struct.pack("<I", crc32c(header)) + payload
 
 
+def startup_image_files(covered_wal, tail, row):
+    """Encode one covered row and a committed suffix in the documented v1 formats."""
+    seconds, nanos = divmod(row.ns, SECOND)
+    timestamp = struct.pack("<qI", int(EPOCH.timestamp()) + seconds, nanos)
+    line = row.line.encode()
+    payload = timestamp + struct.pack("<QI", 0, len(line)) + line
+    header = struct.pack("<III", 1, 1, len(payload)) + timestamp * 2
+    header += struct.pack("<I", crc32c(payload))
+    segment = header + struct.pack("<I", crc32c(header)) + payload
+    segment_name = "bog-segment-" + "0" * 32
+    manifest = json.dumps({
+        "version": 1, "source_sha256": hashlib.sha256(covered_wal).hexdigest(),
+        "covered_offset": len(covered_wal), "next_ordinal": 1,
+        "segments": [{"name": segment_name, "size": len(segment),
+                      "sha256": hashlib.sha256(segment).hexdigest()}],
+    }).encode()
+    manifest_digest = hashlib.sha256(manifest)
+    checkpoint = {
+        segment_name: segment,
+        "bog.checkpoint": b'{"payload":' + manifest + b',"sha256":"' + manifest_digest.hexdigest().encode() + b'"}',
+    }
+    metadata = b"BOGBAK01" + manifest_digest.digest()
+    metadata += struct.pack("<QQQ", len(covered_wal), 1, len(covered_wal) + len(tail))
+    metadata += hashlib.sha256(tail).digest()
+    return checkpoint, {
+        **checkpoint, "bog.backup": metadata + hashlib.sha256(metadata).digest(), "bog.wal.tail": tail,
+    }
+
+
+def restored_startup_suite(binary, directory):
+    if sys.platform != "linux":
+        raise InfrastructureError("restored-image startup requires Linux")
+
+    directory.mkdir()
+    legacy = directory / "legacy"
+    covered = Row(2, "acknowledged checkpoint row")
+    tail = [Row(1, "acknowledged backfill"), Row(2, "acknowledged tie")]
+    with run_bog(binary, legacy) as bog:
+        expect_query(bog, [], 0, 3, label="fresh startup")
+        bog.ingest([covered])
+        prefix = data_files(legacy)["bog.wal"]
+        bog.ingest(tail)
+        bog.kill()
+    committed = data_files(legacy)
+    wal = committed["bog.wal"]
+    check(wal.startswith(prefix) and len(wal) > len(prefix), "legacy WAL lost its acknowledged prefix")
+    with run_bog(binary, legacy) as bog:
+        expect_query(bog, [covered, *tail], 0, 3, label="legacy startup")
+
+    checkpoint, restored = startup_image_files(prefix, wal[len(prefix):], covered)
+    checkpointed = directory / "legacy-with-checkpoint"
+    write_data_copy(checkpointed, {**committed, **checkpoint})
+    with run_bog(binary, checkpointed) as bog:
+        expect_query(bog, [covered, *tail], 0, 3, label="legacy startup with offline checkpoint")
+
+    # An occupied port makes the order observable even if the process exits
+    # too quickly for a readiness probe to see a transient listener.
+    probes = []
+    mixed = {**committed, **restored, "bog.wal": wal + b"uncommitted suffix"}
+    staged = {".bog-wal-init-" + "1" * 32: WAL_MAGIC}
+    with socket.socket() as occupied:
+        occupied.bind(("127.0.0.1", 0))
+        port = occupied.getsockname()[1]
+        for label, files in (
+            ("restored", restored),
+            ("mixed-layout", mixed),
+            ("backup-marker-only", {"bog.backup": restored["bog.backup"], **staged}),
+            ("wal-tail-only", {"bog.wal.tail": restored["bog.wal.tail"], **staged}),
+        ):
+            case = directory / label
+            write_data_copy(case, files)
+            with run_bog(binary, case, ready=False, port=port) as bog:
+                message = bog.log_tail().replace(str(case), "<data-dir>")
+            reached_bind = "bind: address already in use" in message.lower()
+            probes.append((case, files, message, reached_bind))
+
+    if (os.environ.get("SLIPWAY_PARAM_REQUIRE_RESTORED_IMAGE_GUARD") != "1"
+            and all(reached_bind for _, _, _, reached_bind in probes)):
+        return SuiteSkipped("restored-image guard unavailable: all image layouts reached HTTP bind")
+
+    failures = []
+    for case, files, message, reached_bind in probes:
+        if reached_bind:
+            failures.append(f"{case.name}: startup reached HTTP bind before refusing the image")
+        elif not (re.search(r"restored|mixed|bog\.(?:backup|wal\.tail)", message, re.I)
+                  and re.search(r"offline|separate.*director|clean directory|empty directory|restore into|"
+                                r"move .*director|use .*director", message, re.I)):
+            failures.append(f"{case.name}: expected an actionable image diagnostic before bind, got {message}")
+        paths = {path.name: path for path in case.iterdir()}
+        if paths.keys() != files.keys():
+            added = sorted(paths.keys() - files.keys())
+            removed = sorted(files.keys() - paths.keys())
+            failures.append(f"{case.name}: startup changed inventory (added {added}, removed {removed})")
+        for name in sorted(paths.keys() & files.keys()):
+            path = paths[name]
+            if path.is_symlink() or not path.is_file() or file_sha256(path) != hashlib.sha256(files[name]).hexdigest():
+                failures.append(f"{case.name}: startup changed {name}")
+    check(not failures, "; ".join(failures))
+
+
 def historical_surrogate_suite(binary, directory):
     fresh = Row(3, "durable append after historical replay")
     with run_bog(binary, directory) as bog:
@@ -2510,6 +2612,7 @@ SUITES = (
     ("directory-lock", lock_suite),
     ("kill-durability", durability_suite),
     ("wal-recovery", recovery_suite),
+    ("restored-image-startup", restored_startup_suite),
     ("historical-surrogates", historical_surrogate_suite),
     ("enospc-recovery", enospc_suite),
     ("performance-smoke", performance_suite),
@@ -2527,6 +2630,7 @@ REQUIRED_SUITES = (
     "directory-lock",
     "kill-durability",
     "wal-recovery",
+    "restored-image-startup",
     "historical-surrogates",
     "enospc-recovery",
     "performance-smoke",
