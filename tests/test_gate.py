@@ -11,6 +11,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import verify
+from release_gate import (FIXTURE_ROOT_CLEANUP, record_fixture_root_cleanup, validate_budget_trials,
+                          validate_durability)
 
 README_ONLY = "7655ed627bccad30700b8de4b6f47c8d7d5d8579"
 
@@ -41,6 +43,48 @@ def buildable_candidate(root):
 
 
 class GateTest(unittest.TestCase):
+    def test_fixed_budget_trials_require_each_issued_cursor_to_exhaust(self):
+        trials = [dict(budget=3, outcome="exhausted", pages=3, rows=4),
+                  dict(budget=1, outcome="clean_rejection", pages=0, rows=0),
+                  dict(budget=2, outcome="exhausted", pages=3, rows=4)]
+        report = {"exact_threshold_budget": 2, "rejected_budgets": 1, "probes": trials}
+        validate_budget_trials(report, "sparse", 4, 2)
+        trials[0].update(outcome="issued_cursor", pages=1, rows=2)
+        with self.assertRaisesRegex(verify.Rejected, "incomplete sparse walk at budget 3"):
+            validate_budget_trials(report, "sparse", 4, 2)
+
+    def test_release_cleanup_is_additive_but_required_for_a_new_run(self):
+        healthy = {"readiness_status": 200, "readiness_reason": "ready", "ingest_status": 204,
+                   "replayed_after_restart": True}
+        full = {"readiness_status": 503, "readiness_reason": "low_disk_headroom", "ingest_status": 503,
+                "post_ingest_reason": "wal_rollback", "post_ingest_category": "enospc"}
+        identity = {"schema_version": 1, "revision": "a" * 40, "binary_sha256": "b" * 64,
+                    "fixture": "linux-release-v1"}
+        cases = {name: {"status": "pass", "evidence": {"stale_cursors_rejected": 1}}
+                 for name in ("sigkill", "recovery", "enospc")}
+        cases["enospc"]["evidence"].update(healthy_to_full=healthy, full_to_healthy=full)
+        with tempfile.TemporaryDirectory() as work:
+            directory = Path(work)
+            report = directory / "durability.json"
+            parent = directory / "fixtures"
+            report.write_text(json.dumps({**identity, "cases": cases}))
+            validate_durability(directory, identity)
+            with self.assertRaisesRegex(verify.Rejected, "missing required case fixture_root_cleanup"):
+                validate_durability(directory, identity, require_fixture_root_cleanup=True)
+
+            parent.mkdir()
+            record_fixture_root_cleanup(directory, identity, parent)
+            self.assertFalse(parent.exists())
+            validate_durability(directory, identity, require_fixture_root_cleanup=True)
+
+            parent.mkdir()
+            (parent / "leaked-root").mkdir()
+            with self.assertRaisesRegex(verify.Rejected, "fixture_root_cleanup did not pass"):
+                record_fixture_root_cleanup(directory, identity, parent)
+            self.assertEqual(json.loads(report.read_text())["cases"][FIXTURE_ROOT_CLEANUP]["status"], "fail")
+            with self.assertRaisesRegex(verify.Rejected, "fixture_root_cleanup did not pass"):
+                validate_durability(directory, identity)
+
     def test_missing_bounded_filesystem_blocks_both_enospc_suites(self):
         with tempfile.TemporaryDirectory() as directory:
             missing = str(Path(directory) / "missing-mount")

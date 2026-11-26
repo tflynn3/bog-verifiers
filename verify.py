@@ -45,6 +45,7 @@ NEXT_CURSOR = "Bog-Next-Cursor"
 QUERY_ADMISSION_FLAGS = {"query-limits": ("-query-work-budget", 32), "query-admission": ("-query-concurrency", 1)}
 QUERY_REJECTION_PROBES = ("ordinary", "first_page", "continuation")
 CAPACITY_FLAG = "-enable-capacity-control"
+RETAINED_TAIL_FLAG = "-retained-tail-max-bytes"
 CAPACITY_PATH = "/_capacity/compaction"
 MAX_FRAME = 4 * 1024 * 1024
 DEFAULT_QUERY_LIMIT = 500
@@ -826,21 +827,27 @@ def capacity_control_suite(binary, directory):
     with run_bog(binary, store, flags=(CAPACITY_FLAG,)) as bog:
         initial = state(bog, "GET", f"{CAPACITY_PATH}?action=status&cutoff=0")
         bog.ingest(rows)
+        args = query_args(0, SECOND)
+        expected = oracle(rows, 0, SECOND)
+        cursor = expect_page(bog, args, expected, 0, 1, None, "first page before compaction")
         published = state(bog, "POST", start_path)
         deadline = time.monotonic() + HTTP_TIMEOUT
         while published["state"] == "running" and time.monotonic() < deadline:
             time.sleep(0.02)
             published = state(bog, "GET", status_path)
-        check(published["state"] == "complete" and published["generation"] > initial["generation"] and
+        check(published["state"] == "complete" and published["generation"] == initial["generation"] + 1 and
               published["covered_rows"] == published["committed_rows"] == len(rows),
               f"capacity control did not publish the requested cutoff: {published!r}")
+        expect_walk(bog, args, expected, (1,), "held cursor after compaction", position=1, cursor=cursor)
         bog.kill()
     with run_bog(binary, store) as bog:
         hidden(bog)
+        expect_bad_query(bog, {**args, "cursor": cursor}, "pre-compaction cursor after restart")
         expect_query(bog, rows, 0, SECOND, label="ordinary query after compacted restart")
         expect_walk(bog, query_args(0, SECOND), oracle(rows, 0, SECOND), (1, 2),
                     "paged query after compacted restart")
     return {"default_http_status": 404, "wildcard_opt_in_exit": wildcard_exit,
+            "snapshot_rows": len(expected), "stale_cursor_rejected": True,
             "initial_generation": initial["generation"], "published": published, "restart_rows": len(rows)}
 
 
@@ -848,9 +855,9 @@ def query_admission_required():
     return os.environ.get("SLIPWAY_PARAM_REQUIRE_QUERY_ADMISSION") == "1"
 
 
-def query_flag_unavailable(binary, directory, suite):
+def query_flag_unavailable(binary, directory, suite, *, flags=None):
     flag, _ = QUERY_ADMISSION_FLAGS[suite]
-    if flag in advertised_flags(binary, directory):
+    if flag in (advertised_flags(binary, directory) if flags is None else flags):
         return None
     reason = f"admission coverage unavailable: Bog -help does not list {flag}"
     check(not query_admission_required(), f"{reason}; required for #19 verification")
@@ -858,7 +865,8 @@ def query_flag_unavailable(binary, directory, suite):
 
 
 def query_limits_suite(binary, directory):
-    unavailable = query_flag_unavailable(binary, directory, "query-limits")
+    flags = advertised_flags(binary, directory)
+    unavailable = query_flag_unavailable(binary, directory, "query-limits", flags=flags)
     if unavailable:
         return unavailable
 
@@ -872,6 +880,16 @@ def query_limits_suite(binary, directory):
     args = query_args(0, last.ns + 1, "@")
     with run_bog(binary, directory / "work-budget", flags=(f"{flag}={budget}",)) as bog:
         bog.ingest([first, second, *gap, last])
+        if RETAINED_TAIL_FLAG in flags:
+            rejections = {
+                "ordinary": expect_query_error(bog, {**args, "limit": 3}, 503,
+                                               "ordinary query exceeds work budget"),
+                "first_page": expect_query_error(bog, {**args, "limit": 2, "page": "1"}, 503,
+                                                 "first page cannot certify the sparse walk"),
+                "uncertifiable_first_page": expect_query_error(bog, {**args, "limit": 1, "page": "1"}, 503,
+                                                               "first page must certify its continuation"),
+            }
+            return {"flag": flag, "flag_value": budget, "rejections": rejections}
         expect_rows(bog.query(0, second.ns + 1, "@", limit=2), [first, second],
                     "ordinary query fits the work budget")
         cursor = expect_page(bog, args, [first, second, last], 0, 1, None, "first page fits budget")
@@ -2716,6 +2734,10 @@ def require_query_admission_metrics(name, metrics):
     if name == "query-admission":
         expected.update(ingest_during_saturation="passed", snapshot_after_disconnect="passed",
                         backfill_after_restart="passed")
+    if metrics == expected:
+        return
+    if name == "query-limits":
+        expected["rejections"]["uncertifiable_first_page"] = expected["rejections"].pop("continuation")
     check(metrics == expected, f"#19 {name} report is missing or mismatched")
 
 

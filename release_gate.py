@@ -15,6 +15,7 @@ SEED_ROWS = {196_608, 393_216}
 TAIL_ROWS = 2_048
 BATCH_ROWS = 64
 PRODUCERS = {"admission", "durability", "capacity", "parity"}
+FIXTURE_ROOT_CLEANUP = "fixture_root_cleanup"
 
 
 def identity(binary, revision, fixture):
@@ -23,7 +24,7 @@ def identity(binary, revision, fixture):
             "fixture": fixture}
 
 
-def case_evidence(directory, producer, name, expected):
+def read_report(directory, producer, expected):
     with (directory / f"{producer}.json").open() as stream:
         report = json.load(stream, object_pairs_hook=unique_fields)
     for key, value in expected.items():
@@ -31,9 +32,18 @@ def case_evidence(directory, producer, name, expected):
               f"{producer}: mismatched {key}")
     if producer == "capacity":
         check(report.get("mode") == "live", "capacity: live mode is required")
+    return report
+
+
+def passing_case(report, producer, name):
+    check(name in report["cases"], f"{producer}: missing required case {name}")
     case = report["cases"][name]
     check(case["status"] == "pass", f"{producer}: {name} did not pass")
-    return case["evidence"]
+    return case
+
+
+def case_evidence(directory, producer, name, expected):
+    return passing_case(read_report(directory, producer, expected), producer, name)["evidence"]
 
 
 def integer(value, low, high=None):
@@ -101,20 +111,44 @@ def validate_capacity(evidence):
               cleanup.get("detail", "") == "", f"{label}: incomplete process or cgroup cleanup")
 
 
+def validate_budget_trials(walk, name, rows, budget):
+    probes = walk["probes"]
+    check(isinstance(probes, list) and probes and integer(walk.get("exact_threshold_budget"), budget, budget),
+          f"admission: missing {name} exact budget threshold")
+    observed = {}
+    for probe in probes:
+        trial = probe.get("budget")
+        check(integer(trial, 1, 2048) and trial not in observed and "failure" not in probe,
+              f"admission: invalid {name} budget trial")
+        observed[trial] = probe.get("outcome")
+        outcome, pages, count = ("clean_rejection", 0, 0) if trial < budget else ("exhausted", 3, rows)
+        check(observed[trial] == outcome and integer(probe.get("pages"), pages, pages) and
+              integer(probe.get("rows"), count, count), f"admission: incomplete {name} walk at budget {trial}")
+    check(observed.get(budget) == "exhausted" and (budget == 1 or observed.get(budget - 1) == "clean_rejection") and
+          sum(trial < budget for trial in observed) == walk["rejected_budgets"],
+          f"admission: unproven {name} budget boundary")
+
+
 def validate_budget(evidence):
     check(integer(evidence.get("http_status"), 503, 503) and
           integer(evidence.get("ndjson_rows"), 0, 0) and evidence.get("next_cursor") is False and
-          evidence.get("framed_budget_rejection") is True and
           integer(evidence.get("elapsed_ms"), 0, 1999), "admission: incomplete work budget rejection")
     tied = evidence["fixed_budget_walk"]
     sparse = tied["sparse_walk"]
+    trial_report = "probes" in tied or "probes" in sparse
+    check(evidence.get("framed_budget_rejection", trial_report) is True,
+          "admission: missing framed work budget rejection")
     for name, walk, rows in (("tied", tied, 3), ("sparse", sparse, 4)):
         budget = walk.get("first_cursor_budget")
         check(integer(budget, 2, 2048) and integer(walk.get("rejected_budgets"), 1, budget - 1) and
-              integer(walk.get("rows"), rows, rows) and integer(walk.get("pages"), 3, 3) and
-              integer(walk.get("continuation_pages"), 2, 2) and walk.get("terminal") is True and
-              "issuance_failure" not in walk and "continuation_failure" not in walk,
+              integer(walk.get("rows"), rows, rows) and integer(walk.get("pages"), 3, 3) and not
+              {"issuance_failure", "continuation_failure", "first_failure", "first_broken_continuation"} & walk.keys(),
               f"admission: incomplete {name} fixed-budget walk")
+        if trial_report:
+            validate_budget_trials(walk, name, rows, budget)
+        else:
+            check(integer(walk.get("continuation_pages"), 2, 2) and walk.get("terminal") is True,
+                  f"admission: incomplete {name} continuation evidence")
     check(tied["rejected_budgets"] == tied["first_cursor_budget"] - 1 and
           all(integer(sparse.get(key), value, value) for key, value in
               {"response_byte_cap": 96, "first_limit": 4, "first_rows": 2, "resume_limit": 1}.items()),
@@ -135,6 +169,15 @@ def validate_parity(evidence):
 
     check(integer(evidence.get("unpaged_checks"), 4, 4) and evidence.get("stale_cursor_rejected") is True,
           "parity: missing unpaged or prior-process cursor evidence")
+    if "legacy_restart_rows" in evidence:
+        check(integer(evidence["legacy_restart_rows"], 7, 7), "parity: incomplete legacy WAL restart")
+    if "backup_compare" in evidence:
+        compare = evidence["backup_compare"]
+        check(integer(compare.get("default_rows"), 6, 6) and type(compare.get("page_ceiling_advertised")) is bool,
+              "parity: incomplete default backup comparison")
+        if compare["page_ceiling_advertised"]:
+            check(integer(compare.get("bounded_rows"), 6, 6) and integer(compare.get("low_cap_exit"), 4, 4),
+                  "parity: incomplete bounded backup comparison")
     resource = evidence["retained_resource_admission"]
     check(resource["status"] == "pass" and integer(resource.get("limit_bytes"), 1) and
           integer(resource.get("rejected_http_status"), 503, 503) and
@@ -154,9 +197,12 @@ def validate_parity(evidence):
           "parity: incomplete restored generation replacement or snapshot evidence")
 
 
-def validate_durability(directory, expected):
+def validate_durability(directory, expected, *, require_fixture_root_cleanup=False):
+    report = read_report(directory, "durability", expected)
+    if require_fixture_root_cleanup or FIXTURE_ROOT_CLEANUP in report["cases"]:
+        passing_case(report, "durability", FIXTURE_ROOT_CLEANUP)
     for name in ("sigkill", "recovery", "enospc"):
-        proof = case_evidence(directory, "durability", name, expected)
+        proof = passing_case(report, "durability", name)["evidence"]
         check(integer(proof.get("stale_cursors_rejected"), 1), f"durability: {name} lacks prior-process cursor evidence")
     healthy = proof["healthy_to_full"]
     full = proof["full_to_healthy"]
@@ -167,13 +213,30 @@ def validate_durability(directory, expected):
           full.get("post_ingest_category") == "enospc", "durability: incomplete active-filesystem retarget evidence")
 
 
-def validate(directory, expected):
+def record_fixture_root_cleanup(directory, expected, parent):
+    report = read_report(directory, "durability", expected)
+    cases = report["cases"]
+    if FIXTURE_ROOT_CLEANUP in cases:
+        passing_case(report, "durability", FIXTURE_ROOT_CLEANUP)
+    # rmdir checks that the producer removed its fixture tree without traversing
+    # a leftover mount or erasing evidence of a leak.
+    try:
+        parent.rmdir()
+    except OSError as exc:
+        cases[FIXTURE_ROOT_CLEANUP] = {"status": "fail", "detail": str(exc)}
+    else:
+        cases.setdefault(FIXTURE_ROOT_CLEANUP, {"status": "pass"})
+    (directory / "durability.json").write_text(json.dumps(report, indent=2) + "\n")
+    passing_case(report, "durability", FIXTURE_ROOT_CLEANUP)
+
+
+def validate(directory, expected, *, require_fixture_root_cleanup=False):
     statuses = (directory / "producers.txt").read_text().splitlines()
     check(len(statuses) == len(PRODUCERS) and
           set(statuses) == {f"{name} revision={expected['revision']} exit=0" for name in PRODUCERS},
           "missing, repeated or failing release producer status")
     validate_budget(case_evidence(directory, "admission", "work_budget", expected))
-    validate_durability(directory, expected)
+    validate_durability(directory, expected, require_fixture_root_cleanup=require_fixture_root_cleanup)
     validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected))
     validate_parity(case_evidence(directory, "parity", "restored_parity", expected))
     control = case_evidence(directory, "control", "capacity_control", expected)
@@ -183,6 +246,9 @@ def validate(directory, expected):
           integer(published["generation"], control["initial_generation"] + 1) and
           integer(published["covered_rows"], 3, 3) and integer(published["committed_rows"], 3, 3) and
           integer(control["restart_rows"], 3, 3), "control: incomplete loopback or restart evidence")
+    if "snapshot_rows" in control or "stale_cursor_rejected" in control:
+        check(integer(control.get("snapshot_rows"), 3, 3) and control.get("stale_cursor_rejected") is True,
+              "control: incomplete cursor evidence across compaction and restart")
 
 
 def produce_control(binary, directory, expected):
@@ -205,12 +271,14 @@ def produce_control(binary, directory, expected):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("control", "validate"))
+    parser.add_argument("action", choices=("control", "record-cleanup", "validate"))
     parser.add_argument("binary", type=Path)
     parser.add_argument("revision")
     parser.add_argument("fixture")
     parser.add_argument("directory", type=Path)
     parser.add_argument("--arch", choices=("amd64", "arm64"))
+    parser.add_argument("--fixture-parent", type=Path)
+    parser.add_argument("--require-fixture-root-cleanup", action="store_true")
     args = parser.parse_args()
     try:
         directory = args.directory.resolve()
@@ -218,6 +286,9 @@ def main():
         expected = identity(binary, args.revision, args.fixture)
         if args.action == "control":
             produce_control(binary, directory, expected)
+        elif args.action == "record-cleanup":
+            check(args.fixture_parent is not None, "durability fixture parent is required")
+            record_fixture_root_cleanup(directory, expected, args.fixture_parent)
         else:
             check(args.arch is not None, "native architecture is required")
             # Check the ELF machine independently of the runner label and reports.
@@ -226,7 +297,7 @@ def main():
             machine = {"amd64": 62, "arm64": 183}[args.arch]
             check(header[:6] == b"\x7fELF\x02\x01" and int.from_bytes(header[18:20], "little") == machine,
                   f"candidate binary is not Linux {args.arch}")
-            validate(directory, expected)
+            validate(directory, expected, require_fixture_root_cleanup=args.require_fixture_root_cleanup)
             (directory / "qualified.json").write_text(json.dumps({**expected, "arch": args.arch}) + "\n")
     except (Rejected, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         parser.exit(1, f"release evidence: {exc}\n")

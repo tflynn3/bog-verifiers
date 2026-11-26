@@ -70,7 +70,9 @@ the documented WAL and commit marker.
   express the same bounds in different time zones.
 - The work budget suite sets `-query-work-budget=32` when advertised and
   checks HTTP 503 without rows or `Bog-Next-Cursor` for ordinary scans and
-  for lookahead on first pages and continuations.
+  for lookahead on first pages and continuations. When candidate help
+  advertises `-retained-tail-max-bytes`, the suite requires the sparse
+  first page to reject before issuing an uncertifiable cursor.
 - The admission suite independently detects `-query-concurrency` and sets it
   to 1. An unread response holds the slot through TCP backpressure. Ordinary
   queries, first pages, and continuations must return HTTP 503 within two
@@ -232,25 +234,31 @@ binary digests. The `linux-release-evidence-amd64` and
 `linux-release-evidence-arm64` artifacts contain the reports, build metadata,
 digests, and logs.
 
-The workflow reuses the Bog checkout's production-client paging probe and
-Linux durability producer. Budget-1 exhaustion, tied rows, and a sparse
+The workflow runs the candidate checkout's #70 production-client paging
+probe and #53 Linux durability producer. Budget-1 exhaustion, tied rows, and a sparse
 byte-trimmed walk must return the expected framed responses. A cursor issued
 at a fixed budget must reach terminal exhaustion at the same budget. The
 walk reports keep schema version 1 and add the observed failure page,
 budget, HTTP status, and diagnostic for unexpected issuance or continuation
 failures. The durability report must demonstrate prior-process cursor
 rejection and verify readiness and ingest in both filesystem retarget
-directions.
+directions. The native workflow checks that the producer removed its fixture
+root and records `fixture_root_cleanup` in the schema v1 durability report.
+New native qualifications require that case to pass. Historical reports may
+omit it, and an explicit cleanup failure rejects either report format.
 
 The capacity producer must show live generation replacement with an
 acknowledged backfill, the original cursor's terminal walk, a fresh query,
 and full restart recovery at 196,608 and 393,216 seed rows under the 128 MiB
 cgroup limit. Each fixture requires successful process and cgroup cleanup.
 
-Restored parity checks legacy WAL replay, then removes the original data and
+Restored parity checks legacy WAL replay, append, and restart, then removes the original data and
 bundle and starts the candidate on the verified v1 restore. Ordinary queries
 and framed cursor walks check restored rows, a durable append, and exact
-restart parity. The resource probe discovers `-retained-tail-max-bytes` in
+restart parity. When the operator CLI is available, a separate restored copy
+serves the default backup comparison. If `compare -help` advertises `-max-pages`,
+the comparison must also finish at the exact page ceiling and report an
+incomplete comparison at a lower ceiling. The resource probe discovers `-retained-tail-max-bytes` in
 candidate help. This release probe requires the composed runtime to expose
 that flag as a byte limit for uncovered WAL frames. At the restored tail
 limit, Bog must reject a whole two-row batch with HTTP 503, preserve the WAL
@@ -266,5 +274,6 @@ object under schema version 1.
 
 The resource and replacement probes discover their flags in candidate help.
 Missing flags skip the corresponding probe. The short Slipway capacity
-suite also discovers `-enable-capacity-control` before running. The manually
+suite also discovers `-enable-capacity-control` before running, then checks
+that a held cursor survives compaction and expires after restart. The manually
 dispatched release gate requires passing evidence from both probes.

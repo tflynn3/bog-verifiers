@@ -78,8 +78,8 @@ jobs:
 
       - name: Record fixture configuration
         run: |
-          cp gate/verify/release/README.md "$EVIDENCE/fixture.md"
-          cp gate/verify/linux/README.md "$EVIDENCE/durability-fixture.md"
+          cp candidate/verify/release/README.md "$EVIDENCE/fixture.md"
+          cp candidate/verify/linux/README.md "$EVIDENCE/durability-fixture.md"
           cp gate/bench/retained-history/README.md "$EVIDENCE/capacity-fixture.md"
           cp verifiers/release/*.patch "$EVIDENCE/"
           printf 'tooling_revision=%s\nverifier_revision=%s\n' "$(git -C gate rev-parse HEAD)" \
@@ -134,12 +134,20 @@ jobs:
             fi
           }
           admission() (
-            cd gate || exit
+            cd candidate || exit
             timeout --kill-after=5s 2m go run ./verify/release "${common[@]}" -report "$EVIDENCE/admission.json"
           )
           durability() (
-            cd gate || exit
-            timeout --kill-after=5s 15m go run ./verify/linux "${common[@]}" -report "$EVIDENCE/durability.json"
+            local parent producer status=0 cleanup_status=0
+            producer="$RUNNER_TEMP/bog-durability-producer"
+            (cd candidate && go build -trimpath -o "$producer" ./verify/linux) || exit
+            parent=$(mktemp -d "$RUNNER_TEMP/bog-durability.XXXXXXXX") || exit
+            TMPDIR="$parent" timeout --kill-after=5s 15m "$producer" "${common[@]}" \
+              -report "$EVIDENCE/durability.json" || status=$?
+            python3 -B verifiers/release_gate.py record-cleanup "$BINARY" "$REVISION" "$FIXTURE" \
+              "$EVIDENCE" --fixture-parent "$parent" || cleanup_status=$?
+            if (( status != 0 )); then exit "$status"; fi
+            exit "$cleanup_status"
           )
           capacity() (
             control_status=0
@@ -178,6 +186,11 @@ jobs:
             exit "$control_status"
           )
           parity() (
+            unset BOG_RELEASE_OPERATOR
+            if [[ -d candidate/cmd/bog-verify ]]; then
+              export BOG_RELEASE_OPERATOR="$RUNNER_TEMP/bog-release-operator"
+              (cd candidate && go build -trimpath -o "$BOG_RELEASE_OPERATOR" ./cmd/bog-verify) || exit
+            fi
             cd gate || exit
             export BOG_RELEASE_BINARY="$BINARY" BOG_RELEASE_REVISION="$REVISION" BOG_RELEASE_FIXTURE="$FIXTURE"
             export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/parity.json"
@@ -205,7 +218,7 @@ jobs:
               -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
             if (( failed != 0 )); then exit "$failed"; fi
             python3 -B "$GITHUB_WORKSPACE/verifiers/release_gate.py" validate \
-              "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --arch "$RELEASE_ARCH"
+              "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --arch "$RELEASE_ARCH" --require-fixture-root-cleanup
           } 2>&1 | tee "$EVIDENCE/validation.log"
 
       - name: Race-test release verifier lifecycle
@@ -216,8 +229,8 @@ jobs:
           CGO_ENABLED: '1'
         run: |
           {
-            (cd ../candidate && go test -race -count=1 ./internal/archtest) || exit 1
-            go test -race -count=1 ./verify/linux ./verify/release ./verify/query-model ./bench/retained-history
+            (cd ../candidate && go test -race -count=1 ./internal/archtest ./verify/linux ./verify/release) || exit 1
+            go test -race -count=1 ./verify/release ./verify/query-model ./bench/retained-history
           } 2>&1 | tee "$EVIDENCE/verifier-race.log"
 
       - name: Publish release evidence
