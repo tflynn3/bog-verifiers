@@ -2631,6 +2631,9 @@ def suite_plan(suites, profile):
     return suites
 
 
+BUILD_TIMEOUT_SECONDS = int(os.environ.get("BOG_VERIFY_BUILD_TIMEOUT", "300"))
+
+
 def build(source, work, log):
     binary = work / "bog"
     log.touch()
@@ -2639,10 +2642,12 @@ def build(source, work, log):
         with log.open("wb") as output:
             completed = subprocess.run(
                 ["go", "build", "-mod=readonly", "-trimpath", "-o", str(binary), "./cmd/bog"], cwd=source,
-                stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, timeout=120,
+                stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, timeout=BUILD_TIMEOUT_SECONDS,
             )
     except subprocess.TimeoutExpired as exc:
-        raise Rejected("go build ./cmd/bog timed out after 120s") from exc
+        # A slow build means a loaded or cold runner, not a defect in the candidate.
+        # Rejecting here sent builders off to "fix" code that was fine.
+        raise InfrastructureError(f"go build ./cmd/bog timed out after {BUILD_TIMEOUT_SECONDS}s") from exc
     if completed.returncode:
         tail = " ".join(log_tail(log, 1200).split())
         raise Rejected(f"go build ./cmd/bog failed (status {completed.returncode}): {tail}")
@@ -2813,6 +2818,13 @@ def main(source, work, sha, profile="pr"):
             suite.update(status="blocked", diagnostic="build prerequisite failed")
         finish("rejected", f"build: {reason}")
         return reject(work, sha, "build", 0, reason)
+    except InfrastructureError as exc:
+        reason = diagnostic(exc)
+        result["build"].update(status="infra_error", diagnostic=reason)
+        for suite in result["suites"]:
+            suite.update(status="blocked", diagnostic="build prerequisite failed")
+        finish("infra_error", f"build: {reason}")
+        return 2
     finally:
         if build_log.exists():
             print("BOG_BUILD " + json.dumps({"role": "candidate", "sha": sha, "log_tail": log_tail(build_log, 4096)}))
