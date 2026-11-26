@@ -14,7 +14,7 @@ MEMORY_LIMIT = 128 * 1024**2
 SEED_ROWS = {196_608, 393_216}
 TAIL_ROWS = 2_048
 BATCH_ROWS = 64
-PRODUCERS = {"admission", "durability", "capacity", "parity", "control"}
+PRODUCERS = {"admission", "durability", "capacity", "parity"}
 
 
 def identity(binary, revision, fixture):
@@ -89,6 +89,18 @@ def validate_capacity(evidence):
               cleanup.get("detail", "") == "", f"{label}: incomplete process or cgroup cleanup")
 
 
+def validate_budget(evidence):
+    check(integer(evidence.get("http_status"), 503, 503) and
+          integer(evidence.get("ndjson_rows"), 0, 0) and evidence.get("next_cursor") is False and
+          integer(evidence.get("elapsed_ms"), 0, 1999), "admission: incomplete work budget rejection")
+    fixed = evidence["fixed_budget_pagination"]
+    budget = fixed.get("budget")
+    check(integer(budget, 2, 16_384) and integer(fixed.get("rejected_budget"), budget - 1, budget - 1) and
+          integer(fixed.get("rejected_http_status"), 503, 503) and integer(fixed.get("first_rows"), 1, 1) and
+          integer(fixed.get("resumed_rows"), 1, 1) and fixed.get("terminal") is True,
+          "admission: missing measured cursor budget or terminal continuation")
+
+
 def validate_parity(evidence):
     point = evidence["verified_point"]
     generation = point["Generation"]
@@ -101,12 +113,17 @@ def validate_parity(evidence):
           evidence["post_restore_204"] is True and integer(evidence["appended_rows"], 7, 7) and
           integer(evidence["restart_rows"], 7, 7), "parity: incomplete restore, ingest or restart evidence")
 
+    terminal = evidence["terminal_walks"]
+    check(all(integer(terminal.get(stage), 9, 9) for stage in ("legacy", "restored", "appended", "restart")),
+          "parity: incomplete terminal walks")
+
 
 def validate(directory, expected):
     statuses = (directory / "producers.txt").read_text().splitlines()
     check(len(statuses) == len(PRODUCERS) and
           set(statuses) == {f"{name} revision={expected['revision']} exit=0" for name in PRODUCERS},
           "missing, repeated or failing release producer status")
+    validate_budget(case_evidence(directory, "admission", "work_budget", expected))
     validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected))
     validate_parity(case_evidence(directory, "parity", "restored_parity", expected))
     control = case_evidence(directory, "control", "capacity_control", expected)

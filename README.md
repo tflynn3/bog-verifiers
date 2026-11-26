@@ -223,15 +223,20 @@ Run harness regressions with `python3 -B -m unittest discover -s tests -v`.
 
 ## Linux release qualification for #53
 
-Dispatch **Linux release verification** in this repository with the full
-integrated Bog revision. The workflow builds one clean Linux amd64 executable
-and passes it to the admission, durability, capacity, restored parity, and
-capacity control producers. It applies the capacity launcher and restored
-parity patches in the pinned tooling checkout. Download
-`linux-release-evidence` for the fixture and tooling
-revisions, candidate revision and binary SHA-256, reports, exit statuses, and logs.
-The admission, durability, capacity, and restored parity reports must pass for
-`linux-release-v1` and carry the same full candidate revision and binary SHA-256.
+Dispatch **Linux release verification** from the verifier ref containing these
+gate updates. Supply the full Bog commit SHA with the composed runtime and
+capacity changes. The workflow applies the verifier patches to a separate
+pinned gate checkout and builds one clean Linux amd64 candidate binary. The
+admission, durability, live capacity, and restored parity producers must all
+pass for fixture `linux-release-v1` with schema version 1 and the same candidate
+revision and binary SHA-256. The capacity stage also keeps its loopback control
+report. Download `linux-release-evidence` for the checkout revisions, build
+identity, reports, producer statuses, and logs.
+
+The admission report preserves the existing saturation and work-budget
+rejections. Its `work_budget` case also records the measured budget for a
+one-row first page, a clean HTTP 503 one unit below it, and a full terminal
+continuation at the same fixed budget.
 
 The capacity report must show both 196,608 and 393,216 retained rows under a
 128 MiB cgroup memory limit, exact recovery after restart, a published
@@ -240,8 +245,8 @@ fixture. The cleanup evidence records candidate reaping, an empty cgroup subtree
 and its removal. The restored parity producer checks legacy startup, then
 starts the candidate on a verified v1 restore after removing the legacy source
 and backup bundle. It uses `verify/query-model` for exact ordered rows and
-checks terminal pages before the append, after its HTTP 204, and after SIGKILL
-and restart.
+records nine terminal walks per stage, including before the append, after
+HTTP 204, and after SIGKILL and restart.
 
 The short Slipway capacity control suite runs when Bog advertises
 `-enable-capacity-control`. It checks that the control is absent by default,

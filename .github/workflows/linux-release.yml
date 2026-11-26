@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       revision:
-        description: Full lowercase commit SHA to qualify
+        description: Full lowercase commit SHA containing the composed runtime and capacity changes
         required: true
         type: string
 
@@ -48,6 +48,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           path: verifiers
           persist-credentials: false
 
@@ -73,6 +74,7 @@ jobs:
           cp verifiers/release/*.patch "$EVIDENCE/"
           printf 'tooling_revision=%s\nverifier_revision=%s\n' "$(git -C gate rev-parse HEAD)" \
             "$(git -C verifiers rev-parse HEAD)" | tee -a "$EVIDENCE/run.txt"
+          [[ "$(git -C verifiers rev-parse HEAD)" == "$GITHUB_SHA" ]]
           [[ "$(git -C gate rev-parse HEAD)" == "$TOOLING_REVISION" ]]
           git -C gate apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/*.patch
 
@@ -129,6 +131,9 @@ jobs:
             timeout --kill-after=5s 15m go run ./verify/linux "${common[@]}" -report "$EVIDENCE/durability.json"
           )
           capacity() (
+            control_status=0
+            python3 -B verifiers/release_gate.py control "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" \
+              2>&1 | tee "$EVIDENCE/control.log" || control_status=$?
             capacity_control_available || exit
             cd gate || exit
             work=$(mktemp -d "$RUNNER_TEMP/bog-capacity.XXXXXXXX") || exit
@@ -158,7 +163,8 @@ jobs:
                 } | tee "$evidence/capacity-runner.txt"
                 exec "$work/capacity" "$@" -mode live -cgroup-parent "$parent" \
                   -work-dir "$work" -report "$evidence/capacity.json"
-              ' capacity "$work" "$EVIDENCE" "${common[@]}"
+              ' capacity "$work" "$EVIDENCE" "${common[@]}" || exit
+            exit "$control_status"
           )
           parity() (
             cd gate || exit
@@ -166,11 +172,8 @@ jobs:
             export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/parity.json"
             timeout --kill-after=5s 3m go test -json -count=1 -run '^TestReleaseRestoredParity$' ./verify/release
           )
-          control() (
-            python3 -B verifiers/release_gate.py control "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE"
-          )
           failed=0
-          for name in admission durability capacity parity control; do
+          for name in admission durability capacity parity; do
             status=0
             "$name" 2>&1 | tee "$EVIDENCE/$name.log" || status=$?
             record "$name" "$status"
