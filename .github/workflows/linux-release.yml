@@ -18,12 +18,22 @@ env:
   CGO_ENABLED: '0'
   FIXTURE: linux-release-v1
   BOG_REPOSITORY: tflynn3/bog
-  TOOLING_REVISION: d06f31a4026eb5f46e56fe0040321a7b389fbea3
+  TOOLING_REVISION: abefdb5dcdc1f8bbbecdc9c0cc7ab39b309a87db
   REVISION: ${{ inputs.revision }}
 
 jobs:
   verify:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: amd64, runner: ubuntu-24.04, runner_arch: X64, machine: x86_64}
+          - {arch: arm64, runner: ubuntu-24.04-arm, runner_arch: ARM64, machine: aarch64}
+    runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_ARCH: ${{ matrix.arch }}
+      EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+      EXPECTED_MACHINE: ${{ matrix.machine }}
     timeout-minutes: 65
     defaults:
       run:
@@ -44,7 +54,7 @@ jobs:
             findmnt --target /sys/fs/cgroup
           } | tee "$EVIDENCE/run.txt"
           [[ "$REVISION" =~ ^[0-9a-f]{40}$ ]] || { echo "Expected a full lowercase commit SHA" | tee -a "$EVIDENCE/run.txt"; exit 1; }
-          [[ "$RUNNER_ARCH" == X64 && "$(uname -m)" == x86_64 ]]
+          [[ "$RUNNER_OS" == Linux && "$(uname -s)" == Linux && "$RUNNER_ARCH" == "$EXPECTED_RUNNER_ARCH" && "$(uname -m)" == "$EXPECTED_MACHINE" ]]
 
       - uses: actions/checkout@v4
         with:
@@ -94,11 +104,12 @@ jobs:
             [[ "$head" == "$REVISION" ]]
             [[ -z "$(git status --porcelain)" ]]
             go version
-            [[ "$(go env GOVERSION GOOS GOARCH GOTOOLCHAIN GOAMD64 CGO_ENABLED)" == $'go1.27.0\nlinux\namd64\nlocal\nv1\n0' ]]
+            [[ "$(go env GOVERSION GOOS GOARCH GOTOOLCHAIN CGO_ENABLED)" == "$(printf 'go1.27.0\nlinux\n%s\nlocal\n0' "$RELEASE_ARCH")" ]]
             go build -trimpath -buildvcs=true -o "$BINARY" ./cmd/bog
             go version -m "$BINARY" | tee "$EVIDENCE/build-info.txt"
             grep -Eq "^[[:space:]]+build[[:space:]]+vcs.revision=$REVISION$" "$EVIDENCE/build-info.txt"
             grep -Eq '^[[:space:]]+build[[:space:]]+vcs.modified=false$' "$EVIDENCE/build-info.txt"
+            grep -Eq "^[[:space:]]+build[[:space:]]+GOARCH=$RELEASE_ARCH$" "$EVIDENCE/build-info.txt"
             sha256sum "$BINARY" | tee "$EVIDENCE/binary.sha256"
           } 2>&1 | tee "$EVIDENCE/build.log"
 
@@ -193,7 +204,7 @@ jobs:
               -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
               -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
             python3 -B "$GITHUB_WORKSPACE/verifiers/release_gate.py" validate \
-              "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" || failed=1
+              "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --arch "$RELEASE_ARCH" || failed=1
             exit "$failed"
           } 2>&1 | tee "$EVIDENCE/validation.log"
 
@@ -213,6 +224,29 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: linux-release-evidence
+          name: linux-release-evidence-${{ matrix.arch }}
           path: ${{ runner.temp }}/bog-release-evidence
           if-no-files-found: error
+
+  qualify:
+    needs: verify
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: linux-release-evidence-*
+          path: evidence
+      - name: Require both native qualifications
+        env:
+          MATRIX_RESULT: ${{ needs.verify.result }}
+        run: |
+          [[ "$MATRIX_RESULT" == success ]]
+          amd64=$(cat evidence/linux-release-evidence-amd64/qualified.json)
+          arm64=$(cat evidence/linux-release-evidence-arm64/qualified.json)
+          jq -en --argjson amd64 "$amd64" --argjson arm64 "$arm64" \
+            --arg revision "$REVISION" --arg fixture "$FIXTURE" '
+              $amd64.arch == "amd64" and $arm64.arch == "arm64" and
+              ([$amd64, $arm64] | all(.revision == $revision and .fixture == $fixture and
+                (.binary_sha256 | test("^[0-9a-f]{64}$")))) and
+              $amd64.binary_sha256 != $arm64.binary_sha256'

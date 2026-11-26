@@ -1,21 +1,18 @@
 --- a/bench/retained-history/platform_linux.go
 +++ b/bench/retained-history/platform_linux.go
-@@ -47 +47 @@
+@@ -58 +58 @@
 -		cmd.Env = append(cmd.Env, capacityControlEnv+"=1")
 +		cmd.Args = append(cmd.Args, "-enable-capacity-control")
 --- a/bench/retained-history/platform_linux_test.go
 +++ b/bench/retained-history/platform_linux_test.go
-@@ -15 +15 @@
+@@ -96 +96 @@
 -func TestChildCapacityControlEnvironment(t *testing.T) {
 +func TestChildCapacityControlOptIn(t *testing.T) {
-@@ -18,2 +18,2 @@
+@@ -99,2 +99,2 @@
 -		{"live", "0", "1/preserved"},
 -		{"legacy", "1", "unset/preserved"},
 +		{"live", "0", "unset/preserved/-enable-capacity-control"},
 +		{"legacy", "1", "unset/preserved/unset"},
-@@ -26 +26 @@
+@@ -107 +107 @@
 -				"#!/bin/sh\nprintf '%s/%s' \"${BOG_CAPACITY_CONTROL-unset}\" \"$BOG_CAPACITY_TEST_SENTINEL\" > observed\n"), 0700); err != nil {
 +				"#!/bin/sh\nprintf '%s/%s/%s' \"${BOG_CAPACITY_CONTROL-unset}\" \"$BOG_CAPACITY_TEST_SENTINEL\" \"${5-unset}\" > observed\n"), 0700); err != nil {
-@@ -46 +46 @@
--				t.Fatalf("candidate environment: got %q, want %q (%v)", got, tc.want, err)
-+				t.Fatalf("candidate opt-in: got %q, want %q (%v)", got, tc.want, err)

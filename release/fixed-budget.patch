@@ -1,184 +1,127 @@
-diff --git a/verify/release/admission.go b/verify/release/admission.go
-index 5e65629..cdc9620 100644
---- a/verify/release/admission.go
-+++ b/verify/release/admission.go
-@@ -112,0 +113,4 @@ func requireRejection(ctx context.Context, client *http.Client, target string) (
-+	return requireRejectionBody(ctx, client, target, "")
+--- a/verify/release/budget_walk.go
++++ b/verify/release/budget_walk.go
+@@ -19,0 +20,7 @@
++type budgetPageFailure struct {
++	Budget     int    `json:"budget"`
++	Page       int    `json:"page"`
++	HTTPStatus int    `json:"http_status"`
++	Detail     string `json:"detail"`
 +}
 +
-+func requireRejectionBody(ctx context.Context, client *http.Client, target, expectedBody string) (rejection, error) {
-@@ -129,0 +134,3 @@ func requireRejection(ctx context.Context, client *http.Client, target string) (
-+	if expectedBody != "" && (!strings.HasPrefix(res.contentType, "text/plain") || string(res.body) != expectedBody) {
-+		return evidence, fmt.Errorf("unexpected HTTP 503 body or content type: %.200q (%q)", res.body, res.contentType)
-+	}
-@@ -338 +345,6 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
--	budgetErr := serve(ctx, binary, client, []string{"-query-concurrency=1", "-query-work-budget=1"}, func(base string) error {
-+	var budget struct {
-+		rejection
-+		FixedPagination fixedBudgetProof `json:"fixed_budget_pagination"`
-+		FixedWalk       fixedBudgetProof `json:"fixed_budget_walk"`
-+	}
-+	budgetErr := serve(ctx, binary, client, []string{"-query-concurrency=1", fixedBudgetFlag + "=1"}, func(base string) error {
-@@ -342,2 +354,3 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
--		result, err := requireRejection(ctx, client, base+queryPath("", 1, budgetFilter))
--		return record(cases, "work_budget", result, err)
-+		var err error
-+		budget.rejection, err = requireRejectionBody(ctx, client, base+queryPath("", 1, budgetFilter), "query work budget exhausted\n")
-+		return err
-@@ -345,2 +358,10 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
--	if _, ok := cases["work_budget"]; !ok {
--		budgetErr = record(cases, "work_budget", nil, budgetErr)
-+	if budgetErr == nil {
-+		budget.FixedPagination, budgetErr = probeFixedBudget(ctx, binary, client, []row{
-+			{fixtureStart, "first"},
-+			{"2020-01-01T00:00:01Z", strings.Repeat("x", fixedBudgetPadding)},
-+		})
-+	}
-+	if budgetErr == nil {
-+		budget.FixedWalk, budgetErr = probeFixedBudget(ctx, binary, client, []row{
-+			{fixtureStart, "c"}, {fixtureStart, "a"}, {fixtureStart, "b"},
-+		})
-@@ -348 +369 @@ func probeAdmission(ctx context.Context, binary string, cases map[string]outcome
--	return errors.Join(saturationErr, budgetErr)
-+	return errors.Join(saturationErr, record(cases, "work_budget", budget, budgetErr))
-diff --git a/verify/release/fixed_budget.go b/verify/release/fixed_budget.go
-new file mode 100644
-index 0000000..f6a86c5
---- /dev/null
-+++ b/verify/release/fixed_budget.go
-@@ -0,0 +1,135 @@
-+package main
-+
-+import (
-+	"context"
-+	"errors"
-+	"fmt"
-+	"net/http"
-+	"strings"
-+)
-+
-+const (
-+	fixedBudgetFlag    = "-query-work-budget"
-+	fixedBudgetCeiling = 16384
-+	fixedBudgetPadding = 4096
-+)
-+
-+type fixedBudgetProof struct {
-+	Budget            int  `json:"budget"`
-+	RejectedBudget    int  `json:"rejected_budget"`
-+	RejectedHTTP      int  `json:"rejected_http_status"`
-+	FirstRows         int  `json:"first_rows"`
-+	ResumedRows       int  `json:"resumed_rows"`
-+	Terminal          bool `json:"terminal"`
-+	ContinuationPages int  `json:"continuation_pages"`
-+}
-+
-+// Find the first-page budget boundary over HTTP and finish the walk with
-+// the same process and budget at which the first cursor was issued.
-+func probeFixedBudget(ctx context.Context, binary string, client *http.Client, rows []row) (proof fixedBudgetProof, err error) {
-+	firstPath := queryPath("", 1, "")
-+	probe := func(budget int, verify func(string, response) error) error {
-+		flags := []string{fmt.Sprintf("%s=%d", fixedBudgetFlag, budget)}
-+		return serve(ctx, binary, client, flags, func(base string) error {
-+			if _, err := ingest(ctx, client, base, rows); err != nil {
-+				return err
-+			}
-+			res, err := request(ctx, client, http.MethodGet, base+firstPath, nil)
-+			if err != nil {
-+				return err
-+			}
-+			return verify(base, res)
-+		})
-+	}
-+	rejected := func(res response) bool {
-+		return res.status == http.StatusServiceUnavailable && !res.cursorHeader &&
-+			strings.HasPrefix(res.contentType, "text/plain") &&
-+			string(res.body) == "query work budget exhausted\n"
-+	}
-+	requireRow := func(res response, want row) error {
-+		n, err := checkRows(res, []row{want})
+@@ -21,4 +28,8 @@
+-	FirstCursorBudget int `json:"first_cursor_budget"`
+-	RejectedBudgets   int `json:"rejected_budgets"`
+-	Pages             int `json:"pages"`
+-	Rows              int `json:"rows"`
++	IssuanceFailure     *budgetPageFailure `json:"issuance_failure,omitempty"`
++	ContinuationFailure *budgetPageFailure `json:"continuation_failure,omitempty"`
++	ContinuationPages   int                `json:"continuation_pages"`
++	Terminal            bool               `json:"terminal"`
++	FirstCursorBudget   int                `json:"first_cursor_budget"`
++	RejectedBudgets     int                `json:"rejected_budgets"`
++	Pages               int                `json:"pages"`
++	Rows                int                `json:"rows"`
+@@ -118,0 +130,4 @@
 +		if err != nil {
-+			return err
++			proof.budgetWalkStats = trial
++			return proof, err
 +		}
-+		if n != 1 || res.body[len(res.body)-1] != '\n' {
-+			return errors.New("expected one complete NDJSON row")
-+		}
-+		return nil
-+	}
-+	requireFirst := func(res response) error {
-+		if err := requireRow(res, rows[0]); err != nil {
-+			return err
-+		}
-+		if !res.cursorHeader || res.cursor == "" {
-+			return errors.New("first page omitted its continuation")
-+		}
-+		return nil
-+	}
-+	low, high := 1, fixedBudgetCeiling
-+	for low+1 < high {
-+		mid := low + (high-low)/2
-+		if err := probe(mid, func(_ string, res response) error {
-+			if rejected(res) {
-+				low = mid
-+				return nil
+@@ -121 +136,3 @@
+-			proof.FirstRows = fixture.firstRows
++			if trial.FirstCursorBudget != 0 {
++				proof.FirstRows = fixture.firstRows
 +			}
-+			if err := requireFirst(res); err != nil {
-+				return err
-+			}
-+			high = mid
-+			return nil
-+		}); err != nil {
-+			return proof, fmt.Errorf("measure first page at budget %d: %w", mid, err)
+@@ -126,3 +142,0 @@
+-		}
+-		if err != nil {
+-			return proof, err
+@@ -172 +186 @@
+-func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture, proof *budgetWalkStats) error {
++func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture, proof *budgetWalkStats) (err error) {
+@@ -175 +189,13 @@
+-	for number, offset := 1, 0; offset < len(fixture.want); number++ {
++	number, status := 1, 0
++	defer func() {
++		if err == nil {
++			return
 +		}
-+	}
-+	proof.Budget, proof.RejectedBudget = high, low
-+	if err := probe(low, func(base string, res response) error {
-+		proof.RejectedHTTP = res.status
-+		if !rejected(res) {
-+			return fmt.Errorf("expected a clean budget rejection, got HTTP %d: %.200s", res.status, res.body)
++		failure := &budgetPageFailure{budget, number, status, err.Error()}
++		if number == 1 {
++			proof.IssuanceFailure = failure
++		} else {
++			proof.ContinuationFailure = failure
 +		}
-+		if len(rows) != 2 {
-+			return nil
++	}()
++	for offset := 0; offset < len(fixture.want); number++ {
+@@ -181,0 +208,4 @@
++		status = 0
++		if res != nil {
++			status = res.StatusCode
 +		}
-+		// A short ordinary query still fits. The paged request has to
-+		// reserve the more expensive next response before it can succeed.
-+		ordinary, err := request(ctx, client, http.MethodGet, base+strings.Replace(firstPath, "&page=1", "", 1), nil)
-+		if err != nil {
-+			return err
-+		}
-+		return requireRow(ordinary, rows[0])
-+	}); err != nil {
-+		return proof, fmt.Errorf("one below measured budget %d: %w", high, err)
-+	}
-+	err = probe(high, func(base string, first response) error {
-+		if err := requireFirst(first); err != nil {
-+			return err
-+		}
-+		proof.FirstRows = 1
-+		seen := map[string]bool{first.cursor: true}
-+		cursor := first.cursor
-+		for i, want := range rows[1:] {
-+			res, err := request(ctx, client, http.MethodGet, base+queryPath(cursor, 1, ""), nil)
-+			if err != nil {
-+				return err
-+			}
-+			if err := requireRow(res, want); err != nil {
-+				return fmt.Errorf("continuation %d: %w", i+1, err)
-+			}
-+			more := i+2 < len(rows)
-+			if res.cursorHeader != more || (more && (res.cursor == "" || seen[res.cursor])) {
-+				return fmt.Errorf("continuation %d: expected a fresh cursor=%t", i+1, more)
-+			}
-+			seen[res.cursor] = true
-+			cursor = res.cursor
+@@ -218,0 +249,4 @@
++		if number > 1 {
 +			proof.ContinuationPages++
-+			proof.ResumedRows++
-+			proof.Terminal = !more
 +		}
-+		return nil
-+	})
-+	if err != nil {
-+		err = fmt.Errorf("resume at measured budget %d: %w", high, err)
-+	}
-+	return proof, err
-+}
++		proof.Terminal = cursor == ""
+--- a/verify/release/budget_walk_test.go
++++ b/verify/release/budget_walk_test.go
+@@ -142 +142 @@
+-				budgetWalkStats: budgetWalkStats{tc.threshold, rejected, 3, 4},
++				budgetWalkStats: budgetWalkStats{FirstCursorBudget: tc.threshold, RejectedBudgets: rejected, Pages: 3, Rows: 4, ContinuationPages: 2, Terminal: true},
+@@ -181,5 +181,5 @@
+-		{"first budget", 0, 3, []page{first, second, last}, budgetWalkStats{1, 0, 3, 3}, ""},
+-		{"search stops at first cursor", 2, 4, []page{first, second, last}, budgetWalkStats{3, 2, 3, 3}, ""},
+-		{"inclusive upper bound", 2, 3, []page{first, second, last}, budgetWalkStats{3, 2, 3, 3}, ""},
+-		{"no cursor within bound", 3, 3, nil, budgetWalkStats{0, 3, 0, 0}, "no first-page cursor"},
+-		{"partial rejection", 1, 3, []page{{status: 503, body: rejection.body + "{\"t"}}, budgetWalkStats{0, 1, 0, 0}, "unclean HTTP 503"},
++		{"first budget", 0, 3, []page{first, second, last}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 3, Rows: 3, ContinuationPages: 2, Terminal: true}, ""},
++		{"search stops at first cursor", 2, 4, []page{first, second, last}, budgetWalkStats{FirstCursorBudget: 3, RejectedBudgets: 2, Pages: 3, Rows: 3, ContinuationPages: 2, Terminal: true}, ""},
++		{"inclusive upper bound", 2, 3, []page{first, second, last}, budgetWalkStats{FirstCursorBudget: 3, RejectedBudgets: 2, Pages: 3, Rows: 3, ContinuationPages: 2, Terminal: true}, ""},
++		{"no cursor within bound", 3, 3, nil, budgetWalkStats{FirstCursorBudget: 0, RejectedBudgets: 3, Pages: 0, Rows: 0, ContinuationPages: 0, Terminal: false}, "no first-page cursor"},
++		{"partial rejection", 1, 3, []page{{status: 503, body: rejection.body + "{\"t"}}, budgetWalkStats{FirstCursorBudget: 0, RejectedBudgets: 1, Pages: 0, Rows: 0, ContinuationPages: 0, Terminal: false}, "unclean HTTP 503"},
+@@ -189 +189 @@
+-		{"success without first cursor", 1, 3, []page{{status: 200, body: firstRow, ndjson: true}}, budgetWalkStats{0, 1, 0, 0}, "missing continuation cursor"},
++		{"success without first cursor", 1, 3, []page{{status: 200, body: firstRow, ndjson: true}}, budgetWalkStats{FirstCursorBudget: 0, RejectedBudgets: 1, Pages: 0, Rows: 0, ContinuationPages: 0, Terminal: false}, "missing continuation cursor"},
+@@ -192,10 +192,10 @@
+-		{"empty continuation", 0, 3, []page{first, {status: 200, cursor: new(secondToken), ndjson: true}}, budgetWalkStats{1, 0, 1, 1}, "empty query page with next cursor"},
+-		{"repeated cursor", 0, 3, []page{first, {status: 200, body: secondRow, cursor: new(firstToken), ndjson: true}}, budgetWalkStats{1, 0, 1, 1}, "next cursor does not advance pagination"},
+-		{"early termination", 0, 3, []page{first, {status: 200, body: secondRow, ndjson: true}}, budgetWalkStats{1, 0, 1, 1}, "missing continuation cursor"},
+-		{"rejected second page", 0, 3, []page{first, rejection}, budgetWalkStats{1, 0, 1, 1}, "page 2: Bog HTTP 503"},
+-		{"rejected terminal page", 0, 3, []page{first, second, {status: 410}}, budgetWalkStats{1, 0, 2, 2}, "page 3: Bog HTTP 410"},
+-		{"truncated terminal record", 0, 3, []page{first, second, {status: 200, body: lastRow[:len(lastRow)-2], ndjson: true}}, budgetWalkStats{1, 0, 2, 2}, "invalid query record framing"},
+-		{"missing terminal newline", 0, 3, []page{first, second, {status: 200, body: strings.TrimSuffix(lastRow, "\n"), ndjson: true}}, budgetWalkStats{1, 0, 2, 2}, "invalid query record framing"},
+-		{"truncated HTTP body", 0, 3, []page{first, second, {status: 200, body: lastRow, ndjson: true, truncate: true}}, budgetWalkStats{1, 0, 2, 2}, "unexpected EOF"},
+-		{"terminal cursor", 0, 3, []page{first, second, {status: 200, body: lastRow, cursor: new(strings.Repeat("C", 44)), ndjson: true}}, budgetWalkStats{1, 0, 2, 2}, "issued a cursor after the final row"},
+-		{"empty terminal cursor header", 0, 3, []page{first, second, {status: 200, body: lastRow, cursor: new(""), ndjson: true}}, budgetWalkStats{1, 0, 2, 2}, "invalid next cursor header"},
++		{"empty continuation", 0, 3, []page{first, {status: 200, cursor: new(secondToken), ndjson: true}}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 1, Rows: 1, ContinuationPages: 0, Terminal: false}, "empty query page with next cursor"},
++		{"repeated cursor", 0, 3, []page{first, {status: 200, body: secondRow, cursor: new(firstToken), ndjson: true}}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 1, Rows: 1, ContinuationPages: 0, Terminal: false}, "next cursor does not advance pagination"},
++		{"early termination", 0, 3, []page{first, {status: 200, body: secondRow, ndjson: true}}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 1, Rows: 1, ContinuationPages: 0, Terminal: false}, "missing continuation cursor"},
++		{"rejected second page", 0, 3, []page{first, rejection}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 1, Rows: 1, ContinuationPages: 0, Terminal: false}, "page 2: Bog HTTP 503"},
++		{"rejected terminal page", 0, 3, []page{first, second, {status: 410}}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 2, Rows: 2, ContinuationPages: 1, Terminal: false}, "page 3: Bog HTTP 410"},
++		{"truncated terminal record", 0, 3, []page{first, second, {status: 200, body: lastRow[:len(lastRow)-2], ndjson: true}}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 2, Rows: 2, ContinuationPages: 1, Terminal: false}, "invalid query record framing"},
++		{"missing terminal newline", 0, 3, []page{first, second, {status: 200, body: strings.TrimSuffix(lastRow, "\n"), ndjson: true}}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 2, Rows: 2, ContinuationPages: 1, Terminal: false}, "invalid query record framing"},
++		{"truncated HTTP body", 0, 3, []page{first, second, {status: 200, body: lastRow, ndjson: true, truncate: true}}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 2, Rows: 2, ContinuationPages: 1, Terminal: false}, "unexpected EOF"},
++		{"terminal cursor", 0, 3, []page{first, second, {status: 200, body: lastRow, cursor: new(strings.Repeat("C", 44)), ndjson: true}}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 2, Rows: 2, ContinuationPages: 1, Terminal: false}, "issued a cursor after the final row"},
++		{"empty terminal cursor header", 0, 3, []page{first, second, {status: 200, body: lastRow, cursor: new(""), ndjson: true}}, budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 2, Rows: 2, ContinuationPages: 1, Terminal: false}, "invalid next cursor header"},
+@@ -270,0 +271,2 @@
++			// Wire-level tests assert the additional diagnostic fields.
++			got.IssuanceFailure, got.ContinuationFailure = nil, nil
+@@ -340 +342,2 @@
+-	if stats != (budgetWalkStats{1, 0, 2, 2}) || requests.Load() != 3 {
++	stats.ContinuationFailure = nil
++	if stats != (budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 2, Rows: 2, ContinuationPages: 1, Terminal: false}) || requests.Load() != 3 {
+--- a/verify/release/pages_wire_test.go
++++ b/verify/release/pages_wire_test.go
+@@ -164 +164 @@
+-				if verdictErr != nil || verdict.Status != "pass" || stats != (budgetWalkStats{1, 0, 3, 3}) || calls.Load() != 4 {
++				if verdictErr != nil || verdict.Status != "pass" || stats != (budgetWalkStats{FirstCursorBudget: 1, RejectedBudgets: 0, Pages: 3, Rows: 3, ContinuationPages: 2, Terminal: true}) || calls.Load() != 4 {
+@@ -167,0 +168,9 @@
++			}
++			failure := stats.ContinuationFailure
++			other := stats.IssuanceFailure
++			if tc.failPage == 1 {
++				failure, other = other, failure
++			}
++			if failure == nil || other != nil || failure.Budget != 1 ||
++				failure.Page != tc.failPage || !strings.Contains(failure.Detail, tc.problem) {
++				t.Fatalf("wrong observed page failure: %+v, other=%+v", failure, other)

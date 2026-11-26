@@ -83,6 +83,18 @@ def validate_capacity(evidence):
         check(compaction["state"] == "complete" and integer(compaction.get("generation"), seed // 8192 + 1) and
               integer(compaction.get("covered_rows"), seed + BATCH_ROWS, seed + BATCH_ROWS) and
               integer(compaction.get("committed_rows"), total, total), f"{label}: invalid compaction evidence")
+        diagnostics = run["diagnostics"]
+        for phase in ("after_publication_continuation", "fresh_backfill", "restart_walk"):
+            query = diagnostics["queries"][phase]
+            last = query["last"]
+            check(integer(query.get("attempts"), 1) and "first_failure" not in query and
+                  last.get("phase") == "complete" and integer(last.get("http_status"), 200, 200) and
+                  last.get("has_cursor_header") is False,
+                  f"{label}: incomplete {phase} evidence")
+        for snapshot in ("opening_compaction", "overlap_compaction"):
+            running = diagnostics[snapshot]
+            check(running["state"] == "running" and integer(running.get("generation"), 1, compaction["generation"] - 1),
+                  f"{label}: missing {snapshot} generation evidence")
         cleanup = run["cleanup"]
         check(cleanup["status"] == "pass" and cleanup["candidate_reaped"] is True and
               cleanup["subtree_empty"] is True and cleanup["subtree_removed"] is True and
@@ -93,14 +105,19 @@ def validate_budget(evidence):
     check(integer(evidence.get("http_status"), 503, 503) and
           integer(evidence.get("ndjson_rows"), 0, 0) and evidence.get("next_cursor") is False and
           integer(evidence.get("elapsed_ms"), 0, 1999), "admission: incomplete work budget rejection")
-    for name, continuations in (("fixed_budget_pagination", 1), ("fixed_budget_walk", 2)):
-        fixed = evidence[name]
-        budget = fixed.get("budget")
-        check(integer(budget, 2, 16_384) and integer(fixed.get("rejected_budget"), budget - 1, budget - 1) and
-              integer(fixed.get("rejected_http_status"), 503, 503) and integer(fixed.get("first_rows"), 1, 1) and
-              integer(fixed.get("resumed_rows"), continuations, continuations) and
-              integer(fixed.get("continuation_pages"), continuations, continuations) and fixed.get("terminal") is True,
-              f"admission: incomplete {name} evidence")
+    tied = evidence["fixed_budget_walk"]
+    sparse = tied["sparse_walk"]
+    for name, walk, rows in (("tied", tied, 3), ("sparse", sparse, 4)):
+        budget = walk.get("first_cursor_budget")
+        check(integer(budget, 2, 2048) and integer(walk.get("rejected_budgets"), 1, budget - 1) and
+              integer(walk.get("rows"), rows, rows) and integer(walk.get("pages"), 3, 3) and
+              integer(walk.get("continuation_pages"), 2, 2) and walk.get("terminal") is True and
+              "issuance_failure" not in walk and "continuation_failure" not in walk,
+              f"admission: incomplete {name} fixed-budget walk")
+    check(tied["rejected_budgets"] == tied["first_cursor_budget"] - 1 and
+          all(integer(sparse.get(key), value, value) for key, value in
+              {"response_byte_cap": 96, "first_limit": 4, "first_rows": 2, "resume_limit": 1}.items()),
+          "admission: missing budget boundary or sparse byte-trim evidence")
 
 
 def validate_parity(evidence):
@@ -112,12 +129,29 @@ def validate_parity(evidence):
           integer(point["CommittedEnd"], point["CoveredOffset"] + 1),
           "parity: expected a verified checkpoint and nonempty WAL suffix")
     check(integer(evidence["legacy_rows"], 6, 6) and integer(evidence["captured_rows"], 6, 6) and
-          evidence["post_restore_204"] is True and integer(evidence["appended_rows"], 7, 7) and
+          evidence["post_restore_204"] is True and integer(evidence["post_append_rows"], 7, 7) and
           integer(evidence["restart_rows"], 7, 7), "parity: incomplete restore, ingest or restart evidence")
 
-    terminal = evidence["terminal_walks"]
-    check(all(integer(terminal.get(stage), 9, 9) for stage in ("legacy", "restored", "appended", "restart")),
-          "parity: incomplete terminal walks")
+    check(integer(evidence.get("unpaged_checks"), 4, 4) and evidence.get("stale_cursor_rejected") is True,
+          "parity: missing unpaged or prior-process cursor evidence")
+    resource = evidence["retained_resource_admission"]
+    check(resource["status"] == "pass" and integer(resource.get("limit_bytes"), 1) and
+          integer(resource.get("rejected_http_status"), 503, 503) and
+          resource.get("unchanged_wal") is True and integer(resource.get("restart_rows"), 7, 7),
+          "parity: incomplete retained tail admission or restart evidence")
+
+
+def validate_durability(directory, expected):
+    for name in ("sigkill", "recovery", "enospc"):
+        proof = case_evidence(directory, "durability", name, expected)
+        check(integer(proof.get("stale_cursors_rejected"), 1), f"durability: {name} lacks prior-process cursor evidence")
+    healthy = proof["healthy_to_full"]
+    full = proof["full_to_healthy"]
+    check(integer(healthy.get("readiness_status"), 200, 200) and healthy.get("readiness_reason") == "ready" and
+          integer(healthy.get("ingest_status"), 204, 204) and healthy.get("replayed_after_restart") is True and
+          integer(full.get("readiness_status"), 503, 503) and full.get("readiness_reason") == "low_disk_headroom" and
+          integer(full.get("ingest_status"), 503, 503) and full.get("post_ingest_reason") == "wal_rollback" and
+          full.get("post_ingest_category") == "enospc", "durability: incomplete active-filesystem retarget evidence")
 
 
 def validate(directory, expected):
@@ -126,11 +160,7 @@ def validate(directory, expected):
           set(statuses) == {f"{name} revision={expected['revision']} exit=0" for name in PRODUCERS},
           "missing, repeated or failing release producer status")
     validate_budget(case_evidence(directory, "admission", "work_budget", expected))
-    ready = case_evidence(directory, "durability", "descriptor_bound_readiness", expected)
-    check(integer(ready.get("initial_http_status"), 200, 200) and
-          integer(ready.get("full_http_status"), 503, 503) and ready.get("full_reason") == "low_disk_headroom" and
-          integer(ready.get("recovered_http_status"), 200, 200) and ready.get("recovered_reason") == "ready",
-          "durability: incomplete descriptor-bound readiness evidence")
+    validate_durability(directory, expected)
     validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected))
     validate_parity(case_evidence(directory, "parity", "restored_parity", expected))
     control = case_evidence(directory, "control", "capacity_control", expected)
@@ -167,6 +197,7 @@ def main():
     parser.add_argument("revision")
     parser.add_argument("fixture")
     parser.add_argument("directory", type=Path)
+    parser.add_argument("--arch", choices=("amd64", "arm64"))
     args = parser.parse_args()
     try:
         directory = args.directory.resolve()
@@ -175,7 +206,15 @@ def main():
         if args.action == "control":
             produce_control(binary, directory, expected)
         else:
+            check(args.arch is not None, "native architecture is required")
+            # Check the ELF machine independently of the runner label and reports.
+            with binary.open("rb") as stream:
+                header = stream.read(20)
+            machine = {"amd64": 62, "arm64": 183}[args.arch]
+            check(header[:6] == b"\x7fELF\x02\x01" and int.from_bytes(header[18:20], "little") == machine,
+                  f"candidate binary is not Linux {args.arch}")
             validate(directory, expected)
+            (directory / "qualified.json").write_text(json.dumps({**expected, "arch": args.arch}) + "\n")
     except (Rejected, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         parser.exit(1, f"release evidence: {exc}\n")
 

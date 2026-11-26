@@ -1,120 +1,163 @@
-diff --git a/verify/release/main.go b/verify/release/main.go
-index 3f2254e..4fab646 100644
---- a/verify/release/main.go
-+++ b/verify/release/main.go
-@@ -54,0 +55 @@ func run(ctx context.Context, args []string) error {
-+			{"restored parity", parity, []string{"restored_parity"}},
-@@ -60,5 +60,0 @@ func run(ctx context.Context, args []string) error {
--		if parity != "" {
--			if checkErr := validateFile(parity, id, []string{"restored_parity"}); checkErr != nil {
--				err = errors.Join(err, fmt.Errorf("restored parity report: %w", checkErr))
--			}
--		}
-diff --git a/verify/release/parity_linux_test.go b/verify/release/parity_linux_test.go
-index a854994..4d9d395 100644
 --- a/verify/release/parity_linux_test.go
 +++ b/verify/release/parity_linux_test.go
-@@ -14 +13,0 @@ import (
--	"slices"
-@@ -22,0 +22 @@ import (
-+	querymodel "bog/verify/query-model"
-@@ -54,0 +55 @@ type parityProof struct {
-+	LegacyRows     int          `json:"legacy_rows"`
-@@ -56,0 +58 @@ type parityProof struct {
-+	AppendedRows   int          `json:"appended_rows"`
-@@ -57,0 +60,6 @@ type parityProof struct {
-+	TerminalWalks  struct {
-+		Legacy   int `json:"legacy"`
-+		Restored int `json:"restored"`
-+		Appended int `json:"appended"`
-+		Restart  int `json:"restart"`
-+	} `json:"terminal_walks"`
-@@ -86,0 +95,12 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
-+	if err := serveDirectory(ctx, binary, filepath.Join(root, "source"), client, flags, func(base string) error {
-+		return checkRestoredWalks(ctx, client, base, rows, &proof.TerminalWalks.Legacy)
+@@ -12,0 +13 @@
++	"os/exec"
+@@ -57,5 +58,9 @@
+-	Point          backup.Point `json:"verified_point"`
+-	CapturedRows   int          `json:"captured_rows"`
+-	PostRestore204 bool         `json:"post_restore_204"`
+-	PostAppendRows int          `json:"post_append_rows"`
+-	RestartRows    int          `json:"restart_rows"`
++	Point               backup.Point   `json:"verified_point"`
++	CapturedRows        int            `json:"captured_rows"`
++	PostRestore204      bool           `json:"post_restore_204"`
++	LegacyRows          int            `json:"legacy_rows"`
++	UnpagedChecks       int            `json:"unpaged_checks"`
++	StaleCursorRejected bool           `json:"stale_cursor_rejected"`
++	Resource            *resourceProof `json:"retained_resource_admission,omitempty"`
++	PostAppendRows      int            `json:"post_append_rows"`
++	RestartRows         int            `json:"restart_rows"`
+@@ -90,0 +96,29 @@
++	legacy := filepath.Join(root, "legacy")
++	if err := os.Mkdir(legacy, 0700); err != nil {
++		return proof, err
++	}
++	if err := appendParityBatch(legacy, rows); err != nil {
++		return proof, err
++	}
++	checkQueries := func(base string, expected []row) error {
++		if err := checkUnpaged(ctx, client, base, expected); err != nil {
++			return err
++		}
++		proof.UnpagedChecks++
++		pager, err := newReleasePager(base, client, restoredPageCap)
++		if err != nil {
++			return err
++		}
++		return checkRestoredWalks(ctx, pager, expected)
++	}
++	if err := serveDirectory(ctx, binary, legacy, client, flags, func(base string) error {
++		return checkQueries(base, rows)
 +	}); err != nil {
-+		return proof, fmt.Errorf("serve legacy layout: %w", err)
++		return proof, fmt.Errorf("legacy WAL replay: %w", err)
 +	}
 +	proof.LegacyRows = len(rows)
-+	// Remove both inputs so serving and restart can only use the restore.
-+	for _, name := range []string{"source", "bundle"} {
++	for _, name := range []string{"legacy", "source", "bundle"} {
 +		if err := os.RemoveAll(filepath.Join(root, name)); err != nil {
-+			return proof, fmt.Errorf("isolate restore: %w", err)
++			return proof, err
 +		}
 +	}
-@@ -89 +109 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
--		if err := checkRestoredWalks(ctx, client, base, rows); err != nil {
-+		if err := checkRestoredWalks(ctx, client, base, rows, &proof.TerminalWalks.Restored); err != nil {
-@@ -95 +115,9 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
--		return err
-+		if err != nil {
-+			return err
-+		}
-+		rows = append(rows, added)
-+		if err := checkRestoredWalks(ctx, client, base, rows, &proof.TerminalWalks.Appended); err != nil {
-+			return fmt.Errorf("after acknowledged append: %w", err)
-+		}
-+		proof.AppendedRows = len(rows)
-+		return nil
-@@ -101,2 +129 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
--		rows = append(rows, added)
--		if err := checkRestoredWalks(ctx, client, base, rows); err != nil {
-+		if err := checkRestoredWalks(ctx, client, base, rows, &proof.TerminalWalks.Restart); err != nil {
-@@ -114 +141,17 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
--func checkRestoredWalks(ctx context.Context, client *http.Client, base string, appendOrder []row) error {
-+func checkRestoredWalks(ctx context.Context, client *http.Client, base string, appendOrder []row, terminal *int) error {
-+	var log querymodel.Log
-+	for _, r := range appendOrder {
-+		ts, err := time.Parse(time.RFC3339Nano, r.TS)
-+		if err != nil {
-+			return err
-+		}
-+		log.Append([]querymodel.Row{{Time: ts, Line: r.Line}})
-+	}
-+	start, err := time.Parse(time.RFC3339Nano, fixtureStart)
-+	if err != nil {
-+		return err
-+	}
-+	end, err := time.Parse(time.RFC3339Nano, fixtureEnd)
-+	if err != nil {
-+		return err
-+	}
-@@ -116,5 +159,3 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
--		var want []row
--		for _, r := range appendOrder {
--			if strings.Contains(r.Line, filter) {
--				want = append(want, r)
--			}
-+		want, err := log.Match(log.HighWater(), querymodel.Filter{Start: start, End: end, Contains: filter})
-+		if err != nil {
-+			return err
-@@ -122 +162,0 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
--		slices.SortStableFunc(want, func(a, b row) int { return strings.Compare(a.TS, b.TS) })
-@@ -126,0 +167 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
-+			(*terminal)++
-@@ -132 +173 @@ func checkRestoredWalks(ctx context.Context, client *http.Client, base string, a
--func checkRestoredWalk(ctx context.Context, client *http.Client, base, filter string, limit int, want []row) error {
-+func checkRestoredWalk(ctx context.Context, client *http.Client, base, filter string, limit int, want []querymodel.Entry) error {
-@@ -143 +184,7 @@ func checkRestoredWalk(ctx context.Context, client *http.Client, base, filter st
--		n, err := checkRows(res, want)
-+		// VerifyWalk models row-limited pages. This fixture also has a byte
-+		// limit, so compare each returned prefix against Match's ordered rows.
-+		expected := make([]row, 0, min(limit, len(want)))
-+		for _, entry := range want[:min(limit, len(want))] {
-+			expected = append(expected, row{entry.Time.Format(time.RFC3339Nano), entry.Line})
-+		}
-+		n, err := checkRows(res, expected)
-@@ -147,3 +193,0 @@ func checkRestoredWalk(ctx context.Context, client *http.Client, base, filter st
--		if n > limit {
--			return errors.New("page exceeded row limit")
+@@ -99 +133 @@
+-		if err := checkRestoredWalks(ctx, pager, rows); err != nil {
++		if err := checkQueries(base, rows); err != nil {
+@@ -108 +142 @@
+-		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
++		if err := checkQueries(base, augmented); err != nil {
+@@ -129,5 +163,2 @@
+-		pager, err := newReleasePager(base, client, restoredPageCap)
+-		if err != nil {
+-			return err
 -		}
-diff --git a/verify/release/report_test.go b/verify/release/report_test.go
-index 7ffef1b..0692989 100644
---- a/verify/release/report_test.go
-+++ b/verify/release/report_test.go
-@@ -96,0 +97 @@ func TestValidateCommand(t *testing.T) {
-+		{"parity", []string{"restored_parity"}},
-@@ -118,0 +120,3 @@ func TestValidateCommand(t *testing.T) {
-+	if err := run(t.Context(), args[:len(args)-2]); err == nil || !strings.Contains(err.Error(), "restored parity report") {
-+		t.Fatalf("validation without parity accepted: %v", err)
+-		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
++		proof.StaleCursorRejected = true
++		if err := checkQueries(base, augmented); err != nil {
+@@ -140,0 +172,99 @@
 +	}
++	if err == nil {
++		proof.Resource, err = probeRestoredAdmission(ctx, binary, dir, client, flags, point, augmented)
++	}
++	return proof, err
++}
++
++func checkUnpaged(ctx context.Context, client *http.Client, base string, rows []row) error {
++	want := slices.Clone(rows)
++	slices.SortStableFunc(want, func(a, b row) int { return strings.Compare(a.TS, b.TS) })
++	// The response byte cap can trim the ordinary prefix. Its first two
++	// rows fit, so compare that exact prefix and require no cursor.
++	path := strings.Replace(queryPath("", 2, ""), "&page=1", "", 1)
++	res, err := request(ctx, client, http.MethodGet, base+path, nil)
++	if err != nil {
++		return err
++	}
++	n, err := checkRows(res, want[:2])
++	if err != nil || n != 2 || res.cursorHeader || !res.framed || !bytes.HasSuffix(res.body, []byte("\n")) {
++		return fmt.Errorf("expected two framed unpaged rows without a cursor: HTTP %d, rows %d, error %v", res.status, n, err)
++	}
++	return nil
++}
++
++const tailLimitFlag = "-retained-tail-max-bytes"
++
++type resourceProof struct {
++	Status             string `json:"status"`
++	Detail             string `json:"detail,omitempty"`
++	LimitBytes         int64  `json:"limit_bytes"`
++	RejectedHTTPStatus int    `json:"rejected_http_status"`
++	UnchangedWAL       bool   `json:"unchanged_wal"`
++	RestartRows        int    `json:"restart_rows"`
++}
++
++func probeRestoredAdmission(ctx context.Context, binary, dir string, client *http.Client, flags []string, point backup.Point, rows []row) (*resourceProof, error) {
++	proof := &resourceProof{Status: "fail"}
++	help, err := exec.CommandContext(ctx, binary, "-help").CombinedOutput()
++	if err != nil {
++		return proof, fmt.Errorf("probe retained resource flags: %w", err)
++	}
++	if !slices.ContainsFunc(strings.Split(string(help), "\n"), func(line string) bool {
++		name, _, _ := strings.Cut(strings.TrimSpace(line), " ")
++		return name == tailLimitFlag
++	}) {
++		proof.Status, proof.Detail = "skip", "candidate does not advertise "+tailLimitFlag
++		return proof, nil
++	}
++	walPath := filepath.Join(dir, "bog.wal")
++	before, err := os.ReadFile(walPath)
++	if err != nil {
++		return proof, err
++	}
++	markerPath := filepath.Join(dir, "bog.commit")
++	marker, err := os.ReadFile(markerPath)
++	if err != nil {
++		return proof, err
++	}
++	// The v1 image's WAL holds the uncovered suffix. Allow its exact
++	// footprint and attempt to add a two-row frame beyond the limit.
++	proof.LimitBytes = int64(len(before))
++	if proof.LimitBytes < int64(point.CommittedEnd-point.CoveredOffset) {
++		return proof, errors.New("restored WAL is shorter than its verified suffix")
++	}
++	flags = append(flags, fmt.Sprintf("%s=%d", tailLimitFlag, proof.LimitBytes))
++	if err := serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
++		add := []row{{fixtureStart, "must not commit A"}, {fixtureStart, "must not commit B"}}
++		var ingestErr error
++		proof.RejectedHTTPStatus, ingestErr = ingest(ctx, client, base, add)
++		if proof.RejectedHTTPStatus != http.StatusServiceUnavailable {
++			return fmt.Errorf("tail admission: expected HTTP 503, got %d (%v)", proof.RejectedHTTPStatus, ingestErr)
++		}
++		pager, err := newReleasePager(base, client, restoredPageCap)
++		if err != nil {
++			return err
++		}
++		return checkRestoredWalks(ctx, pager, rows)
++	}); err != nil {
++		return proof, err
++	}
++	after, walErr := os.ReadFile(walPath)
++	afterMarker, markerErr := os.ReadFile(markerPath)
++	proof.UnchangedWAL = walErr == nil && markerErr == nil && bytes.Equal(before, after) && bytes.Equal(marker, afterMarker)
++	if !proof.UnchangedWAL {
++		return proof, fmt.Errorf("tail rejection changed WAL or marker: %v", errors.Join(walErr, markerErr))
++	}
++	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
++		pager, err := newReleasePager(base, client, restoredPageCap)
++		if err != nil {
++			return err
++		}
++		if err := checkRestoredWalks(ctx, pager, rows); err != nil {
++			return err
++		}
++		proof.RestartRows = len(rows)
++		return nil
++	})
++	if err == nil {
++		proof.Status = "pass"

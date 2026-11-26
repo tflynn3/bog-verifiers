@@ -223,44 +223,41 @@ Run harness regressions with `python3 -B -m unittest discover -s tests -v`.
 
 ## Linux release qualification for #53
 
-Dispatch **Linux release verification** from the verifier ref containing these
-gate updates. Supply the full Bog commit SHA with the composed runtime and
-capacity changes. The workflow applies the verifier patches to a separate
-pinned gate checkout and builds one clean Linux amd64 candidate binary. The
-admission, durability, live capacity, and restored parity producers must all
-pass for fixture `linux-release-v1` with schema version 1 and the same candidate
-revision and binary SHA-256. The capacity stage also keeps its loopback control
-report. Download `linux-release-evidence` for the checkout revisions, build
-identity, reports, producer statuses, and logs.
+Dispatch **Linux release verification** from the verifier ref with the full
+composed Bog commit SHA. The workflow builds one clean Go 1.27.0 binary on
+each of the native Ubuntu 24.04 amd64 and arm64 runners. All producers on each
+runner share that binary and the `linux-release-v1` fixture. The final job
+requires both architecture results for the dispatched revision and distinct
+binary digests. The `linux-release-evidence-amd64` and
+`linux-release-evidence-arm64` artifacts contain the reports, build metadata,
+digests, and logs.
 
-The admission report preserves the existing saturation and work-budget
-rejections. Its `work_budget` case also records the measured budget for a
-one-row first page, a clean HTTP 503 one unit below it, and a full terminal
-continuation at the same fixed budget. A separate three-row walk measures its
-own first-page boundary and checks both continuations at that budget, in
-append order across tied timestamps.
+The workflow reuses the Bog checkout's production-client paging probe and
+Linux durability producer. Budget-1 exhaustion, tied rows, and a sparse
+byte-trimmed walk must return the expected framed responses. A cursor issued
+at a fixed budget must reach terminal exhaustion at the same budget. The
+walk reports keep schema version 1 and add the observed failure page,
+budget, HTTP status, and diagnostic for unexpected issuance or continuation
+failures. The durability report must demonstrate prior-process cursor
+rejection and verify readiness and ingest in both filesystem retarget
+directions.
 
-The durability report also checks `GET /ready` while the original data
-directory path is absent. After moving the directory within the private
-tmpfs, the producer fills that filesystem and requires HTTP 503 with
-`low_disk_headroom`. Freeing the space must return HTTP 200 with `ready`
-while the original path is still absent. A candidate without `GET /ready`
-skips this case in the producer. Release qualification requires it to pass.
+The capacity producer must show live generation replacement with an
+acknowledged backfill, the original cursor's terminal walk, a fresh query,
+and full restart recovery at 196,608 and 393,216 seed rows under the 128 MiB
+cgroup limit. Each fixture requires successful process and cgroup cleanup.
 
-The capacity report must show both 196,608 and 393,216 retained rows under a
-128 MiB cgroup memory limit, exact recovery after restart, a published
-compaction cutoff, all required measurements, and successful cleanup for each
-fixture. The cleanup evidence records candidate reaping, an empty cgroup subtree,
-and its removal. The restored parity producer checks legacy startup, then
-starts the candidate on a verified v1 restore after removing the legacy source
-and backup bundle. It uses `verify/query-model` for exact ordered rows and
-records nine terminal walks per stage, including before the append, after
-HTTP 204, and after SIGKILL and restart.
+Restored parity checks legacy WAL replay, then removes the original data and
+bundle and starts the candidate on the verified v1 restore. Ordinary queries
+and framed cursor walks check restored rows, a durable append, and exact
+restart parity. The resource probe discovers `-retained-tail-max-bytes` in
+candidate help. This release probe requires the composed runtime to expose
+that flag as a byte limit for uncovered WAL frames. At the restored tail
+limit, Bog must reject a whole two-row batch with HTTP 503, preserve the WAL
+and commit marker, and serve the exact acknowledged rows before and after
+restart.
 
-The short Slipway capacity control suite runs when Bog advertises
-`-enable-capacity-control`. It checks that the control is absent by default,
-that opt-in rejects a wildcard bind, and that loopback compaction publishes a
-generation whose rows survive SIGKILL and restart. An older candidate skips
-only this suite. The manually dispatched release workflow records an
-unavailable live capacity result when the flag is absent and requires passing
-live capacity, control, and restored parity evidence to qualify a release.
+Candidates without the tail limit flag skip that probe. The existing short
+Slipway capacity suite still discovers `-enable-capacity-control` before
+running. The manually dispatched release gate requires every required case to
+pass. Missing or skipped evidence leaves the revision unqualified.
