@@ -17,7 +17,7 @@ from release_gate import (CAPACITY_WORK_BUDGET, FIXTURE_ROOT_CLEANUP, MEMORY_LIM
                           validate_capacity_observations, validate_control_scope, validate_cutover_control,
                           validate_memory_peak,
                           validate_cutover_parity, validate_durability, validate_no_oom_kills,
-                          validate_replacement_restart, validate_restart_compaction)
+                          validate_producers, validate_replacement_restart, validate_restart_compaction)
 
 README_ONLY = "7655ed627bccad30700b8de4b6f47c8d7d5d8579"
 
@@ -224,6 +224,9 @@ class GateTest(unittest.TestCase):
         for cycle in cycles:
             cycle["retired_cursor_status"] = 410
         validate_restore_cycles(report)
+        with self.assertRaisesRegex(verify.Rejected, "missing restored append after retarget back"):
+            validate_restore_cycles(report, require_served_runtime=True)
+        retarget["back_append_status"] = 204
         with self.assertRaisesRegex(verify.Rejected, "missing clean retained shutdown"):
             validate_restore_cycles(report, require_served_runtime=True)
         shutdown = dict(held_cursor=True, prior_cursor_rejected=True, append_status=204, exit_code=0, replay_rows=15)
@@ -233,6 +236,7 @@ class GateTest(unittest.TestCase):
             (ordinary, {"exit_signal": 15}, "ordinary WAL crash replay"),
             (hidden, {"retire": 405}, "hidden default control"),
             (retarget, {"back_ready_status": 503}, "retarget readiness"),
+            (retarget, {"back_append_status": 503}, "append after retarget back"),
             (cycles[1], {"retired_cursor_status": 400}, "retired cursor refusal"),
             (shutdown, {"held_cursor": False}, "clean retained shutdown"),
             (shutdown, {"prior_cursor_rejected": False}, "clean retained shutdown"),
@@ -243,6 +247,35 @@ class GateTest(unittest.TestCase):
             with self.subTest(changes=changes), patch.dict(target, changes):
                 with self.assertRaisesRegex(verify.Rejected, reason):
                     validate_restore_cycles(report, require_served_runtime=True)
+
+    def test_native_shutdown_requires_pinned_producer_and_explicit_passes(self):
+        revision, gate = "a" * 40, "b" * 40
+        package, test = "bog/verify/release", "TestReleaseRetainedShutdown"
+        passes = [dict(Action="pass", Package=package, Test=test), dict(Action="pass", Package=package)]
+        with tempfile.TemporaryDirectory() as work:
+            directory = Path(work)
+            manifest = directory / "producers.txt"
+            events = directory / "retained-shutdown-events.jsonl"
+            historical = "".join(f"{name} revision={revision} exit=0\n"
+                                 for name in ("admission", "durability", "capacity", "parity"))
+            shutdown = (f"retained_shutdown revision={revision} arch=arm64 exit=0 "
+                        f"checkout=shutdown-gate checkout_sha={gate}\n")
+            manifest.write_text(historical)
+            validate_producers(directory, revision, None, None)
+            for line in ("", shutdown.replace("arm64", "amd64"), shutdown.replace(gate, revision),
+                         shutdown.replace("exit=0", "exit=77"), shutdown * 2):
+                with self.subTest(line=line), self.assertRaisesRegex(verify.Rejected, "producer status"):
+                    manifest.write_text(historical + line)
+                    validate_producers(directory, revision, "arm64", gate)
+            manifest.write_text(historical + shutdown)
+            for records in (passes[:1], passes[1:], passes + passes[:1],
+                            passes + [dict(passes[0], Action="skip")],
+                            passes + [dict(passes[0], Action="fail")]):
+                with self.subTest(records=records), self.assertRaisesRegex(verify.Rejected, "retained shutdown"):
+                    events.write_text("".join(json.dumps(event) + "\n" for event in records))
+                    validate_producers(directory, revision, "arm64", gate)
+            events.write_text("".join(json.dumps(event) + "\n" for event in passes))
+            validate_producers(directory, revision, "arm64", gate)
 
     def test_native_replacement_requires_ordered_suffix_and_terminal_retry(self):
         rows, backfill, suffix = verify.replacement_fixture()

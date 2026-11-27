@@ -20,6 +20,7 @@ env:
   BOG_REPOSITORY: tflynn3/bog
   TOOLING_REVISION: abefdb5dcdc1f8bbbecdc9c0cc7ab39b309a87db
   PARITY_TOOLING_REVISION: dcbfa3fa98d75f9dca1dbff1b035d814f37fe438
+  SHUTDOWN_GATE_REVISION: e1925ab5e06c93dc01d726c603976e2bd588d8d0
   CONTROL_SCOPE_TOOLING_REVISION: 268195aae3f25aeac21efa818f3215b29ede406a
   CAPACITY_VALIDATION_REVISION: ecb3ca2efb0af151438ef08e417f702d9a22f839
   ADMISSION_TOOLING_REVISION: 304749df78fe3dfaa75ce411efa34708269af659
@@ -86,6 +87,13 @@ jobs:
           repository: ${{ env.BOG_REPOSITORY }}
           ref: ${{ env.PARITY_TOOLING_REVISION }}
           path: parity-gate
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BOG_REPOSITORY }}
+          ref: ${{ env.SHUTDOWN_GATE_REVISION }}
+          path: shutdown-gate
           persist-credentials: false
 
       - uses: actions/checkout@v4
@@ -185,10 +193,17 @@ jobs:
       - name: Run release evidence producers
         if: steps.build.outcome == 'success'
         timeout-minutes: 48
+        env:
+          PINNED_BINARY_SHA256: ${{ steps.build.outputs.binary_sha256 }}
         run: |
           record() {
             local name=$1 status=$2
-            printf '%s revision=%s exit=%d\n' "$name" "$REVISION" "$status" | tee -a "$EVIDENCE/producers.txt"
+            if [[ "$name" == retained_shutdown ]]; then
+              printf '%s revision=%s arch=%s exit=%d checkout=shutdown-gate checkout_sha=%s\n' \
+                "$name" "$REVISION" "$RELEASE_ARCH" "$status" "$shutdown_revision"
+            else
+              printf '%s revision=%s exit=%d\n' "$name" "$REVISION" "$status"
+            fi | tee -a "$EVIDENCE/producers.txt"
           }
           common=(-binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE")
           unset BOG_CAPACITY_CONTROL
@@ -340,8 +355,37 @@ jobs:
             timeout --kill-after=5s 90s python3 -B verifiers/release_gate.py record-restore-cycles \
               "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --restore-helper "$helper" || exit
           )
+          retained_shutdown() (
+            [[ "$shutdown_revision" == "$SHUTDOWN_GATE_REVISION" ]] || exit 1
+            [[ -z "$(git -C shutdown-gate status --porcelain)" ]] || exit 1
+            [[ "$PINNED_BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 1
+            check_pin() {
+              printf '%s  %s\n' "$PINNED_BINARY_SHA256" "$BINARY" | sha256sum --check
+            }
+            check_pin || exit
+            local help control
+            help=$("$BINARY" -help 2>&1) || exit
+            control=$(jq -er '.cases.capacity_control |
+              if .status == "skip" then "unavailable"
+              elif .status == "pass" then
+                if .evidence.environment_opt_in == true then "enabled" else "unavailable" end
+              else error("loopback compaction capability probe failed") end' "$EVIDENCE/control.json") || exit
+            if ! grep -Eq '^[[:space:]]*-query-concurrency([[:space:]=]|$)' <<< "$help" ||
+               ! grep -Eq '^[[:space:]]*-query-max-response-bytes([[:space:]=]|$)' <<< "$help" ||
+               [[ "$control" == unavailable ]]; then
+              echo "Retained shutdown requires query admission and opted-in loopback compaction."
+              exit 77
+            fi
+            cd shutdown-gate || exit
+            export CGO_ENABLED=1 BOG_RELEASE_RETAINED_SHUTDOWN=1 BOG_RELEASE_BINARY_SHA256="$PINNED_BINARY_SHA256"
+            export BOG_RELEASE_BINARY="$BINARY" BOG_RELEASE_REVISION="$REVISION" BOG_RELEASE_FIXTURE="$FIXTURE"
+            timeout --kill-after=5s 3m go test -race -json -count=1 -timeout=90s \
+              -run '^TestReleaseRetainedShutdown$' ./verify/release | tee "$EVIDENCE/retained-shutdown-events.jsonl" || exit
+            check_pin
+          )
+          shutdown_revision=$(git -C shutdown-gate rev-parse HEAD)
           failed=0
-          for name in admission durability capacity parity; do
+          for name in admission durability capacity parity retained_shutdown; do
             status=0
             "$name" 2>&1 | tee "$EVIDENCE/$name.log" || status=$?
             record "$name" "$status"
@@ -476,6 +520,7 @@ jobs:
               --parity-gate-revision "$(git -C ../parity-gate rev-parse HEAD)" \
               --verifier-revision "$GITHUB_SHA" \
               --capacity-validation-revision "$CAPACITY_VALIDATION_REVISION" \
+              --shutdown-gate-revision "$SHUTDOWN_GATE_REVISION" \
               --require-fixture-root-cleanup --require-fixed-boundaries --require-backfill-timelines \
               --require-capacity-observations --require-replacement-restart --require-control-scope \
               --require-served-runtime
@@ -513,6 +558,7 @@ jobs:
             --arg amd64_digest "$amd64_digest" --arg arm64_digest "$arm64_digest" \
             --arg revision "$REVISION" --arg fixture "$FIXTURE" --arg gate "$PARITY_TOOLING_REVISION" \
             --arg verifier "$GITHUB_SHA" \
+            --arg shutdown_gate "$SHUTDOWN_GATE_REVISION" \
             --arg capacity_validation "$CAPACITY_VALIDATION_REVISION" '
               if $amd64.arch == "amd64" and $arm64.arch == "arm64" and
               ([$amd64, $arm64] | all(.schema_version == 1 and .current_observations == true and
@@ -520,6 +566,7 @@ jobs:
                 .verifier_revision == $verifier and
                 .post_restore_ack_crash == true and .writable_restore_cycles == true and .tail_only_two_cycle_parity == true and
                 .replacement_restart == true and .control_scope == true and .served_runtime == true and
+                .retained_shutdown == true and .shutdown_gate_revision == $shutdown_gate and
                 .capacity_validation_revision == $capacity_validation and
                 (.binary_sha256 | test("^[0-9a-f]{64}$")))) and
               $amd64.binary_sha256 == $amd64_digest and $arm64.binary_sha256 == $arm64_digest and
@@ -527,5 +574,6 @@ jobs:
                 {revision: $revision, fixture: $fixture, verifier_revision: $verifier, parity_gate_revision: $gate,
                   capacity_validation_revision: $capacity_validation, control_scope: true, writable_restore_cycles: true,
                   tail_only_two_cycle_parity: true, served_runtime: true,
+                  retained_shutdown: true, shutdown_gate_revision: $shutdown_gate,
                   binary_sha256: {amd64: $amd64_digest, arm64: $arm64_digest}}
               else error("native qualification identities or verdicts did not match") end'

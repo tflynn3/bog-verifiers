@@ -27,6 +27,7 @@ TAIL_ONLY_PARITY = "tail_only_two_cycle_parity"
 REPLACEMENT_RESTART = "replacement_restart"
 FIXED_BUDGET_REPLAY = "fixed_budget_replay"
 CONTROL_SCOPE = "control_scope"
+RETAINED_SHUTDOWN = "retained_shutdown"
 
 
 def identity(binary, revision, fixture):
@@ -536,6 +537,9 @@ def validate_restore_cycles(report, *, require_served_runtime=False):
               all(integer(retarget.get(key), value, value) for key, value in dict(
                   away_ready_status=200, append_status=204, back_ready_status=200).items()),
               f"{label}: missing restored path retarget readiness or append")
+        if require_served_runtime or "back_append_status" in retarget:
+            check(integer(retarget.get("back_append_status"), 204, 204),
+                  f"{label}: missing restored append after retarget back")
 
     def point(value, version, next_ordinal, committed_ordinal):
         check(isinstance(value, dict), f"{label}: missing recovery point")
@@ -746,15 +750,43 @@ def validate_replacement_restart(report, control, *, require_export_walk=False):
         validate_terminal_replay(trial, label)
 
 
+def validate_producers(directory, revision, arch, shutdown_gate_revision):
+    expected = {f"{name} revision={revision} exit=0" for name in PRODUCERS}
+    if shutdown_gate_revision is not None:
+        expected.add(f"{RETAINED_SHUTDOWN} revision={revision} arch={arch} exit=0 "
+                     f"checkout=shutdown-gate checkout_sha={shutdown_gate_revision}")
+    statuses = (directory / "producers.txt").read_text().splitlines()
+    check(len(statuses) == len(expected) and set(statuses) == expected,
+          "missing, repeated or failing release producer status")
+    if shutdown_gate_revision is not None:
+        validate_shutdown_events(directory / "retained-shutdown-events.jsonl")
+
+
+def validate_shutdown_events(path):
+    package, test = "bog/verify/release", "TestReleaseRetainedShutdown"
+    passes = {"": 0, test: 0}
+    with path.open() as events:
+        for line in events:
+            event = json.loads(line, object_pairs_hook=unique_fields)
+            if event.get("Package") != package:
+                continue
+            name, action = event.get("Test", ""), event.get("Action")
+            if name in passes or name.startswith(test + "/"):
+                check(action not in ("fail", "skip"),
+                      f"retained shutdown: {name or package} reported {action}")
+                if action == "pass" and name in passes:
+                    passes[name] += 1
+    check(all(count == 1 for count in passes.values()),
+          "retained shutdown: expected exactly one test pass and one package pass")
+
+
 def validate(directory, expected, *, require_fixture_root_cleanup=False, require_fixed_boundaries=False,
              require_backfill_timelines=False, require_capacity_observations=False, cutover_arch=None,
-             require_replacement_restart=False, require_control_scope=False, require_served_runtime=False):
+             require_replacement_restart=False, require_control_scope=False, require_served_runtime=False,
+             shutdown_gate_revision=None):
     if cutover_arch:
         expected = {**expected, "arch": cutover_arch}
-    statuses = (directory / "producers.txt").read_text().splitlines()
-    check(len(statuses) == len(PRODUCERS) and
-          set(statuses) == {f"{name} revision={expected['revision']} exit=0" for name in PRODUCERS},
-          "missing, repeated or failing release producer status")
+    validate_producers(directory, expected["revision"], cutover_arch, shutdown_gate_revision)
     validate_budget(case_evidence(directory, "admission", "work_budget", expected),
                     require_fixed_boundaries=require_fixed_boundaries, require_tied_byte_walk=bool(cutover_arch))
     validate_durability(directory, expected, require_fixture_root_cleanup=require_fixture_root_cleanup,
@@ -850,6 +882,7 @@ def main():
     parser.add_argument("--parity-gate-revision", "--gate-revision")
     parser.add_argument("--verifier-revision")
     parser.add_argument("--capacity-validation-revision")
+    parser.add_argument("--shutdown-gate-revision")
     parser.add_argument("--fixture-parent", type=Path)
     parser.add_argument("--require-fixture-root-cleanup", action="store_true")
     parser.add_argument("--require-fixed-boundaries", action="store_true")
@@ -897,6 +930,9 @@ def main():
                   "control scope evidence requires strict native cutover validation")
             check(not args.require_served_runtime or cutover,
                   "served runtime evidence requires strict native cutover validation")
+            if args.require_served_runtime or args.shutdown_gate_revision is not None:
+                check(cutover and re.fullmatch(r"[0-9a-f]{40}", args.shutdown_gate_revision or ""),
+                      "invalid retained shutdown gate checkout revision")
             if cutover or args.binary_sha256 is not None:
                 check(expected["binary_sha256"] == args.binary_sha256,
                       "candidate binary SHA-256 differs from the native build pin")
@@ -914,7 +950,8 @@ def main():
                      cutover_arch=args.arch if cutover else None,
                      require_replacement_restart=args.require_replacement_restart,
                      require_control_scope=args.require_control_scope,
-                     require_served_runtime=args.require_served_runtime)
+                     require_served_runtime=args.require_served_runtime,
+                     shutdown_gate_revision=args.shutdown_gate_revision)
             qualification = {**expected, "arch": args.arch}
             if cutover:
                 qualification["current_observations"] = True
@@ -930,6 +967,9 @@ def main():
                 qualification[CONTROL_SCOPE] = True
             if args.require_served_runtime:
                 qualification["served_runtime"] = True
+            if args.shutdown_gate_revision is not None:
+                qualification[RETAINED_SHUTDOWN] = True
+                qualification["shutdown_gate_revision"] = args.shutdown_gate_revision
             verdict.write_text(json.dumps(qualification) + "\n")
     except (Rejected, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         parser.exit(1, f"release evidence: {exc}\n")

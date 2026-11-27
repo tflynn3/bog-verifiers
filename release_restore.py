@@ -22,7 +22,7 @@ def fixture_tool(helper, *args):
     check(result.returncode == 0, f"backup fixture {args[0]} failed: {result.stderr[:500]!r}")
 
 
-def retargeted_append(bog, link, active, rows):
+def retargeted_append(bog, link, active, away_rows, back_rows):
     def ready():
         status, raw = bog.request("GET", "/ready")
         body = json.loads(raw, object_pairs_hook=unique_fields)
@@ -52,8 +52,10 @@ def retargeted_append(bog, link, active, rows):
         return 200
 
     away = retarget("/proc")
-    bog.ingest(rows)
-    return {"away_ready_status": away, "append_status": 204, "back_ready_status": retarget(active)}
+    bog.ingest(away_rows)
+    back = retarget(active)
+    bog.ingest(back_rows)
+    return dict(away_ready_status=away, append_status=204, back_ready_status=back, back_append_status=204)
 
 
 def compaction(bog, cutoff, committed):
@@ -195,7 +197,8 @@ def restore_cycles(binary, directory, helper):
         check(not (active / "bog.wal").exists(), "restore unexpectedly contains a full WAL")
         backup_meta = (active / "bog.backup").read_bytes()
         extra = [rows[1], Row(0, f"cycle {number} backfill"), Row(1, f"cycle {number} tie")]
-        next_suffix = wal_frame(encode_rows(extra))
+        batches = (extra[:1], extra[1:]) if number == 1 else (extra,)
+        next_suffix = b"".join(wal_frame(encode_rows(batch)) for batch in batches)
         augmented = rows + extra
         held = oracle(rows, 0, SECOND)
         launch = active
@@ -210,7 +213,7 @@ def restore_cycles(binary, directory, helper):
             check(rejected == 400, f"malformed restore append returned HTTP {rejected}: {body[:200]!r}")
             expect_query(bog, rows, 0, SECOND, label="rejected restore append rolled back")
             if number == 1:
-                retarget = retargeted_append(bog, launch, active, extra)
+                retarget = retargeted_append(bog, launch, active, *batches)
             else:
                 bog.ingest(extra)
             publication = compaction(bog, len(rows), len(augmented))

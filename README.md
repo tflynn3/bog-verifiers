@@ -293,8 +293,9 @@ passes. It checks ordinary WAL reopen and exact ordered replay after an
 immediate post-204 SIGKILL, with the compaction status, start, and retirement
 routes hidden by default. In the first verified restore it issues a cursor,
 retargets the configured path to procfs, and checks readiness and a durable
-append while the path points away. It checks readiness again after retargeting
-back, then verifies the held walk through publication and retirement. Both
+append while the path points away. After retargeting back it repeats both
+checks, then verifies the exact suffix from both appends and the held walk
+through publication and retirement. Both
 native verdicts require these additional observations. Historical reports
 remain readable without them.
 
@@ -388,8 +389,20 @@ restart the producer leaves a retained cursor open and sends SIGTERM
 while a two-row append is in flight. It requires HTTP 204 and a clean
 exit, then reopens the same directory to check exact ordinary and framed
 replay and rejection of the prior-process cursor. Strict served-runtime
-validation requires this shutdown evidence. Earlier schema-v1 reports
-remain readable through standard validation.
+validation requires this shutdown evidence.
+
+Both native jobs also run the race-enabled `TestReleaseRetainedShutdown`
+from the pinned shutdown tooling checkout against the same SHA-256-pinned
+candidate used by the other producers. That test holds an admitted
+continuation under TCP backpressure across compaction, observes the retired
+predecessor pin, and checks that SIGTERM closes the listener while the
+process still holds the directory lock. It drains the exact terminal NDJSON
+response, requires a clean reaped exit, and walks the same directory through
+exhaustion after restart. The gate requires one test pass and one package
+pass in `retained-shutdown-events.jsonl` and a matching successful producer
+record with the candidate revision, native architecture, and shutdown
+tooling revision. Earlier schema-v1 reports remain readable through standard
+validation.
 The shared proof and both strict consumers accept an acknowledgment at
 the fresh-visibility sample and reject one after that sample, even if it
 precedes the end of the full walk. Their fixtures cover the passing report
@@ -403,6 +416,9 @@ capacity report and runner log. Release Verification owns the pinned parity prod
 The supplemental parity report checks legacy WAL replay, append, and restart, then removes the original data and
 bundle and starts the candidate on the verified v1 restore. Ordinary queries
 and framed cursor walks check restored rows and exact parity after restart.
+The combined parity report independently kills the first restored process
+on its first HTTP 204 and checks all eight rows in order through cursor
+exhaustion after restarting the same directory.
 After the reopened restore acknowledges a second append with HTTP 204, the
 verifier requests SIGKILL of that live process before reading or closing the
 response body and checks its reaped exit signal before restarting.
