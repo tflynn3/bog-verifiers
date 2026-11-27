@@ -521,7 +521,8 @@ def validate_restore_cycles(report, *, require_served_runtime=False):
     check(isinstance(evidence, dict), f"{label}: missing evidence object")
     cycles = evidence.get("cycles")
     check(isinstance(cycles, list) and len(cycles) == 2, f"{label}: expected exactly two cycles")
-    if require_served_runtime or "ordinary_wal_reopen" in evidence or "restored_retarget" in evidence:
+    served_observations = require_served_runtime or "ordinary_wal_reopen" in evidence or "restored_retarget" in evidence
+    if served_observations:
         ordinary = evidence.get("ordinary_wal_reopen")
         hidden = ordinary.get("default_control") if isinstance(ordinary, dict) else None
         check(isinstance(ordinary, dict) and
@@ -535,7 +536,6 @@ def validate_restore_cycles(report, *, require_served_runtime=False):
               all(integer(retarget.get(key), value, value) for key, value in dict(
                   away_ready_status=200, append_status=204, back_ready_status=200).items()),
               f"{label}: missing restored path retarget readiness or append")
-        require_served_runtime = True
 
     def point(value, version, next_ordinal, committed_ordinal):
         check(isinstance(value, dict), f"{label}: missing recovery point")
@@ -570,7 +570,7 @@ def validate_restore_cycles(report, *, require_served_runtime=False):
               f"{label}: cycle {number} is missing measured predecessor pin drain")
         check(integer(cycle.get("reclaimed_bytes"), 0),
               f"{label}: cycle {number} is missing measured reclamation")
-        if require_served_runtime:
+        if served_observations:
             check(integer(cycle.get("retired_cursor_status"), 410, 410),
                   f"{label}: cycle {number} is missing the retired cursor refusal")
         generations.add(exported["generation"])
@@ -579,6 +579,13 @@ def validate_restore_cycles(report, *, require_served_runtime=False):
           all(integer(evidence.get(key), value, value) for key, value in dict(
               descriptor_ready_status=200, final_append_status=204, final_exit_signal=int(signal.SIGKILL),
               final_restart_rows=13).items()), f"{label}: missing readiness, final restart or cleanup evidence")
+    if require_served_runtime or "retained_shutdown" in evidence:
+        shutdown = evidence.get("retained_shutdown")
+        check(isinstance(shutdown, dict) and shutdown.get("held_cursor") is True and
+              shutdown.get("prior_cursor_rejected") is True and
+              all(integer(shutdown.get(key), value, value) for key, value in dict(
+                  append_status=204, exit_code=0, replay_rows=15).items()),
+              f"{label}: missing clean retained shutdown with a held cursor and durable drained append")
 
 
 def record_restore_cycles(binary, directory, expected, helper):

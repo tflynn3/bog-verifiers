@@ -223,12 +223,22 @@ class GateTest(unittest.TestCase):
         evidence.update(ordinary_wal_reopen=ordinary, restored_retarget=retarget)
         for cycle in cycles:
             cycle["retired_cursor_status"] = 410
+        validate_restore_cycles(report)
+        with self.assertRaisesRegex(verify.Rejected, "missing clean retained shutdown"):
+            validate_restore_cycles(report, require_served_runtime=True)
+        shutdown = dict(held_cursor=True, prior_cursor_rejected=True, append_status=204, exit_code=0, replay_rows=15)
+        evidence["retained_shutdown"] = shutdown
         validate_restore_cycles(report, require_served_runtime=True)
         for target, changes, reason in (
             (ordinary, {"exit_signal": 15}, "ordinary WAL crash replay"),
             (hidden, {"retire": 405}, "hidden default control"),
             (retarget, {"back_ready_status": 503}, "retarget readiness"),
             (cycles[1], {"retired_cursor_status": 400}, "retired cursor refusal"),
+            (shutdown, {"held_cursor": False}, "clean retained shutdown"),
+            (shutdown, {"prior_cursor_rejected": False}, "clean retained shutdown"),
+            (shutdown, {"append_status": 503}, "clean retained shutdown"),
+            (shutdown, {"exit_code": -15}, "clean retained shutdown"),
+            (shutdown, {"replay_rows": 14}, "clean retained shutdown"),
         ):
             with self.subTest(changes=changes), patch.dict(target, changes):
                 with self.assertRaisesRegex(verify.Rejected, reason):

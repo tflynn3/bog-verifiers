@@ -383,7 +383,13 @@ framed walks and same-directory restart. Each cycle identifies the pinned
 predecessor after a byte-identical terminal retry, explicitly retires the capture,
 and requires zero pins and observed reclamation for that replacement. The first restore
 checks `/ready` after the configured directory symlink is retargeted to
-procfs. The final restored append survives SIGKILL and replay.
+procfs. The final restored append survives SIGKILL and replay. On that
+restart the producer leaves a retained cursor open and sends SIGTERM
+while a two-row append is in flight. It requires HTTP 204 and a clean
+exit, then reopens the same directory to check exact ordinary and framed
+replay and rejection of the prior-process cursor. Strict served-runtime
+validation requires this shutdown evidence. Earlier schema-v1 reports
+remain readable through standard validation.
 The shared proof and both strict consumers accept an acknowledgment at
 the fresh-visibility sample and reject one after that sample, even if it
 precedes the end of the full walk. Their fixtures cover the passing report

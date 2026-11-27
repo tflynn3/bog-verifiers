@@ -309,9 +309,25 @@ def restore_cycles(binary, directory, helper):
                            pins_after_release=pins_after_release))
         active, point, rows = restored, exported, augmented
 
+    recovered = rows + last
+    drained = [Row(0, "backfill drained on retained shutdown"), Row(1, "tie drained on retained shutdown")]
+    payload = encode_rows(drained)
+    split = len(encode_rows(drained[:1]))
     with run_bog(binary, active, flags=flags) as bog:
-        final_rows = ordered_walk(bog, args, rows + last, "restart after acknowledged second-restore append")
+        final_rows = ordered_walk(bog, args, recovered, "restart after acknowledged second-restore append")
+        cursor = expect_page(bog, args, oracle(recovered, 0, SECOND), 0, 1, None,
+                             "held cursor before retained shutdown", exact_framing=True)
+        # Leave the capture live and keep the POST admitted while SIGTERM closes the listener.
+        with bog.open_ingest(len(payload), expect_continue=True) as client:
+            client.send(payload[:split])
+            bog.graceful_stop(client, payload[split:])
+        shutdown_exit = bog.process.returncode
+    with run_bog(binary, active, flags=flags) as bog:
+        expect_bad_query(bog, {**args, "cursor": cursor}, "cursor from clean retained shutdown")
+        shutdown_rows = ordered_walk(bog, args, recovered + drained, "replay after retained shutdown")
         bog.stop()
     return dict(initial=initial, cycles=cycles, descriptor_ready_status=retarget["away_ready_status"],
                 ordinary_wal_reopen=ordinary, restored_retarget=retarget,
-                final_append_status=204, final_exit_signal=bog_exit_signal, final_restart_rows=final_rows)
+                final_append_status=204, final_exit_signal=bog_exit_signal, final_restart_rows=final_rows,
+                retained_shutdown=dict(held_cursor=True, append_status=204, exit_code=shutdown_exit,
+                                       prior_cursor_rejected=True, replay_rows=shutdown_rows))
