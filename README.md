@@ -317,7 +317,14 @@ and the ADR 0027 crash probe on independent fixtures. The crash case
 sends SIGKILL immediately on HTTP 204 and then verifies all eight rows
 through terminal exhaustion on restart. Strict validation also checks the
 checkpoint and nonempty WAL suffix, observed signal, process reaping, and
-fixture cleanup. Standard validation still reads historical parity reports.
+fixture cleanup. Each native qualification records the crash gate checkout,
+candidate revision, fixture and candidate binary digest. The final job
+checks both crash verdicts and prints the checkout and both digests.
+Standard schema-v1 validation still accepts historical parity reports.
+The pinned capacity validation checkout checks the live capacity report.
+Route capacity fixture failures to the existing Release Verification owner
+with the native architecture, checkout and candidate revisions, and the
+capacity report and runner log.
 
 The supplemental parity report checks legacy WAL replay, append, and restart, then removes the original data and
 bundle and starts the candidate on the verified v1 restore. Ordinary queries

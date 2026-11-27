@@ -19,6 +19,7 @@ TAIL_ROWS = 2_048
 BATCH_ROWS = 64
 PRODUCERS = {"admission", "durability", "capacity", "parity"}
 FIXTURE_ROOT_CLEANUP = "fixture_root_cleanup"
+POST_RESTORE_ACK_CRASH = "post_restore_ack_crash"
 
 
 def identity(binary, revision, fixture):
@@ -358,6 +359,17 @@ def validate_budget(evidence, *, require_fixed_boundaries=False, require_tied_by
           "admission: missing budget boundary or sparse byte-trim evidence")
 
 
+def validate_restore_point(point, label):
+    check(isinstance(point, dict), f"{label}: missing verified restore point")
+    generation = point.get("Generation")
+    covered = point.get("CoveredOffset")
+    check(isinstance(generation, list) and len(generation) == 32 and
+          all(integer(byte, 0, 255) for byte in generation) and any(generation) and
+          integer(point.get("NextOrdinal"), 3, 3) and integer(covered, 1) and
+          integer(point.get("CommittedEnd"), covered + 1, (1 << 63) - 1),
+          f"{label}: expected a verified checkpoint and nonempty WAL suffix")
+
+
 def validate_parity(evidence, *, require_writable_restore=False):
     if require_writable_restore or "restore_status" in evidence:
         check(evidence.get("restore_status") == "pass", "parity: writable restore did not pass")
@@ -365,13 +377,7 @@ def validate_parity(evidence, *, require_writable_restore=False):
         hidden = evidence.get("restored_control_404_checks")
         check(integer(hidden, 4, 4) or integer(hidden, 6, 6),
               "parity: capacity control was not proven absent on restore and restart")
-    point = evidence["verified_point"]
-    generation = point["Generation"]
-    check(isinstance(generation, list) and len(generation) == 32 and
-          all(integer(byte, 0, 255) for byte in generation) and any(generation) and
-          integer(point["NextOrdinal"], 3, 3) and integer(point["CoveredOffset"], 1) and
-          integer(point["CommittedEnd"], point["CoveredOffset"] + 1),
-          "parity: expected a verified checkpoint and nonempty WAL suffix")
+    validate_restore_point(evidence.get("verified_point"), "parity")
     check(integer(evidence["legacy_rows"], 6, 6) and integer(evidence["captured_rows"], 6, 6) and
           evidence["post_restore_204"] is True and integer(evidence["post_append_rows"], 7, 7) and
           integer(evidence["restart_rows"], 7, 7), "parity: incomplete restore, ingest or restart evidence")
@@ -440,6 +446,28 @@ def record_fixture_root_cleanup(directory, expected, parent):
         cases.setdefault(FIXTURE_ROOT_CLEANUP, {"status": "pass"})
     (directory / "durability.json").write_text(json.dumps(report, indent=2) + "\n")
     passing_case(report, "durability", FIXTURE_ROOT_CLEANUP)
+
+
+def validate_combined_parity(directory, expected):
+    report = read_report(directory, "parity", expected)
+    restored = passing_case(report, "parity", "restored_parity")["evidence"]
+    check(all(integer(restored.get(key), count, count) for key, count in
+              (("captured_rows", 6), ("held_capture_rows", 6), ("post_append_rows", 7), ("restart_rows", 7))) and
+          restored.get("post_restore_204") is True, "parity: incomplete held-cursor restore and restart evidence")
+    ordinary = passing_case(report, "parity", "ordinary_wal_reopen")["evidence"]
+    check(all(integer(ordinary.get(key), value, value) for key, value in
+              (("reopened_rows", 3), ("append_status", 204), ("restart_rows", 6))),
+          "parity: incomplete ordinary WAL reopen and restart evidence")
+    label = f"parity: {POST_RESTORE_ACK_CRASH}"
+    crash = passing_case(report, "parity", POST_RESTORE_ACK_CRASH).get("evidence")
+    check(isinstance(crash, dict), f"{label}: missing evidence object")
+    validate_restore_point(crash.get("verified_point"), label)
+    check(integer(crash.get("append_status"), 204, 204) and integer(crash.get("observed_signal"), 9, 9),
+          f"{label}: expected HTTP 204 and observed SIGKILL")
+    check(crash.get("replay_matched") is True and integer(crash.get("replay_rows"), 8, 8),
+          f"{label}: expected exact replay of eight rows")
+    check(all(crash.get(key) is True for key in ("crash_candidate_reaped", "restart_candidate_reaped", "fixture_removed")),
+          f"{label}: expected both candidate processes reaped and fixture removed")
 
 
 def validate_cutover_parity(report, evidence):
@@ -520,6 +548,7 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
     control_case = passing_case(control_report, "control", "capacity_control")
     control = control_case["evidence"]
     if cutover_arch:
+        validate_combined_parity(directory, expected)
         validate_cutover_parity(parity_report, parity)
         check(parity.get("corrupt_restore_preserved") is True,
               "parity: missing corrupt restore file preservation evidence")
@@ -576,6 +605,7 @@ def main():
     parser.add_argument("fixture")
     parser.add_argument("directory", type=Path)
     parser.add_argument("--arch", choices=("amd64", "arm64"))
+    parser.add_argument("--gate-revision")
     parser.add_argument("--fixture-parent", type=Path)
     parser.add_argument("--require-fixture-root-cleanup", action="store_true")
     parser.add_argument("--require-fixed-boundaries", action="store_true")
@@ -607,6 +637,7 @@ def main():
             if cutover:
                 check(platform.system() == "Linux" and native_arch == args.arch,
                       f"cutover must be validated on native Linux {args.arch}")
+                check(re.fullmatch(r"[0-9a-f]{40}", args.gate_revision or ""), "invalid crash gate checkout revision")
             validate(directory, expected, require_fixture_root_cleanup=args.require_fixture_root_cleanup,
                      require_fixed_boundaries=args.require_fixed_boundaries,
                      require_backfill_timelines=args.require_backfill_timelines,
@@ -615,6 +646,8 @@ def main():
             qualification = {**expected, "arch": args.arch}
             if cutover:
                 qualification["current_observations"] = True
+                qualification["crash_gate_revision"] = args.gate_revision
+                qualification[POST_RESTORE_ACK_CRASH] = True
             verdict.write_text(json.dumps(qualification) + "\n")
     except (Rejected, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         parser.exit(1, f"release evidence: {exc}\n")

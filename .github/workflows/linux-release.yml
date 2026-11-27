@@ -278,15 +278,14 @@ jobs:
             go run ./verify/release validate -require-cutover -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
               -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
               -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/supplemental-parity.json" || failed=1
-            (cd ../crash-gate && go run ./verify/release validate -require-cutover \
-              -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
-              -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
-              -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json") || failed=1
+            (cd ../crash-gate && go test -count=1 \
+              -run '^(TestValidatePostRestoreAckCrashEvidence|TestAppendAndCrashOrdering)$' ./verify/release) || failed=1
             go run ./bench/retained-history -validate-cutover "$EVIDENCE/capacity.json" || failed=1
             go test -count=1 -run '^TestValidateCutoverCapacityProof$' ./verify/release || failed=1
             if (( failed != 0 )); then exit "$failed"; fi
             python3 -B "$GITHUB_WORKSPACE/verifiers/release_gate.py" validate \
               "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --arch "$RELEASE_ARCH" \
+              --gate-revision "$(git -C ../crash-gate rev-parse HEAD)" \
               --require-fixture-root-cleanup --require-fixed-boundaries --require-backfill-timelines \
               --require-capacity-observations
           } 2>&1 | tee "$EVIDENCE/validation.log"
@@ -335,10 +334,14 @@ jobs:
           read -r arm64_digest _ < "$arm64_dir/binary.sha256"
           jq -en --argjson amd64 "$amd64" --argjson arm64 "$arm64" \
             --arg amd64_digest "$amd64_digest" --arg arm64_digest "$arm64_digest" \
-            --arg revision "$REVISION" --arg fixture "$FIXTURE" '
-              $amd64.arch == "amd64" and $arm64.arch == "arm64" and
+            --arg revision "$REVISION" --arg fixture "$FIXTURE" --arg gate "$CRASH_TOOLING_REVISION" '
+              if $amd64.arch == "amd64" and $arm64.arch == "arm64" and
               ([$amd64, $arm64] | all(.schema_version == 1 and .current_observations == true and
-                .revision == $revision and .fixture == $fixture and
+                .revision == $revision and .fixture == $fixture and .crash_gate_revision == $gate and
+                .post_restore_ack_crash == true and
                 (.binary_sha256 | test("^[0-9a-f]{64}$")))) and
               $amd64.binary_sha256 == $amd64_digest and $arm64.binary_sha256 == $arm64_digest and
-              $amd64_digest != $arm64_digest'
+              $amd64_digest != $arm64_digest then
+                {revision: $revision, fixture: $fixture, crash_gate_revision: $gate,
+                  binary_sha256: {amd64: $amd64_digest, arm64: $arm64_digest}}
+              else error("native qualification identities or crash verdicts did not match") end'

@@ -11,7 +11,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import verify
-from release_gate import (CAPACITY_WORK_BUDGET, FIXTURE_ROOT_CLEANUP, MEMORY_LIMIT, record_fixture_root_cleanup,
+from release_gate import (CAPACITY_WORK_BUDGET, FIXTURE_ROOT_CLEANUP, MEMORY_LIMIT, POST_RESTORE_ACK_CRASH,
+                          record_fixture_root_cleanup, validate_combined_parity,
                           validate_backfill_timelines, validate_budget, validate_budget_trials,
                           validate_capacity_observations, validate_cutover_control, validate_memory_peak,
                           validate_cutover_parity, validate_durability, validate_no_oom_kills)
@@ -45,6 +46,50 @@ def buildable_candidate(root):
 
 
 class GateTest(unittest.TestCase):
+    def test_combined_parity_requires_candidate_bound_typed_crash_evidence(self):
+        identity = dict(schema_version=1, revision="a" * 40, fixture="linux-release-v1", binary_sha256="b" * 64)
+        point = dict(Generation=[1] + [0] * 31, NextOrdinal=3, CoveredOffset=100, CommittedEnd=200)
+        crash = dict(verified_point=point, append_status=204, observed_signal=9, replay_matched=True, replay_rows=8,
+                     crash_candidate_reaped=True, restart_candidate_reaped=True, fixture_removed=True)
+        ordinary = dict(reopened_rows=3, append_status=204, restart_rows=6)
+        restored = dict(captured_rows=6, held_capture_rows=6, post_restore_204=True, post_append_rows=7, restart_rows=7)
+        cases = {name: dict(status="pass", evidence=evidence) for name, evidence in (
+            (POST_RESTORE_ACK_CRASH, crash), ("ordinary_wal_reopen", ordinary), ("restored_parity", restored))}
+        report = dict(identity, cases=cases)
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+
+            def validate_report():
+                (directory / "parity.json").write_text(json.dumps(report))
+                validate_combined_parity(directory, identity)
+
+            validate_report()
+            for target, changes, reason in (
+                (report, {"revision": "c" * 40}, "mismatched revision"),
+                (report, {"binary_sha256": "c" * 64}, "mismatched binary_sha256"),
+                (report, {"fixture": "another-fixture"}, "mismatched fixture"),
+                (cases[POST_RESTORE_ACK_CRASH], {"status": "skip"}, "did not pass"),
+                (cases[POST_RESTORE_ACK_CRASH], {"evidence": None}, "missing evidence object"),
+                (point, {"CommittedEnd": 100}, "nonempty WAL suffix"),
+                (point, {"CommittedEnd": 1 << 63}, "nonempty WAL suffix"),
+                (point, {"Generation": [True] + [0] * 31}, "verified checkpoint"),
+                (crash, {"append_status": 200}, "HTTP 204"),
+                (crash, {"observed_signal": "9"}, "observed SIGKILL"),
+                (crash, {"replay_matched": 1}, "exact replay"),
+                (crash, {"replay_rows": 8.0}, "exact replay"),
+                (crash, {"crash_candidate_reaped": False}, "processes reaped"),
+                (crash, {"restart_candidate_reaped": None}, "processes reaped"),
+                (crash, {"fixture_removed": False}, "fixture removed"),
+                (ordinary, {"restart_rows": 7}, "ordinary WAL"),
+                (restored, {"held_capture_rows": 5}, "held-cursor restore"),
+            ):
+                with self.subTest(changes=changes), patch.dict(target, changes):
+                    with self.assertRaisesRegex(verify.Rejected, reason):
+                        validate_report()
+            del cases[POST_RESTORE_ACK_CRASH]
+            with self.assertRaisesRegex(verify.Rejected, f"missing required case {POST_RESTORE_ACK_CRASH}"):
+                validate_report()
+
     def test_cutover_requires_retirement_exit_and_cleanup_evidence(self):
         retirement = dict(status="pass", retire_http_status=204, terminal_page_retried=True,
                           invalid_cursor_http_status=400, pins_while_held=1, pins_after_release=0)
