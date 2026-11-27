@@ -513,7 +513,7 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
     validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected),
                       require_backfill_timelines=require_backfill_timelines,
                       require_capacity_observations=require_capacity_observations)
-    parity_report = read_report(directory, "parity", expected)
+    parity_report = read_report(directory, "supplemental-parity" if cutover_arch else "parity", expected)
     parity = passing_case(parity_report, "parity", "restored_parity")["evidence"]
     validate_parity(parity, require_writable_restore=require_backfill_timelines)
     control_report = read_report(directory, "control", expected)

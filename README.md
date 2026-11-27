@@ -310,7 +310,16 @@ Failed runs upload the producer report and logs when available. The workflow
 records the fixture-root check even when the producer exits with an error.
 Historical schema v1 parsing remains available without the current evidence flags.
 
-Restored parity checks legacy WAL replay, append, and restart, then removes the original data and
+Both native jobs require an explicit passing `TestReleaseRestoredParity`
+event in `parity-events.jsonl` and a matching schema-v1 `parity.json`.
+The combined producer runs ordinary WAL reopen, held-cursor restore parity,
+and the ADR 0027 crash probe on independent fixtures. The crash case
+sends SIGKILL immediately on HTTP 204 and then verifies all eight rows
+through terminal exhaustion on restart. Strict validation also checks the
+checkpoint and nonempty WAL suffix, observed signal, process reaping, and
+fixture cleanup. Standard validation still reads historical parity reports.
+
+The supplemental parity report checks legacy WAL replay, append, and restart, then removes the original data and
 bundle and starts the candidate on the verified v1 restore. Ordinary queries
 and framed cursor walks check restored rows and exact parity after restart.
 After the reopened restore acknowledges a second append with HTTP 204, the

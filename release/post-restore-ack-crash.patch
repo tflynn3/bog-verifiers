@@ -1,0 +1,150 @@
+diff --git a/verify/release/parity_linux_test.go b/verify/release/parity_linux_test.go
+--- a/verify/release/parity_linux_test.go
++++ b/verify/release/parity_linux_test.go
+@@ -62 +62,6 @@
+-	if err := errors.Join(probeErr, ordinaryErr, writeReport(path, results)); err != nil {
++	// Give the independent restore and crash its own probe deadline.
++	crashCtx, cancelCrash := context.WithTimeout(t.Context(), time.Minute)
++	defer cancelCrash()
++	crash, crashErr := postRestoreAckCrash(crashCtx, binary)
++	crashErr = record(results.Cases, postRestoreAckCrashCase, crash, crashErr)
++	if err := errors.Join(probeErr, ordinaryErr, crashErr, writeReport(path, results)); err != nil {
+diff --git a/verify/release/main.go b/verify/release/main.go
+--- a/verify/release/main.go
++++ b/verify/release/main.go
+@@ -67 +67 @@
+-				cases = append(cases, ordinaryWALCase)
++				cases = append(cases, ordinaryWALCase, postRestoreAckCrashCase)
+diff --git a/verify/release/post_restore_ack_crash_linux_test.go b/verify/release/post_restore_ack_crash_linux_test.go
+--- a/verify/release/post_restore_ack_crash_linux_test.go
++++ b/verify/release/post_restore_ack_crash_linux_test.go
+@@ -23,5 +22,0 @@
+-const (
+-	postRestoreAckCrashCase = "post_restore_ack_crash"
+-	postRestoreCrashRows    = parityFixtureRows + 2
+-)
+-
+@@ -39,2 +34 @@
+-// TestReleasePostRestoreAckCrash can run on either native release runner
+-// before this case is wired into the combined parity producer.
++// TestReleasePostRestoreAckCrash also supports a standalone native run.
+diff --git a/verify/release/report.go b/verify/release/report.go
+--- a/verify/release/report.go
++++ b/verify/release/report.go
+@@ -194,0 +195,4 @@
++	case postRestoreAckCrashCase:
++		if opts.requireCutover {
++			return validatePostRestoreAckCrash(fields["evidence"])
++		}
+diff --git a/verify/release/report_test.go b/verify/release/report_test.go
+--- a/verify/release/report_test.go
++++ b/verify/release/report_test.go
+@@ -26,0 +27,3 @@
++
++var postRestoreAckPointJSON = fmt.Sprintf(`{"Generation":[1%s],"CoveredOffset":100,"NextOrdinal":3,"CommittedEnd":200}`, strings.Repeat(",0", 31))
++var postRestoreAckCrashJSON = `{"verified_point":` + postRestoreAckPointJSON + `,"append_status":204,"observed_signal":9,"replay_matched":true,"replay_rows":8,"crash_candidate_reaped":true,"restart_candidate_reaped":true,"fixture_removed":true}`
+@@ -293,0 +297 @@
++	parity.Cases[postRestoreAckCrashCase] = outcome{Status: "pass", Evidence: jsontext.Value(postRestoreAckCrashJSON)}
+@@ -466,0 +471,40 @@
++
++func TestValidatePostRestoreAckCrashEvidence(t *testing.T) {
++	id := identity{1, testRevision, strings.Repeat("a", 64), capacityFixtureID}
++	proof := postRestoreAckCrashJSON
++	required := []string{restoredParityCase, ordinaryWALCase, postRestoreAckCrashCase}
++	for _, tc := range []struct {
++		name, status, evidence string
++		pass                   bool
++	}{
++		{"valid", "pass", proof, true},
++		{"historical", "", "", false},
++		{"skip", "skip", proof, false},
++		{"string signal", "pass", strings.Replace(proof, `"observed_signal":9`, `"observed_signal":"9"`, 1), false},
++		{"no committed suffix", "pass", strings.Replace(proof, `"CommittedEnd":200`, `"CommittedEnd":100`, 1), false},
++		{"unmatched replay", "pass", strings.Replace(proof, `"replay_matched":true`, `"replay_matched":false`, 1), false},
++		{"missing cleanup", "pass", strings.Replace(proof, `,"fixture_removed":true`, "", 1), false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			cases := map[string]outcome{
++				ordinaryWALCase:    {Status: "pass", Evidence: jsontext.Value(ordinaryWALJSON)},
++				restoredParityCase: {Status: "pass", Evidence: jsontext.Value(restoredParityJSON)},
++			}
++			if tc.status != "" {
++				cases[postRestoreAckCrashCase] = outcome{Status: tc.status, Evidence: jsontext.Value(tc.evidence)}
++			}
++			raw, err := json.Marshal(report{id, cases})
++			if err != nil {
++				t.Fatal(err)
++			}
++			if err := validateReportWithOptions(raw, id, required, validationOptions{requireCutover: true}); (err == nil) != tc.pass {
++				t.Fatalf("cutover validation = %v, want pass %t", err, tc.pass)
++			}
++			if tc.status == "" {
++				if err := validateReport(raw, id, []string{restoredParityCase}); err != nil {
++					t.Fatalf("historical validation: %v", err)
++				}
++			}
++		})
++	}
++}
+diff --git a/verify/release/recovery.go b/verify/release/recovery.go
+--- a/verify/release/recovery.go
++++ b/verify/release/recovery.go
+@@ -6,0 +7 @@
++	"syscall"
+@@ -10,2 +11,3 @@
+-	ordinaryWALCase    = "ordinary_wal_reopen"
+-	restoredParityCase = "restored_parity"
++	ordinaryWALCase         = "ordinary_wal_reopen"
++	restoredParityCase      = "restored_parity"
++	postRestoreAckCrashCase = "post_restore_ack_crash"
+@@ -16,0 +19 @@
++	postRestoreCrashRows  = parityFixtureRows + 2
+@@ -57,0 +61,43 @@
++
++func validatePostRestoreAckCrash(raw jsontext.Value) error {
++	var point jsontext.Value
++	var status, observedSignal, rows int
++	var matched, crashReaped, restartReaped, removed bool
++	if _, err := decodeFields(raw, map[string]any{
++		"verified_point": &point, "append_status": &status, "observed_signal": &observedSignal,
++		"replay_matched": &matched, "replay_rows": &rows, "crash_candidate_reaped": &crashReaped,
++		"restart_candidate_reaped": &restartReaped, "fixture_removed": &removed,
++	}); err != nil {
++		return fmt.Errorf("evidence: %w", err)
++	}
++	var generation []*uint8
++	var covered, committed, next int64
++	if _, err := decodeFields(point, map[string]any{
++		"Generation": &generation, "CoveredOffset": &covered, "CommittedEnd": &committed, "NextOrdinal": &next,
++	}); err != nil {
++		return fmt.Errorf("verified point: %w", err)
++	}
++	if len(generation) != 32 || covered <= 0 || committed <= covered || next != paritySeedRows {
++		return fmt.Errorf("verified point: require a checkpoint at ordinal %d and a committed WAL suffix", paritySeedRows)
++	}
++	nonzero := false
++	for _, b := range generation {
++		if b == nil {
++			return fmt.Errorf("verified point: null generation byte")
++		}
++		nonzero = nonzero || *b != 0
++	}
++	if !nonzero {
++		return fmt.Errorf("verified point: empty checkpoint generation")
++	}
++	if status != http.StatusNoContent || observedSignal != int(syscall.SIGKILL) {
++		return fmt.Errorf("require immediate HTTP 204 and observed SIGKILL, got status=%d signal=%d", status, observedSignal)
++	}
++	if !matched || rows != postRestoreCrashRows {
++		return fmt.Errorf("require exact replay of %d rows, got matched=%t rows=%d", postRestoreCrashRows, matched, rows)
++	}
++	if !crashReaped || !restartReaped || !removed {
++		return fmt.Errorf("require reaping and fixture removal, got crash_reaped=%t restart_reaped=%t fixture_removed=%t", crashReaped, restartReaped, removed)
++	}
++	return nil
++}
+diff --git a/verify/release/capacity_cutover_test.go b/verify/release/capacity_cutover_test.go
+--- a/verify/release/capacity_cutover_test.go
++++ b/verify/release/capacity_cutover_test.go
+@@ -65,0 +66 @@
++			postRestoreAckCrashCase: jsontext.Value(postRestoreAckCrashJSON),

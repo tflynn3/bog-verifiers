@@ -19,6 +19,7 @@ env:
   FIXTURE: linux-release-v1
   BOG_REPOSITORY: tflynn3/bog
   TOOLING_REVISION: abefdb5dcdc1f8bbbecdc9c0cc7ab39b309a87db
+  CRASH_TOOLING_REVISION: 339ea819100ef3d8e2fca3b40936e4288ae313d3
   CAPACITY_VALIDATION_REVISION: b3cd5607e71e1b40872045d2097aac693de0269e
   ADMISSION_TOOLING_REVISION: 304749df78fe3dfaa75ce411efa34708269af659
   REVISION: ${{ inputs.revision }}
@@ -81,6 +82,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ env.BOG_REPOSITORY }}
+          ref: ${{ env.CRASH_TOOLING_REVISION }}
+          path: crash-gate
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BOG_REPOSITORY }}
           ref: ${{ env.CAPACITY_VALIDATION_REVISION }}
           path: capacity-validation
           persist-credentials: false
@@ -97,7 +105,7 @@ jobs:
           cp admission/verify/release/README.md "$EVIDENCE/fixture.md"
           cp candidate/verify/linux/README.md "$EVIDENCE/durability-fixture.md"
           cp candidate/bench/retained-history/README.md "$EVIDENCE/capacity-fixture.md"
-          cp verifiers/release/{fixed-budget,restored-parity,capacity-validation}.patch "$EVIDENCE/"
+          cp verifiers/release/{fixed-budget,restored-parity,capacity-validation,post-restore-ack-crash}.patch "$EVIDENCE/"
           cp verifiers/release/admission/fixed-boundaries.patch "$EVIDENCE/"
           printf 'tooling_revision=%s\nverifier_revision=%s\n' "$(git -C gate rev-parse HEAD)" \
             "$(git -C verifiers rev-parse HEAD)" | tee -a "$EVIDENCE/run.txt"
@@ -112,6 +120,10 @@ jobs:
           validation_revision=$(git -C capacity-validation rev-parse HEAD)
           printf 'capacity_validation_revision=%s\n' "$validation_revision" | tee -a "$EVIDENCE/run.txt"
           [[ "$validation_revision" == "$CAPACITY_VALIDATION_REVISION" ]]
+          crash_revision=$(git -C crash-gate rev-parse HEAD)
+          printf 'crash_tooling_revision=%s\n' "$crash_revision" | tee -a "$EVIDENCE/run.txt"
+          [[ "$crash_revision" == "$CRASH_TOOLING_REVISION" ]]
+          git -C crash-gate apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/post-restore-ack-crash.patch
           git -C gate apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/{fixed-budget,restored-parity}.patch
           git -C admission apply --unidiff-zero "$GITHUB_WORKSPACE/verifiers/release/admission/fixed-boundaries.patch"
           git -C capacity-validation apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/capacity-validation.patch
@@ -172,7 +184,10 @@ jobs:
               2>&1 | tee "$EVIDENCE/control.log" || exit
             case "$(jq -er '.cases.capacity_control.status' "$EVIDENCE/control.json")" in
               skip) echo "Live capacity skipped. See control.json."; exit 0 ;;
-              pass) ;;
+              pass)
+                jq -e '.cases.capacity_control.evidence.environment_opt_in == true' "$EVIDENCE/control.json" >/dev/null ||
+                  { echo "Strict live capacity requires BOG_CAPACITY_CONTROL=1 on loopback."; exit 1; }
+                ;;
               *) exit 1 ;;
             esac
             cd candidate || exit
@@ -228,9 +243,19 @@ jobs:
               export BOG_RELEASE_OPERATOR="$RUNNER_TEMP/bog-release-operator"
               (cd candidate && go build -trimpath -o "$BOG_RELEASE_OPERATOR" ./cmd/bog-verify) || exit
             fi
-            cd gate || exit
             export BOG_RELEASE_BINARY="$BINARY" BOG_RELEASE_REVISION="$REVISION" BOG_RELEASE_FIXTURE="$FIXTURE"
-            export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/parity.json"
+            (
+              cd crash-gate || exit
+              export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/parity.json"
+              timeout --kill-after=5s 3m go test -json -count=1 -run '^TestReleaseRestoredParity$' ./verify/release
+            ) | tee "$EVIDENCE/parity-events.jsonl" || exit
+            jq -es 'any(.[]; .Action == "pass" and .Package == "bog/verify/release" and
+              .Test == "TestReleaseRestoredParity")' "$EVIDENCE/parity-events.jsonl" >/dev/null ||
+              { echo "TestReleaseRestoredParity did not report a passing test event."; exit 1; }
+            [[ -s "$EVIDENCE/parity.json" ]] || { echo "Combined parity report is missing."; exit 1; }
+
+            cd gate || exit
+            export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/supplemental-parity.json"
             timeout --kill-after=5s 3m go test -json -count=1 -run '^TestReleaseRestoredParity$' ./verify/release
           )
           failed=0
@@ -252,7 +277,11 @@ jobs:
             sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
             go run ./verify/release validate -require-cutover -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
               -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
-              -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
+              -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/supplemental-parity.json" || failed=1
+            (cd ../crash-gate && go run ./verify/release validate -require-cutover \
+              -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
+              -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
+              -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json") || failed=1
             go run ./bench/retained-history -validate-cutover "$EVIDENCE/capacity.json" || failed=1
             go test -count=1 -run '^TestValidateCutoverCapacityProof$' ./verify/release || failed=1
             if (( failed != 0 )); then exit "$failed"; fi
