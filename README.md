@@ -288,6 +288,16 @@ exact restart replay in both retarget directions, and recovery after freeing
 space. Historical reports may
 omit it, and an explicit cleanup failure rejects either report format.
 
+The writable restore probe runs after the selected-tail capability probe
+passes. It checks ordinary WAL reopen and exact ordered replay after an
+immediate post-204 SIGKILL, with the compaction status, start, and retirement
+routes hidden by default. In the first verified restore it issues a cursor,
+retargets the configured path to procfs, and checks readiness and a durable
+append while the path points away. It checks readiness again after retargeting
+back, then verifies the held walk through publication and retirement. Both
+native verdicts require these additional observations. Historical reports
+remain readable without them.
+
 At both 196,608 and 393,216 seed rows under the 128 MiB cgroup limit, the
 capacity producer records clustered and scattered backfill timelines.
 Each proves an acknowledged append and continuation during compaction,
@@ -307,7 +317,9 @@ with the continuation token that fetched that page.
 Qualification requires an observed zero after retirement, reclamation credit
 for the corresponding predecessor and replacement generations, and an exact
 fresh walk. The benchmark runs both its strict cutover and correlated-evidence
-validators on the same report consumed by the strict release validator. On
+validators on the same report consumed by the strict release validator. The
+workflow checks the report identity against the architecture's build digest
+and rechecks the binary after running the validators. On
 restart in the same directory, the producer reads back the published
 generation, covered cutoff, and committed row count. The independent append
 ledger checks the full ordered walk through the committed suffix and terminal

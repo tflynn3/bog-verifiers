@@ -7,10 +7,10 @@ import subprocess
 import time
 from urllib.parse import urlencode
 
-from verify import (CAPACITY_PATH, RETAINED_TAIL_FLAG, SECOND, WAL_MAGIC, Row,
-                    advertised_flags, check, commit_marker, decode_rows, encode_rows, expect_page, expect_query,
-                    expect_query_error, expect_rows,
-                    expect_walk, oracle, query_args, run_bog, unique_fields, wal_frame)
+from verify import (CAPACITY_PATH, CONTROL_SCOPE_REQUESTS, RETAINED_TAIL_FLAG, SECOND, WAL_MAGIC, Row,
+                    advertised_flags, check, commit_marker, decode_rows, encode_rows, expect_bad_query,
+                    expect_page, expect_query, expect_query_error, expect_rows, expect_walk, oracle,
+                    query_args, run_bog, unique_fields, wal_frame)
 
 
 def digest(data):
@@ -22,7 +22,7 @@ def fixture_tool(helper, *args):
     check(result.returncode == 0, f"backup fixture {args[0]} failed: {result.stderr[:500]!r}")
 
 
-def ready_after_retarget(bog, link):
+def retargeted_append(bog, link, active, rows):
     def ready():
         status, raw = bog.request("GET", "/ready")
         body = json.loads(raw, object_pairs_hook=unique_fields)
@@ -43,12 +43,17 @@ def ready_after_retarget(bog, link):
     ready()
     check(os.statvfs(link).f_bavail > 0 and os.statvfs("/proc").f_bavail == 0,
           "readiness fixture requires headroom at the active directory and none on procfs")
-    replacement = link.with_suffix(".replacement")
-    replacement.symlink_to("/proc", target_is_directory=True)
-    replacement.replace(link)
-    time.sleep(6.1)  # Outlive the five-second evidence window and a refresh interval.
-    ready()
-    return 200
+    def retarget(target):
+        replacement = link.with_suffix(".replacement")
+        replacement.symlink_to(target, target_is_directory=True)
+        replacement.replace(link)
+        time.sleep(6.1)  # Outlive the five-second evidence window and a refresh interval.
+        ready()
+        return 200
+
+    away = retarget("/proc")
+    bog.ingest(rows)
+    return {"away_ready_status": away, "append_status": 204, "back_ready_status": retarget(active)}
 
 
 def compaction(bog, cutoff, committed):
@@ -99,6 +104,42 @@ def append_and_kill(bog, rows):
     return -bog.process.returncode
 
 
+def ordered_walk(bog, args, expected, label):
+    ordered = oracle(expected, 0, SECOND)
+    body, cursor = bog.query_ndjson(args, exact_framing=True)
+    check(cursor is None, f"{label}: ordinary query returned a cursor")
+    expect_rows(decode_rows(body), ordered, f"{label}: ordinary query")
+    expect_walk(bog, args, ordered, (1, 2), label, exact_framing=True)
+    return len(ordered)
+
+
+def ordinary_wal_reopen(binary, directory, args, flags, rows, extra):
+    directory.mkdir()
+    prefix = WAL_MAGIC + wal_frame(encode_rows(rows))
+    (directory / "bog.wal").write_bytes(prefix)
+    (directory / "bog.commit").write_bytes(commit_marker(len(prefix)))
+    with run_bog(binary, directory, flags=flags) as bog:
+        reopened = ordered_walk(bog, args, rows, "ordinary WAL reopen")
+        cursor = expect_page(bog, args, oracle(rows, 0, SECOND), 0, 1, None,
+                             "ordinary WAL capture", exact_framing=True)
+        hidden = {}
+        for action, method, path in CONTROL_SCOPE_REQUESTS:
+            if action == "start":
+                path = f"{CAPACITY_PATH}?action=start&cutoff={len(rows)}"
+            elif action == "retire":
+                path += "&" + urlencode({"cursor": cursor})
+            status, _ = bog.request(method, path)
+            check(status == 404, f"ordinary WAL without opt-in: {action} returned HTTP {status}")
+            hidden[action] = status
+        exit_signal = append_and_kill(bog, extra)
+    with run_bog(binary, directory, flags=flags) as bog:
+        expect_bad_query(bog, {**args, "cursor": cursor}, "prior-process ordinary WAL cursor")
+        replayed = ordered_walk(bog, args, rows + extra, "ordinary WAL replay after immediate SIGKILL")
+        bog.stop()
+    return dict(reopened_rows=reopened, append_status=204, exit_signal=exit_signal,
+                replay_rows=replayed, default_control=hidden)
+
+
 def bundle_point(bundle, version, covered, next_ordinal, committed, suffix, predecessor=None):
     raw = (bundle / "bog.backup").read_bytes()
     rsuffix = (bundle / "bog.wal.tail").read_bytes()
@@ -147,14 +188,7 @@ def restore_cycles(binary, directory, helper):
     seed.rename(seed.with_suffix(".parked"))
     flags = (f"{RETAINED_TAIL_FLAG}=65536",) if RETAINED_TAIL_FLAG in available else ()
     args = query_args(0, SECOND)
-
-    def walk(bog, expected, label):
-        ordered = oracle(expected, 0, SECOND)
-        body, cursor = bog.query_ndjson(args, exact_framing=True)
-        check(cursor is None, f"{label}: ordinary query returned a cursor")
-        expect_rows(decode_rows(body), ordered, f"{label}: ordinary query")
-        expect_walk(bog, args, ordered, (1, 2), label, exact_framing=True)
-        return len(expected)
+    ordinary = ordinary_wal_reopen(binary, directory / "ordinary", args, flags, rows[:3], suffix_rows)
 
     cycles = []
     for number in (1, 2):
@@ -169,15 +203,16 @@ def restore_cycles(binary, directory, helper):
             launch = directory / "data-link"
             launch.symlink_to(active, target_is_directory=True)
         with run_bog(binary, launch, capacity=True, flags=flags) as bog:
-            if number == 1:
-                readiness = ready_after_retarget(bog, launch)
             predecessor = compaction_status(bog, "GET", "status", point["next_ordinal"])["generation"]
             cursor = expect_page(bog, args, held, 0, 1, None, "initial retained page", exact_framing=True)
             bad_batch = encode_rows([Row(1, f"cycle {number} rejected row")]) + b'{"ts":'
             rejected, body = bog.request("POST", "/ingest", bad_batch)
             check(rejected == 400, f"malformed restore append returned HTTP {rejected}: {body[:200]!r}")
             expect_query(bog, rows, 0, SECOND, label="rejected restore append rolled back")
-            bog.ingest(extra)
+            if number == 1:
+                retarget = retargeted_append(bog, launch, active, extra)
+            else:
+                bog.ingest(extra)
             publication = compaction(bog, len(rows), len(augmented))
             continuation = {**args, "cursor": cursor, "limit": 2}
             page, next_cursor = bog.query_ndjson(continuation, exact_framing=True)
@@ -203,7 +238,7 @@ def restore_cycles(binary, directory, helper):
             retire = urlencode({"action": "retire", "cursor": terminal_cursor})
             status, body = bog.request("POST", f"{CAPACITY_PATH}?{retire}")
             check(status == 204 and not body, f"predecessor capture retirement returned HTTP {status}: {body!r}")
-            expect_query_error(bog, terminal_args, 410, "retired predecessor cursor")
+            retired = expect_query_error(bog, terminal_args, 410, "retired predecessor cursor")["status"]
             deadline = time.monotonic() + 5
             while True:
                 pins_after_release, metrics = predecessor_observation(bog, publication)
@@ -216,7 +251,9 @@ def restore_cycles(binary, directory, helper):
                       f"predecessor pin drain or reclamation did not finish: "
                       f"remaining pins={pins_after_release}, reclaimed bytes={reclaimed}")
                 time.sleep(0.02)
-            fresh = walk(bog, augmented, "fresh retained walk after advance")
+            fresh = ordered_walk(bog, args, augmented, "fresh retained walk after advance")
+            stale_cursor = expect_page(bog, args, oracle(augmented, 0, SECOND), 0, 1, None,
+                                       "capture before replacement restart", exact_framing=True)
             bog.kill()
             replacement_signal = -bog.process.returncode
 
@@ -244,13 +281,15 @@ def restore_cycles(binary, directory, helper):
         with run_bog(binary, active, flags=flags) as bog:
             hidden, _ = bog.request("GET", f"{CAPACITY_PATH}?action=status")
             check(hidden == 404, f"default compaction status returned HTTP {hidden}")
-            restarted = walk(bog, augmented, "same-directory restart after advance")
+            expect_bad_query(bog, {**args, "cursor": stale_cursor}, "prior-process retained cursor")
+            restarted = ordered_walk(bog, args, augmented, "same-directory restart after advance")
             restart_append_signal = append_and_kill(bog, restart_append)
         with run_bog(binary, active, flags=flags) as bog:
-            restart_append_rows = walk(bog, augmented + restart_append, "replay after replacement restart append")
+            restart_append_rows = ordered_walk(bog, args, augmented + restart_append,
+                                               "replay after replacement restart append")
             bog.stop()
         with run_bog(binary, restored, flags=flags) as bog:
-            restored_rows = walk(bog, augmented, "independent writable restore")
+            restored_rows = ordered_walk(bog, args, augmented, "independent writable restore")
             if number == 2:
                 last = [Row(1, "tie appended after second restore")]
                 bog_exit_signal = append_and_kill(bog, last)
@@ -265,12 +304,14 @@ def restore_cycles(binary, directory, helper):
                            restart_append_exit_signal=restart_append_signal,
                            restart_append_replay_rows=restart_append_rows,
                            reclaimed_bytes=reclaimed,
+                           retired_cursor_status=retired,
                            default_control_status=hidden, pins_while_held=pins_while_held,
                            pins_after_release=pins_after_release))
         active, point, rows = restored, exported, augmented
 
     with run_bog(binary, active, flags=flags) as bog:
-        final_rows = walk(bog, rows + last, "restart after acknowledged second-restore append")
+        final_rows = ordered_walk(bog, args, rows + last, "restart after acknowledged second-restore append")
         bog.stop()
-    return dict(initial=initial, cycles=cycles, descriptor_ready_status=readiness,
+    return dict(initial=initial, cycles=cycles, descriptor_ready_status=retarget["away_ready_status"],
+                ordinary_wal_reopen=ordinary, restored_retarget=retarget,
                 final_append_status=204, final_exit_signal=bog_exit_signal, final_restart_rows=final_rows)

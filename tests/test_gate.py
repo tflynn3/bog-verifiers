@@ -194,6 +194,8 @@ class GateTest(unittest.TestCase):
             validate_restore_cycles(report)
         case = cases[WRITABLE_RESTORE_CYCLES] = dict(status="pass", evidence=evidence)
         validate_restore_cycles(report)
+        with self.assertRaisesRegex(verify.Rejected, "missing ordinary WAL"):
+            validate_restore_cycles(report, require_served_runtime=True)
         for target, changes, reason in (
             (case, {"status": "skip"}, "did not pass"),
             (evidence, {"cycles": cycles[:1]}, "exactly two"),
@@ -215,6 +217,22 @@ class GateTest(unittest.TestCase):
             with self.subTest(changes=changes), patch.dict(target, changes):
                 with self.assertRaisesRegex(verify.Rejected, reason):
                     validate_restore_cycles(report)
+        hidden = dict(status=404, start=404, retire=404)
+        ordinary = dict(reopened_rows=3, append_status=204, exit_signal=9, replay_rows=6, default_control=hidden)
+        retarget = dict(away_ready_status=200, append_status=204, back_ready_status=200)
+        evidence.update(ordinary_wal_reopen=ordinary, restored_retarget=retarget)
+        for cycle in cycles:
+            cycle["retired_cursor_status"] = 410
+        validate_restore_cycles(report, require_served_runtime=True)
+        for target, changes, reason in (
+            (ordinary, {"exit_signal": 15}, "ordinary WAL crash replay"),
+            (hidden, {"retire": 405}, "hidden default control"),
+            (retarget, {"back_ready_status": 503}, "retarget readiness"),
+            (cycles[1], {"retired_cursor_status": 400}, "retired cursor refusal"),
+        ):
+            with self.subTest(changes=changes), patch.dict(target, changes):
+                with self.assertRaisesRegex(verify.Rejected, reason):
+                    validate_restore_cycles(report, require_served_runtime=True)
 
     def test_native_replacement_requires_ordered_suffix_and_terminal_retry(self):
         rows, backfill, suffix = verify.replacement_fixture()

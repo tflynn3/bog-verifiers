@@ -489,7 +489,7 @@ def record_fixture_root_cleanup(directory, expected, parent):
     passing_case(report, "durability", FIXTURE_ROOT_CLEANUP)
 
 
-def validate_combined_parity(directory, expected, *, require_restore_cycles=False):
+def validate_combined_parity(directory, expected, *, require_restore_cycles=False, require_served_runtime=False):
     report = read_report(directory, "parity", expected)
     restored = passing_case(report, "parity", "restored_parity")["evidence"]
     check(all(integer(restored.get(key), count, count) for key, count in
@@ -512,15 +512,30 @@ def validate_combined_parity(directory, expected, *, require_restore_cycles=Fals
 
     if require_restore_cycles:
         passing_case(report, "parity", TAIL_ONLY_PARITY)
-        validate_restore_cycles(report)
+        validate_restore_cycles(report, require_served_runtime=require_served_runtime)
 
 
-def validate_restore_cycles(report):
+def validate_restore_cycles(report, *, require_served_runtime=False):
     label = f"parity: {WRITABLE_RESTORE_CYCLES}"
     evidence = passing_case(report, "parity", WRITABLE_RESTORE_CYCLES).get("evidence")
     check(isinstance(evidence, dict), f"{label}: missing evidence object")
     cycles = evidence.get("cycles")
     check(isinstance(cycles, list) and len(cycles) == 2, f"{label}: expected exactly two cycles")
+    if require_served_runtime or "ordinary_wal_reopen" in evidence or "restored_retarget" in evidence:
+        ordinary = evidence.get("ordinary_wal_reopen")
+        hidden = ordinary.get("default_control") if isinstance(ordinary, dict) else None
+        check(isinstance(ordinary, dict) and
+              all(integer(ordinary.get(key), value, value) for key, value in dict(
+                  reopened_rows=3, append_status=204, exit_signal=int(signal.SIGKILL), replay_rows=6).items()) and
+              isinstance(hidden, dict) and set(hidden) == {"status", "start", "retire"} and
+              all(integer(status, 404, 404) for status in hidden.values()),
+              f"{label}: missing ordinary WAL crash replay or hidden default control")
+        retarget = evidence.get("restored_retarget")
+        check(isinstance(retarget, dict) and
+              all(integer(retarget.get(key), value, value) for key, value in dict(
+                  away_ready_status=200, append_status=204, back_ready_status=200).items()),
+              f"{label}: missing restored path retarget readiness or append")
+        require_served_runtime = True
 
     def point(value, version, next_ordinal, committed_ordinal):
         check(isinstance(value, dict), f"{label}: missing recovery point")
@@ -555,6 +570,9 @@ def validate_restore_cycles(report):
               f"{label}: cycle {number} is missing measured predecessor pin drain")
         check(integer(cycle.get("reclaimed_bytes"), 0),
               f"{label}: cycle {number} is missing measured reclamation")
+        if require_served_runtime:
+            check(integer(cycle.get("retired_cursor_status"), 410, 410),
+                  f"{label}: cycle {number} is missing the retired cursor refusal")
         generations.add(exported["generation"])
         previous = exported
     check(evidence.get("fixture_removed") is True and
@@ -582,7 +600,7 @@ def record_restore_cycles(binary, directory, expected, helper):
                 evidence = restore_cycles(binary, Path(workspace) / "cycles", helper)
             evidence["fixture_removed"] = not Path(workspace).exists()
             case.update(status="pass", evidence=evidence)
-            validate_restore_cycles(report)
+            validate_restore_cycles(report, require_served_runtime=True)
     except Exception as exc:
         case.update(status="fail", detail=str(exc))
         raise
@@ -719,7 +737,7 @@ def validate_replacement_restart(report, control):
 
 def validate(directory, expected, *, require_fixture_root_cleanup=False, require_fixed_boundaries=False,
              require_backfill_timelines=False, require_capacity_observations=False, cutover_arch=None,
-             require_replacement_restart=False, require_control_scope=False):
+             require_replacement_restart=False, require_control_scope=False, require_served_runtime=False):
     if cutover_arch:
         expected = {**expected, "arch": cutover_arch}
     statuses = (directory / "producers.txt").read_text().splitlines()
@@ -741,7 +759,8 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
     control_case = passing_case(control_report, "control", "capacity_control")
     control = control_case["evidence"]
     if cutover_arch:
-        validate_combined_parity(directory, expected, require_restore_cycles=True)
+        validate_combined_parity(directory, expected, require_restore_cycles=True,
+                                 require_served_runtime=require_served_runtime)
         validate_cutover_parity(parity_report, parity)
         check(parity.get("corrupt_restore_preserved") is True,
               "parity: missing corrupt restore file preservation evidence")
@@ -825,6 +844,7 @@ def main():
     parser.add_argument("--require-capacity-observations", action="store_true")
     parser.add_argument("--require-replacement-restart", action="store_true")
     parser.add_argument("--require-control-scope", action="store_true")
+    parser.add_argument("--require-served-runtime", action="store_true")
     parser.add_argument("--restore-helper", type=Path)
     args = parser.parse_args()
     try:
@@ -858,6 +878,8 @@ def main():
                   "replacement restart evidence requires strict native cutover validation")
             check(not args.require_control_scope or cutover,
                   "control scope evidence requires strict native cutover validation")
+            check(not args.require_served_runtime or cutover,
+                  "served runtime evidence requires strict native cutover validation")
             if cutover or args.binary_sha256 is not None:
                 check(expected["binary_sha256"] == args.binary_sha256,
                       "candidate binary SHA-256 differs from the native build pin")
@@ -874,7 +896,8 @@ def main():
                      require_capacity_observations=args.require_capacity_observations,
                      cutover_arch=args.arch if cutover else None,
                      require_replacement_restart=args.require_replacement_restart,
-                     require_control_scope=args.require_control_scope)
+                     require_control_scope=args.require_control_scope,
+                     require_served_runtime=args.require_served_runtime)
             qualification = {**expected, "arch": args.arch}
             if cutover:
                 qualification["current_observations"] = True
@@ -888,6 +911,8 @@ def main():
                 qualification[REPLACEMENT_RESTART] = True
             if args.require_control_scope:
                 qualification[CONTROL_SCOPE] = True
+            if args.require_served_runtime:
+                qualification["served_runtime"] = True
             verdict.write_text(json.dumps(qualification) + "\n")
     except (Rejected, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         parser.exit(1, f"release evidence: {exc}\n")

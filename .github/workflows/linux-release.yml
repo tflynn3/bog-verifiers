@@ -437,8 +437,12 @@ jobs:
         timeout-minutes: 3
         run: |
           {
+            [[ "$PINNED_BINARY_SHA256" =~ ^[0-9a-f]{64}$ ]] || exit 1
+            check_binary_pin() {
+              printf '%s  %s\n' "$PINNED_BINARY_SHA256" "$BINARY" | sha256sum --check
+            }
+            check_binary_pin || exit 1
             failed=0
-            sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
             BOG_RELEASE_REQUIRE_RETARGET=1 go run ./verify/release validate -require-cutover -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
               -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
               -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" \
@@ -453,8 +457,16 @@ jobs:
             jq -es 'any(.[]; .Action == "pass" and .Package == "bog/verify/release" and
               .Test == "TestValidateNativeSelectedTailParity")' "$EVIDENCE/parity-validation-events.jsonl" >/dev/null || failed=1
             capacity_producer="$RUNNER_TEMP/bog-capacity-producer"
-            "$capacity_producer" -validate-cutover "$EVIDENCE/capacity.json" || failed=1
-            "$capacity_producer" -validate-capacity-correlation "$EVIDENCE/capacity.json" || failed=1
+            if jq -e --arg digest "$PINNED_BINARY_SHA256" --arg revision "$REVISION" \
+              --arg fixture "$FIXTURE" '.binary_sha256 == $digest and .revision == $revision and .fixture == $fixture' \
+              "$EVIDENCE/capacity.json" >/dev/null; then
+              "$capacity_producer" -validate-cutover "$EVIDENCE/capacity.json" || failed=1
+              "$capacity_producer" -validate-capacity-correlation "$EVIDENCE/capacity.json" || failed=1
+            else
+              echo "Capacity report identity differs from the native build pin."
+              failed=1
+            fi
+            check_binary_pin || failed=1
             if (( failed != 0 )); then exit "$failed"; fi
             python3 -B "$GITHUB_WORKSPACE/verifiers/release_gate.py" validate \
               "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --arch "$RELEASE_ARCH" \
@@ -463,7 +475,8 @@ jobs:
               --verifier-revision "$GITHUB_SHA" \
               --capacity-validation-revision "$CAPACITY_VALIDATION_REVISION" \
               --require-fixture-root-cleanup --require-fixed-boundaries --require-backfill-timelines \
-              --require-capacity-observations --require-replacement-restart --require-control-scope
+              --require-capacity-observations --require-replacement-restart --require-control-scope \
+              --require-served-runtime
           } 2>&1 | tee "$EVIDENCE/validation.log"
 
       - name: Publish release evidence
@@ -504,13 +517,13 @@ jobs:
                 .revision == $revision and .fixture == $fixture and .parity_gate_revision == $gate and
                 .verifier_revision == $verifier and
                 .post_restore_ack_crash == true and .writable_restore_cycles == true and .tail_only_two_cycle_parity == true and
-                .replacement_restart == true and .control_scope == true and
+                .replacement_restart == true and .control_scope == true and .served_runtime == true and
                 .capacity_validation_revision == $capacity_validation and
                 (.binary_sha256 | test("^[0-9a-f]{64}$")))) and
               $amd64.binary_sha256 == $amd64_digest and $arm64.binary_sha256 == $arm64_digest and
               $amd64_digest != $arm64_digest then
                 {revision: $revision, fixture: $fixture, verifier_revision: $verifier, parity_gate_revision: $gate,
                   capacity_validation_revision: $capacity_validation, control_scope: true, writable_restore_cycles: true,
-                  tail_only_two_cycle_parity: true,
+                  tail_only_two_cycle_parity: true, served_runtime: true,
                   binary_sha256: {amd64: $amd64_digest, arm64: $arm64_digest}}
               else error("native qualification identities or verdicts did not match") end'
