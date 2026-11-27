@@ -1,5 +1,5 @@
 diff --git a/verify/release/budget_walk.go b/verify/release/budget_walk.go
-index b60a142..bb81ad6 100644
+index b60a142..7d74abe 100644
 --- a/verify/release/budget_walk.go
 +++ b/verify/release/budget_walk.go
 @@ -12,4 +12 @@ import (
@@ -23,7 +23,7 @@ index b60a142..bb81ad6 100644
 @@ -42 +48 @@ type budgetFixture struct {
 -	seed, want              []row
 +	seed, want, afterIssue  []row
-@@ -60,5 +66,7 @@ type budgetProbe struct {
+@@ -60,5 +66,13 @@ type budgetProbe struct {
 -	Budget  int                 `json:"budget"`
 -	Outcome budgetProbeOutcome  `json:"outcome"`
 -	Pages   int                 `json:"pages"`
@@ -34,9 +34,20 @@ index b60a142..bb81ad6 100644
 +	Pages        int                 `json:"pages"`
 +	Rows         int                 `json:"rows"`
 +	AppendedRows int                 `json:"post_issuance_append_rows,omitempty"`
++	BackfillAcks []budgetBackfillAck `json:"backfill_acknowledgements,omitempty"`
 +	ResumeLimit  int                 `json:"resume_limit,omitempty"`
 +	Failure      *budgetProbeFailure `json:"failure,omitempty"`
-@@ -169,6 +177,35 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
++}
++
++type budgetBackfillAck struct {
++	AfterPage  int `json:"after_page"`
++	HTTPStatus int `json:"http_status"`
+@@ -75,0 +90 @@ type budgetProbeFailure struct {
++	Stage      string `json:"stage,omitempty"`
+@@ -105 +120 @@ func (s *budgetSearch) record(probe budgetProbe) {
+-		if probe.Failure.Page > 1 && s.stats.FirstBrokenContinuation == nil {
++		if probe.Failure.Stage != "backfill" && probe.Failure.Page > 1 && s.stats.FirstBrokenContinuation == nil {
+@@ -169,6 +184,45 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
 -	tied, tiedErr := findBudgetWalk(ctx, client, budgetWalkMax, launch(0))
 -	fixture := sparseBudgetFixture()
 -	sparse, sparseErr := findSparseBudgetWalk(ctx, client, budgetWalkMax, fixture, launch(fixture.byteCap))
@@ -49,10 +60,10 @@ index b60a142..bb81ad6 100644
 +func probeBudgetFixtures(ctx context.Context, client *http.Client, launch func(int) budgetLaunch) (budgetWalkProof, error) {
 +	tied := tiedBudgetFixture()
 +	tied.afterIssue = []row{tied.want[1], {fixtureStart, "new tie"}}
-+	tiedStats, tiedErr := requireBudgetBoundary(ctx, client, 11, tied, launch(0))
++	tiedStats, tiedErr := requireBudgetBoundary(ctx, client, 11, tied, launch(tied.byteCap))
 +
 +	sparse := sparseBudgetFixture()
-+	sparse.afterIssue = []row{sparse.want[2], {"2020-01-01T00:00:01Z", "@backfill"}}
++	sparse.afterIssue = []row{{"2020-01-01T00:00:01Z", "@backfill"}, sparse.want[2]}
 +	sparseStats, sparseErr := requireBudgetBoundary(ctx, client, 314, sparse, launch(sparse.byteCap))
 +
 +	// Four short ties force a byte cut after two rows with a row limit of four.
@@ -69,7 +80,8 @@ index b60a142..bb81ad6 100644
 +	duplicate := tied
 +	duplicate.seed = []row{tied.want[0], tied.want[1], tied.want[0]}
 +	duplicate.want = duplicate.seed
-+	duplicateProbe, duplicateErr := tryBudgetWalk(ctx, client, launch(0), 11, duplicate)
++	duplicate.afterIssue = []row{duplicate.want[2], {fixtureStart, "new tie"}}
++	duplicateProbe, duplicateErr := tryBudgetWalk(ctx, client, launch(duplicate.byteCap), 11, duplicate)
 +	duplicateErr = errors.Join(duplicateErr, requireBudgetOutcome(duplicateProbe, probeExhausted))
 +
 +	sparseProof := sparseBudgetWalkProof{
@@ -78,8 +90,7 @@ index b60a142..bb81ad6 100644
 +	}
 +	if sparseStats.FirstCursorBudget > 0 {
 +		sparseProof.FirstRows = sparse.firstRows
-@@ -176 +213,13 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
--	return proof, errors.Join(tiedErr, sparseErr)
++	}
 +	proof := budgetWalkProof{
 +		budgetWalkStats: tiedStats,
 +		SparseWalk:      sparseProof,
@@ -88,12 +99,13 @@ index b60a142..bb81ad6 100644
 +			budgetProbe: tiedByteProbe, ResponseByteCap: tiedBytes.byteCap,
 +			FirstLimit: tiedBytes.firstLimit,
 +		},
-+	}
+@@ -176 +230,4 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
+-	return proof, errors.Join(tiedErr, sparseErr)
 +	if tiedByteProbe.Outcome == probeExhausted {
 +		proof.TiedByteWalk.FirstRows = tiedBytes.firstRows
 +	}
 +	return proof, errors.Join(tiedErr, sparseErr, duplicateErr, tiedByteErr)
-@@ -179,3 +228,19 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
+@@ -179,3 +236,25 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
 -func findBudgetWalk(ctx context.Context, client *http.Client, maxBudget int, launch budgetLaunch) (budgetWalkStats, error) {
 -	// Equal timestamps and equal line lengths keep the fixture small while
 -	// making append order observable across both continuations.
@@ -104,10 +116,16 @@ index b60a142..bb81ad6 100644
 +	search.record(reject)
 +	search.record(exhaust)
 +	stats, err := search.finish(budget, errors.Join(rejectErr, exhaustErr))
-+	return stats, errors.Join(err, requireBudgetOutcome(reject, probeRejected), requireBudgetOutcome(exhaust, probeExhausted))
++	if err != nil {
++		return stats, err
++	}
++	return stats, errors.Join(requireBudgetOutcome(reject, probeRejected), requireBudgetOutcome(exhaust, probeExhausted))
 +}
 +
 +func requireBudgetOutcome(probe budgetProbe, want budgetProbeOutcome) error {
++	if probe.Failure != nil {
++		return probe.Failure
++	}
 +	if probe.Outcome != want {
 +		return fmt.Errorf("fixed-budget walk at budget %d: expected %s, got %s", probe.Budget, want, probe.Outcome)
 +	}
@@ -116,35 +134,37 @@ index b60a142..bb81ad6 100644
 +
 +func tiedBudgetFixture() budgetFixture {
 +	// Equal timestamps and equal line lengths make append order observable.
-@@ -183 +248,5 @@ func findBudgetWalk(ctx context.Context, client *http.Client, maxBudget int, lau
+@@ -183 +262,5 @@ func findBudgetWalk(ctx context.Context, client *http.Client, maxBudget int, lau
 -	fixture := budgetFixture{seed: want, want: want, firstLimit: 1, resumeLimit: 1, firstRows: 1}
-+	return budgetFixture{seed: want, want: want, firstLimit: 1, resumeLimit: 1, firstRows: 1}
++	return budgetFixture{seed: want, want: want, firstLimit: 1, resumeLimit: 1, firstRows: 1, byteCap: 96}
 +}
 +
 +func findBudgetWalk(ctx context.Context, client *http.Client, maxBudget int, launch budgetLaunch) (budgetWalkStats, error) {
 +	fixture := tiedBudgetFixture()
-@@ -255 +324,4 @@ func runBudgetWalk(ctx context.Context, raw *http.Client, base string, budget in
+@@ -255 +338,3 @@ func runBudgetWalk(ctx context.Context, raw *http.Client, base string, budget in
 -	return checkBudgetWalk(ctx, pager, budget, fixture), nil
-+	return checkBudgetWalk(ctx, pager, budget, fixture, func() error {
-+		_, err := ingest(ctx, raw, base, fixture.afterIssue)
-+		return err
++	return checkBudgetWalk(ctx, pager, budget, fixture, func(backfill row) (int, error) {
++		return ingest(ctx, raw, base, []row{backfill})
 +	}), nil
-@@ -258,2 +330,2 @@ func runBudgetWalk(ctx context.Context, raw *http.Client, base string, budget in
+@@ -258,2 +343,2 @@ func runBudgetWalk(ctx context.Context, raw *http.Client, base string, budget in
 -func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture) budgetProbe {
 -	probe := budgetProbe{Budget: budget, Outcome: probeIndeterminate}
-+func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture, appendRows func() error) budgetProbe {
++func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture, appendRow func(row) (int, error)) budgetProbe {
 +	probe := budgetProbe{Budget: budget, Outcome: probeIndeterminate, ResumeLimit: fixture.resumeLimit}
-@@ -295,0 +368,8 @@ func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixtu
-+		if number == 1 && len(fixture.afterIssue) > 0 {
-+			if err := appendRows(); err != nil {
-+				probe.Failure = &budgetProbeFailure{Budget: budget, Page: number, Limit: limit,
-+					Detail: fmt.Sprintf("post-issuance append: %v", err), cause: err}
+@@ -296,0 +382,11 @@ func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixtu
++		// Acknowledge one backfill after each nonterminal page before resuming.
++		if cursor != "" && number <= len(fixture.afterIssue) {
++			status, err := appendRow(fixture.afterIssue[number-1])
++			if err != nil {
++				probe.Failure = &budgetProbeFailure{Budget: budget, Page: number, HTTPStatus: status, Stage: "backfill",
++					Detail: fmt.Sprintf("backfill after page %d: %v", number, err), cause: err}
 +				return probe
 +			}
-+			probe.AppendedRows = len(fixture.afterIssue)
++			probe.AppendedRows++
++			probe.BackfillAcks = append(probe.BackfillAcks, budgetBackfillAck{AfterPage: number, HTTPStatus: status})
 +		}
 diff --git a/verify/release/budget_walk_test.go b/verify/release/budget_walk_test.go
-index 8f54238..02c2d1a 100644
+index 8f54238..8f7be54 100644
 --- a/verify/release/budget_walk_test.go
 +++ b/verify/release/budget_walk_test.go
 @@ -250 +250 @@ func TestFindBudgetWalk(t *testing.T) {
@@ -153,6 +173,132 @@ index 8f54238..02c2d1a 100644
 @@ -393 +393 @@ func TestBudgetWalkRejectsNonAdjacentCursorRepeat(t *testing.T) {
 -	probe := checkBudgetWalk(t.Context(), pager, 1, fixture)
 +	probe := checkBudgetWalk(t.Context(), pager, 1, fixture, nil)
+@@ -477,0 +478,125 @@ func TestSparseBudgetWalkStopsOnRunFailure(t *testing.T) {
++
++func TestBudgetWalkAcknowledgedBackfill(t *testing.T) {
++	t.Parallel()
++	const (
++		budget     = 314
++		firstToken = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++		nextToken  = "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
++	)
++	tie := row{fixtureStart, "@tied"}
++	last := row{fixtureStart, "@last"}
++	want := []row{last, tie, tie, last}
++	backfill := []row{{fixtureStart, "@new"}, tie}
++	fixture := budgetFixture{
++		seed: want, want: want, afterIssue: backfill,
++		firstLimit: 4, firstRows: 2, resumeLimit: 1, byteCap: 96,
++	}
++	for _, tc := range []struct {
++		name        string
++		stopAt      int
++		outcome     budgetProbeOutcome
++		pages, rows int
++		acks        int
++		brokenPage  int
++	}{
++		{"exhausts with both original duplicates", 6, probeExhausted, 3, 4, 2, 0},
++		{"rejects before cursor", 2, probeRejected, 0, 0, 0, 0},
++		{"rejects issued cursor", 4, probeIssued, 1, 2, 1, 2},
++		{"backfill fails after second page", 5, probeIssued, 2, 3, 1, 0},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			var requests atomic.Int32
++			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++				step := int(requests.Add(1))
++				switch step {
++				case 1, 3, 5:
++					var expected strings.Builder
++					enc := json.NewEncoder(&expected)
++					rows := fixture.seed
++					if step > 1 {
++						rows = backfill[(step-3)/2 : (step-3)/2+1]
++					}
++					for _, r := range rows {
++						if err := enc.Encode(r); err != nil {
++							t.Error(err)
++						}
++					}
++					body, err := io.ReadAll(req.Body)
++					if err != nil || req.Method != http.MethodPost || req.URL.Path != "/ingest" || string(body) != expected.String() {
++						t.Errorf("step %d: unexpected ingest %s %s: %q (%v)", step, req.Method, req.URL, body, err)
++					}
++					if step == 5 && tc.stopAt == 5 {
++						http.Error(w, "write failed", http.StatusInternalServerError)
++						return
++					}
++					w.WriteHeader(http.StatusNoContent)
++				case 2, 4, 6:
++					q := req.URL.Query()
++					cursor, limit := "", "4"
++					page, next := want[:2], firstToken
++					if step == 4 {
++						cursor, limit, page, next = firstToken, "1", want[2:3], nextToken
++					}
++					if step == 6 {
++						cursor, limit, page, next = nextToken, "1", want[3:], ""
++					}
++					if req.Method != http.MethodGet || req.URL.Path != "/query" || q.Get("limit") != limit ||
++						q.Get("cursor") != cursor || (q.Get("page") == "1") != (step == 2) {
++						t.Errorf("step %d: unexpected query %s %s", step, req.Method, req.URL)
++					}
++					if step == tc.stopAt && (step == 2 || step == 4) {
++						http.Error(w, strings.TrimSuffix(budgetRejectionBody, "\n"), http.StatusServiceUnavailable)
++						return
++					}
++					w.Header().Set("Content-Type", "application/x-ndjson")
++					if next != "" {
++						w.Header().Set(nextCursor, next)
++					}
++					for _, r := range page {
++						if err := json.NewEncoder(w).Encode(r); err != nil {
++							t.Error(err)
++						}
++					}
++				default:
++					t.Errorf("unexpected request %s %s", req.Method, req.URL)
++					w.WriteHeader(http.StatusInternalServerError)
++				}
++			}))
++			defer srv.Close()
++			probe, err := runBudgetWalk(t.Context(), srv.Client(), srv.URL, budget, fixture)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if probe.Outcome != tc.outcome || probe.Pages != tc.pages || probe.Rows != tc.rows ||
++				probe.ResumeLimit != 1 || probe.AppendedRows != tc.acks || len(probe.BackfillAcks) != tc.acks ||
++				int(requests.Load()) != tc.stopAt {
++				t.Fatalf("unexpected evidence: %+v, requests=%d", probe, requests.Load())
++			}
++			for i, ack := range probe.BackfillAcks {
++				if ack.AfterPage != i+1 || ack.HTTPStatus != http.StatusNoContent {
++					t.Errorf("unexpected acknowledgement: %+v", ack)
++				}
++			}
++			var search budgetSearch
++			search.record(probe)
++			if tc.brokenPage != 0 {
++				failure := search.stats.FirstBrokenContinuation
++				if failure == nil || failure.Page != tc.brokenPage || failure.Budget != budget ||
++					failure.Limit != 1 || failure.HTTPStatus != http.StatusServiceUnavailable {
++					t.Errorf("unexpected continuation failure: %+v", failure)
++				}
++			} else if search.stats.FirstBrokenContinuation != nil {
++				t.Errorf("unexpected broken continuation: %+v", search.stats.FirstBrokenContinuation)
++			}
++			if tc.stopAt == 5 {
++				if probe.Failure == nil || probe.Failure.Stage != "backfill" || probe.Failure.Page != 2 ||
++					probe.Failure.HTTPStatus != http.StatusInternalServerError {
++					t.Errorf("unexpected backfill failure: %+v", probe.Failure)
++				}
++			} else if tc.brokenPage == 0 && probe.Failure != nil {
++				t.Errorf("unexpected failure: %+v", probe.Failure)
++			}
++		})
++	}
++}
 diff --git a/verify/release/pages.go b/verify/release/pages.go
 index d862ddc..0eb934d 100644
 --- a/verify/release/pages.go
