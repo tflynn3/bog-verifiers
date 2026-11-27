@@ -149,8 +149,11 @@ def restore_cycles(binary, directory, helper):
     args = query_args(0, SECOND)
 
     def walk(bog, expected, label):
-        expect_query(bog, expected, 0, SECOND, label=label)
-        expect_walk(bog, args, oracle(expected, 0, SECOND), (1, 2), label, exact_framing=True)
+        ordered = oracle(expected, 0, SECOND)
+        body, cursor = bog.query_ndjson(args, exact_framing=True)
+        check(cursor is None, f"{label}: ordinary query returned a cursor")
+        expect_rows(decode_rows(body), ordered, f"{label}: ordinary query")
+        expect_walk(bog, args, ordered, (1, 2), label, exact_framing=True)
         return len(expected)
 
     cycles = []
@@ -176,8 +179,12 @@ def restore_cycles(binary, directory, helper):
             expect_query(bog, rows, 0, SECOND, label="rejected restore append rolled back")
             bog.ingest(extra)
             publication = compaction(bog, len(rows), len(augmented))
-            terminal_cursor = expect_page(bog, args, held, 1, 2, cursor, "held page after advance",
-                                          exact_framing=True)
+            continuation = {**args, "cursor": cursor, "limit": 2}
+            page, next_cursor = bog.query_ndjson(continuation, exact_framing=True)
+            retried, terminal_cursor = bog.query_ndjson(continuation, exact_framing=True)
+            expect_rows(decode_rows(page), held[1:3], "held continuation after advance")
+            check(page == retried and next_cursor and terminal_cursor,
+                  "retry changed the held continuation bytes or dropped its cursor")
             terminal_args = {**args, "cursor": terminal_cursor, "limit": len(held) - 3}
             terminal, next_cursor = bog.query_ndjson(terminal_args, exact_framing=True)
             expect_rows(decode_rows(terminal), held[3:], "held terminal page after advance")
@@ -190,11 +197,9 @@ def restore_cycles(binary, directory, helper):
                   f"compaction did not replace the predecessor: {predecessor!r} -> {successor!r}")
             check(reclaim_bytes(metrics, predecessor, successor) is None,
                   "replacement was reclaimed before final predecessor pin release")
-            observes_reclaim = "predecessor_pin_generation" in metrics
-            if observes_reclaim:
-                check(type(metrics["predecessor_pin_generation"]) is int and
-                      metrics["predecessor_pin_generation"] == predecessor,
-                      "held pin observation did not identify the predecessor")
+            pinned = metrics.get("predecessor_pin_generation")
+            check(type(pinned) is int and pinned == predecessor,
+                  "held pin observation did not identify the predecessor")
             retire = urlencode({"action": "retire", "cursor": terminal_cursor})
             status, body = bog.request("POST", f"{CAPACITY_PATH}?{retire}")
             check(status == 204 and not body, f"predecessor capture retirement returned HTTP {status}: {body!r}")
@@ -205,7 +210,7 @@ def restore_cycles(binary, directory, helper):
                 reclaimed = reclaim_bytes(metrics, predecessor, successor)
                 check(pins_after_release == 0 or reclaimed is None,
                       "replacement was reclaimed while predecessor pins remained")
-                if pins_after_release == 0 and (not observes_reclaim or reclaimed is not None):
+                if pins_after_release == 0 and reclaimed is not None:
                     break
                 check(time.monotonic() < deadline,
                       f"predecessor pin drain or reclamation did not finish: "

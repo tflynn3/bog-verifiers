@@ -553,6 +553,8 @@ def validate_restore_cycles(report):
             f"{label}: incomplete cycle {number} append, paging, restart or restore evidence")
         check(integer(cycle.get("pins_while_held"), 1) and integer(cycle.get("pins_after_release"), 0, 0),
               f"{label}: cycle {number} is missing measured predecessor pin drain")
+        check(integer(cycle.get("reclaimed_bytes"), 0),
+              f"{label}: cycle {number} is missing measured reclamation")
         generations.add(exported["generation"])
         previous = exported
     check(evidence.get("fixture_removed") is True and

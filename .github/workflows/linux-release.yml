@@ -21,7 +21,7 @@ env:
   TOOLING_REVISION: abefdb5dcdc1f8bbbecdc9c0cc7ab39b309a87db
   PARITY_TOOLING_REVISION: dcbfa3fa98d75f9dca1dbff1b035d814f37fe438
   CONTROL_SCOPE_TOOLING_REVISION: 268195aae3f25aeac21efa818f3215b29ede406a
-  CAPACITY_VALIDATION_REVISION: 93fe02f110cb0054170b59b6bd4808ea05e3afa3
+  CAPACITY_VALIDATION_REVISION: ecb3ca2efb0af151438ef08e417f702d9a22f839
   ADMISSION_TOOLING_REVISION: 304749df78fe3dfaa75ce411efa34708269af659
   REVISION: ${{ inputs.revision }}
 
@@ -265,9 +265,9 @@ jobs:
                 [[ "$unified" == 0::/*/runner ]]
                 group="/sys/fs/cgroup${unified#0::}"
                 parent="${group%/*}"
-                printf "+memory +io\n" > "$parent/cgroup.subtree_control"
                 {
                   printf "capacity_mode=live\ncapacity_cgroup=%s\ncapacity_work_dir=%s\n" "$parent" "$work"
+                  printf "+memory +io\n" > "$parent/cgroup.subtree_control"
                   cat "$parent/cgroup.controllers" "$parent/cgroup.subtree_control"
                   for setting in memory.max memory.swap.max io.max; do
                     printf "%s:\n" "$setting"
@@ -275,9 +275,29 @@ jobs:
                   done
                   findmnt --target "$work"
                   df -h "$work"
-                } | tee "$evidence/capacity-runner.txt"
+                  # Use a sibling of the runner subgroup, as the producer does
+                  # for each candidate, with the same limits and credentials.
+                  (
+                    probe=$(mktemp -d "$parent/release-preflight.XXXXXXXX")
+                    trap '\''rmdir -- "$probe"'\'' EXIT
+                    printf "preflight_cgroup=%s\n" "$probe"
+                    printf "134217728\n" > "$probe/memory.max"
+                    printf "0\n" > "$probe/memory.swap.max"
+                    [[ $(<"$probe/memory.max") == 134217728 ]]
+                    [[ $(<"$probe/memory.swap.max") == 0 ]]
+                    (
+                      printf "%s\n" "$BASHPID" > "$probe/cgroup.procs"
+                      [[ $(</proc/self/cgroup) == "0::${probe#/sys/fs/cgroup}" ]]
+                    )
+                    [[ -z $(<"$probe/cgroup.procs") ]]
+                    cat "$probe/memory.max" "$probe/memory.swap.max" "$probe/memory.peak" "$probe/memory.events" "$probe/io.stat"
+                    rmdir -- "$probe"
+                    trap - EXIT
+                  )
+                  printf "capacity_preflight=pass\n"
+                } 2>&1 | tee "$evidence/capacity-runner.txt"
                 exec "$producer" "$@" -mode live -cgroup-parent "$parent" \
-                  -work-dir "$work" -report "$evidence/capacity.json"
+                  -require-capacity-correlation -work-dir "$work" -report "$evidence/capacity.json"
               ' capacity "$work" "$EVIDENCE" "$producer" "${common[@]}" || exit
           )
           parity() (
@@ -432,7 +452,9 @@ jobs:
             ) | tee "$EVIDENCE/parity-validation-events.jsonl" || failed=1
             jq -es 'any(.[]; .Action == "pass" and .Package == "bog/verify/release" and
               .Test == "TestValidateNativeSelectedTailParity")' "$EVIDENCE/parity-validation-events.jsonl" >/dev/null || failed=1
-            go run ./bench/retained-history -validate-cutover "$EVIDENCE/capacity.json" || failed=1
+            capacity_producer="$RUNNER_TEMP/bog-capacity-producer"
+            "$capacity_producer" -validate-cutover "$EVIDENCE/capacity.json" || failed=1
+            "$capacity_producer" -validate-capacity-correlation "$EVIDENCE/capacity.json" || failed=1
             if (( failed != 0 )); then exit "$failed"; fi
             python3 -B "$GITHUB_WORKSPACE/verifiers/release_gate.py" validate \
               "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --arch "$RELEASE_ARCH" \

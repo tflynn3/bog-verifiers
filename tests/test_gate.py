@@ -183,7 +183,8 @@ class GateTest(unittest.TestCase):
                        fresh_rows=held + 3, restart_rows=held + 3, restored_rows=held + 3,
                        append_status=204, rejected_append_status=400, terminal_retry_byte_identical=True,
                        replacement_exit_signal=9, restart_append_exit_signal=9, restart_append_replay_rows=held + 4,
-                       default_control_status=404, pins_while_held=1, pins_after_release=0)
+                       default_control_status=404, pins_while_held=1, pins_after_release=0,
+                       reclaimed_bytes=0)
                   for source, exported, held in ((initial, first, 6), (first, second, 9))]
         evidence = dict(initial=initial, cycles=cycles, descriptor_ready_status=200, fixture_removed=True,
                         final_append_status=204, final_exit_signal=9, final_restart_rows=13)
@@ -205,6 +206,8 @@ class GateTest(unittest.TestCase):
             (cycles[1], {"restart_rows": 9}, "incomplete cycle 2"),
             (cycles[0], {"pins_while_held": 0}, "cycle 1 is missing measured predecessor pin drain"),
             (cycles[1], {"pins_after_release": 1}, "cycle 2 is missing measured predecessor pin drain"),
+            (cycles[0], {"reclaimed_bytes": None}, "cycle 1 is missing measured reclamation"),
+            (cycles[1], {"reclaimed_bytes": -1}, "cycle 2 is missing measured reclamation"),
             (second, {"suffix_bytes": 99}, "recovery bounds"),
             (second, {"generation": first["generation"]}, "does not advance"),
             (second, {"covered_offset": 301, "committed_end": 401}, "does not advance"),

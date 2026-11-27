@@ -285,7 +285,10 @@ capacity producer records clustered and scattered backfill timelines.
 Each proves an acknowledged append and continuation during compaction,
 publication at the exact newer cutoff, exhaustion of the held snapshot,
 and fresh visibility. The workflow builds the capacity producer, pinned query
-model, and both strict consumers from `93fe02f`. The strict release consumer
+model, and both strict consumers from `ecb3ca2`. Before running the workloads,
+the native runner creates a child cgroup under the same delegation, verifies
+the 128 MiB memory and zero swap limits, moves a short-lived process into the
+child, and removes it after the process exits. The strict release consumer
 also receives the query model and TCP handler event files and checks the
 replacement test's candidate identity. The producer uses 2,147,483,648
 work units for live queries. The report records peak sampled
@@ -293,8 +296,11 @@ checkpoint staging bytes. After each held walk exhausts, the
 producer retries its terminal page, checks the NDJSON response byte for
 byte, records the positive predecessor pin count, and retires the capture
 with the continuation token that fetched that page.
-Qualification requires an observed zero after retirement and an exact fresh
-walk. On restart in the same directory, the producer reads back the published
+Qualification requires an observed zero after retirement, reclamation credit
+for the corresponding predecessor and replacement generations, and an exact
+fresh walk. The benchmark runs both its strict cutover and correlated-evidence
+validators on the same report consumed by the strict release validator. On
+restart in the same directory, the producer reads back the published
 generation, covered cutoff, and committed row count. The independent append
 ledger checks the full ordered walk through the committed suffix and terminal
 exhaustion. Each fixture also requires process, cgroup, and fixture root cleanup.
@@ -353,9 +359,9 @@ to pass.
 Strict native qualification also requires `writable_restore_cycles` in the
 combined report. This probe advances a verified v1 restore at two exact
 cutoffs, exports and verifies each v2 image, and checks held and fresh
-framed walks and same-directory restart. Each cycle measures positive
-predecessor pins while its cursor is held, explicitly retires the capture,
-and measures zero pins at the same published cutoff. The first restore
+framed walks and same-directory restart. Each cycle identifies the pinned
+predecessor after a byte-identical terminal retry, explicitly retires the capture,
+and requires zero pins and observed reclamation for that replacement. The first restore
 checks `/ready` after the configured directory symlink is retargeted to
 procfs. The final restored append survives SIGKILL and replay.
 The shared proof and both strict consumers accept an acknowledgment at
