@@ -170,10 +170,7 @@ def validate_capacity_observations(run, seed, label, cgroups):
           integer(group.get("memory_swap_max_bytes"), 0, 0), f"{label}: expected 128 MiB with swap disabled")
 
     diagnostics = run["diagnostics"]
-    events = diagnostics.get("cgroup_memory_events")
-    check(isinstance(events, dict) and {"oom", "oom_kill"} <= events.keys() and
-          all(integer(count, 0) for count in events.values()) and events["oom_kill"] == 0 and
-          events.get("oom_group_kill", 0) == 0, f"{label}: missing memory.events or recorded OOM kill")
+    validate_no_oom_kills(diagnostics, label)
     progress = diagnostics.get("seed_progress")
     check(isinstance(progress, dict) and integer(progress.get("acknowledged_rows"), seed, seed) and
           integer(progress.get("published_rows"), seed, seed) and
@@ -195,6 +192,13 @@ def validate_capacity_observations(run, seed, label, cgroups):
         else:
             check(signal == "" and integer(candidate.get("exit_code"), 0, 0) and
                   not candidate.get("wait_error"), f"{label}: unexpected {lifetime} exit")
+
+
+def validate_no_oom_kills(diagnostics, label):
+    events = diagnostics.get("cgroup_memory_events")
+    check(isinstance(events, dict) and {"oom", "oom_kill"} <= events.keys() and
+          all(integer(count, 0) for count in events.values()) and events["oom_kill"] == 0 and
+          events.get("oom_group_kill", 0) == 0, f"{label}: missing memory.events or recorded OOM kill")
 
 
 def validate_memory_peak(timeline, peak, label, *, required=False):
@@ -257,6 +261,7 @@ def validate_capacity(evidence, *, require_backfill_timelines=False, require_cap
         current = "cgroup_memory_limit_bytes" in run
         if require_capacity_observations:
             if current:
+                validate_no_oom_kills(diagnostics, label)
                 check(integer(run.get("cgroup_memory_limit_bytes"), MEMORY_LIMIT, MEMORY_LIMIT) and
                       integer(run.get("cgroup_swap_max_bytes"), 0, 0) and
                       integer(run.get("cgroup_oom_kill_count"), 0, 0) and
@@ -437,7 +442,14 @@ def record_fixture_root_cleanup(directory, expected, parent):
     passing_case(report, "durability", FIXTURE_ROOT_CLEANUP)
 
 
-def validate_cutover_parity(evidence):
+def validate_cutover_parity(report, evidence):
+    ordinary = passing_case(report, "parity", "ordinary_wal_reopen")["evidence"]
+    check(integer(ordinary.get("append_status"), 204, 204) and
+          integer(evidence.get("legacy_append_status"), 204, 204) and
+          integer(ordinary.get("reopened_rows"), 6, 6) and integer(ordinary.get("restart_rows"), 7, 7) and
+          ordinary["reopened_rows"] == evidence.get("legacy_rows") and
+          ordinary["restart_rows"] == evidence.get("legacy_restart_rows"),
+          "parity: incomplete ordinary WAL reopen, append, or exact restart evidence")
     check(evidence.get("legacy_restart_unpaged") is True and
           integer(evidence.get("restored_control_404_checks"), 6, 6),
           "parity: missing ordinary legacy restart or default-off restored control evidence")
@@ -497,13 +509,14 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
     validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected),
                       require_backfill_timelines=require_backfill_timelines,
                       require_capacity_observations=require_capacity_observations)
-    parity = case_evidence(directory, "parity", "restored_parity", expected)
+    parity_report = read_report(directory, "parity", expected)
+    parity = passing_case(parity_report, "parity", "restored_parity")["evidence"]
     validate_parity(parity, require_writable_restore=require_backfill_timelines)
     control_report = read_report(directory, "control", expected)
     control_case = passing_case(control_report, "control", "capacity_control")
     control = control_case["evidence"]
     if cutover_arch:
-        validate_cutover_parity(parity)
+        validate_cutover_parity(parity_report, parity)
         check(parity.get("corrupt_restore_preserved") is True,
               "parity: missing corrupt restore file preservation evidence")
         validate_cutover_control(control_case)

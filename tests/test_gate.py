@@ -14,7 +14,7 @@ import verify
 from release_gate import (CAPACITY_WORK_BUDGET, FIXTURE_ROOT_CLEANUP, MEMORY_LIMIT, record_fixture_root_cleanup,
                           validate_backfill_timelines, validate_budget, validate_budget_trials,
                           validate_capacity_observations, validate_cutover_control, validate_memory_peak,
-                          validate_cutover_parity, validate_durability)
+                          validate_cutover_parity, validate_durability, validate_no_oom_kills)
 
 README_ONLY = "7655ed627bccad30700b8de4b6f47c8d7d5d8579"
 
@@ -76,11 +76,20 @@ class GateTest(unittest.TestCase):
         parity = dict(fixture_removed=True, corrupt_restore_exit=1, restore_metadata_preserved=True,
                       held_restore_rows=6, replayed_restore_page=True, legacy_restart_unpaged=True,
                       restored_control_404_checks=6, reopened_restore_append_status=204,
-                      reopened_restore_restart_rows=8)
-        validate_cutover_parity(parity)
+                      reopened_restore_restart_rows=8, legacy_rows=6, legacy_append_status=204,
+                      legacy_restart_rows=7)
+        ordinary = dict(reopened_rows=6, append_status=204, restart_rows=7)
+        report = {"cases": {"ordinary_wal_reopen": {"status": "pass", "evidence": ordinary}}}
+        validate_cutover_parity(report, parity)
+        for change in ({"append_status": 503}, {"reopened_rows": 5}, {"restart_rows": 6}):
+            with self.subTest(change=change), patch.dict(ordinary, change):
+                with self.assertRaisesRegex(verify.Rejected, "incomplete ordinary WAL reopen"):
+                    validate_cutover_parity(report, parity)
+        with self.assertRaisesRegex(verify.Rejected, "missing required case ordinary_wal_reopen"):
+            validate_cutover_parity({"cases": {}}, parity)
         del parity["replayed_restore_page"]
         with self.assertRaisesRegex(verify.Rejected, "continuation replay"):
-            validate_cutover_parity(parity)
+            validate_cutover_parity(report, parity)
 
     def test_capacity_observations_require_distinct_groups_and_attributed_teardown(self):
         seed = 196_608
@@ -109,6 +118,12 @@ class GateTest(unittest.TestCase):
             with self.subTest(reason=reason), patch.dict(target, changes):
                 with self.assertRaisesRegex(verify.Rejected, reason):
                     validate_capacity_observations(run, seed, "fixture", set())
+
+        for raw_events in ({"oom": 0}, {"oom": 0, "oom_kill": None}, {"oom": 0, "oom_kill": "0"},
+                           {"oom": 0, "oom_kill": 0, "oom_group_kill": 1}):
+            with self.subTest(raw_events=raw_events):
+                with self.assertRaisesRegex(verify.Rejected, "missing memory.events or recorded OOM kill"):
+                    validate_no_oom_kills({"cgroup_memory_events": raw_events}, "fixture")
 
     def test_timed_memory_sample_is_bounded_by_its_fixture_peak(self):
         memory = dict(read_start_ns=26, read_end_ns=29, bytes=100_000_000)
