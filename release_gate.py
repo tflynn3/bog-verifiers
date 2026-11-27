@@ -1,5 +1,6 @@
 """Produce the small capacity control report and validate Linux release evidence."""
 import argparse
+from functools import partial
 import json
 import platform
 import signal
@@ -7,8 +8,9 @@ from pathlib import Path
 import re
 import tempfile
 
-from verify import (PROCESS_LOGS, Rejected, SuiteSkipped, capacity_control_suite, check,
-                    file_sha256, unique_fields)
+from verify import (PROCESS_LOGS, REPLACEMENT_WORK_BUDGET, SECOND, Rejected, SuiteSkipped,
+                    budget_probe_rows, capacity_control_suite, check, file_sha256,
+                    fixed_budget_replay_suite, oracle, ordered_sha256, replacement_fixture, unique_fields)
 
 
 FIXTURE = "linux-release-v1"
@@ -20,6 +22,8 @@ BATCH_ROWS = 64
 PRODUCERS = {"admission", "durability", "capacity", "parity"}
 FIXTURE_ROOT_CLEANUP = "fixture_root_cleanup"
 POST_RESTORE_ACK_CRASH = "post_restore_ack_crash"
+REPLACEMENT_RESTART = "replacement_restart"
+FIXED_BUDGET_REPLAY = "fixed_budget_replay"
 
 
 def identity(binary, revision, fixture):
@@ -547,8 +551,48 @@ def validate_cutover_control(case):
           "control: missing process teardown or unexpected candidate exit")
 
 
+def validate_terminal_replay(evidence, label):
+    terminal = evidence.get("terminal_sha256")
+    check(isinstance(terminal, str) and re.fullmatch(r"[0-9a-f]{64}", terminal) and
+          evidence.get("terminal_retry_sha256") == terminal,
+          f"{label}: missing byte-identical terminal replay")
+
+
+def validate_replacement_restart(report, control):
+    replay = control.get("replacement_replay") or {}
+    rows, backfill, suffix = replacement_fixture()
+    ordered = ordered_sha256(oracle([*rows, backfill, suffix], 0, SECOND))
+    check(integer(replay.get("work_budget"), REPLACEMENT_WORK_BUDGET, REPLACEMENT_WORK_BUDGET) and
+          replay.get("fresh_ordered_sha256") == replay.get("restart_ordered_sha256") == ordered,
+          "replacement restart: missing exact ordered replay of the checkpoint and committed suffix")
+    validate_terminal_replay(replay, "replacement restart")
+
+    case = passing_case(report, "control", FIXED_BUDGET_REPLAY)
+    evidence = case["evidence"]
+    check(evidence.get("fixture_removed") is True and integer(evidence.get("response_byte_cap"), 112, 112) and
+          len(case["processes"]) == 2 and
+          all(process.get("expected_ready") is True and integer(process.get("exit_code"), 0, 0)
+              for process in case["processes"]), "fixed-budget replay: missing fixture, clean exits or byte cap")
+    trials = evidence["trials"]
+    check(len(trials) == 2, "fixed-budget replay: expected both budget trials")
+    ordered = ordered_sha256(oracle(budget_probe_rows(), 0, 129, "@"))
+    for trial, budget, limit, first_rows in zip(trials, (32, 4096), (1, 4), (1, 2)):
+        label = f"fixed-budget replay at {budget}"
+        check(integer(trial.get("budget"), budget, budget) and integer(trial.get("first_limit"), limit, limit),
+              f"{label}: missing issuing limits")
+        if budget == 32 and trial.get("outcome") == "clean_rejection":
+            check(integer(trial.get("status"), 503, 503) and integer(trial.get("ndjson_rows"), 0, 0) and
+                  trial.get("next_cursor") is False, f"{label}: partial opening response")
+            continue
+        check(trial.get("outcome") == "exhausted" and integer(trial.get("first_rows"), first_rows, first_rows) and
+              integer(trial.get("resume_limit"), 1, 1) and integer(trial.get("rows"), 4, 4) and
+              trial.get("ordered_sha256") == ordered, f"{label}: incomplete ordered walk")
+        validate_terminal_replay(trial, label)
+
+
 def validate(directory, expected, *, require_fixture_root_cleanup=False, require_fixed_boundaries=False,
-             require_backfill_timelines=False, require_capacity_observations=False, cutover_arch=None):
+             require_backfill_timelines=False, require_capacity_observations=False, cutover_arch=None,
+             require_replacement_restart=False):
     if cutover_arch:
         expected = {**expected, "arch": cutover_arch}
     statuses = (directory / "producers.txt").read_text().splitlines()
@@ -574,6 +618,8 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
         check(parity.get("corrupt_restore_preserved") is True,
               "parity: missing corrupt restore file preservation evidence")
         validate_cutover_control(control_case)
+    if require_replacement_restart:
+        validate_replacement_restart(control_report, control)
     published = control["published"]
     expanded = "fresh_rows" in control
     covered, committed = (4, 5) if expanded else (3, 3)
@@ -596,25 +642,35 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
               "control: incomplete cursor evidence across compaction and restart")
 
 
-def produce_control(binary, directory, expected):
+def produce_control(binary, directory, expected, *, require_replacement_restart=False):
+    suites = [("capacity_control", partial(capacity_control_suite,
+                                          require_replacement_restart=require_replacement_restart))]
+    if require_replacement_restart:
+        suites.append((FIXED_BUDGET_REPLAY, fixed_budget_replay_suite))
     processes = []
     token = PROCESS_LOGS.set((directory, processes))
-    case = {"status": "fail", "processes": processes}
+    cases = {}
     try:
-        with tempfile.TemporaryDirectory(prefix="bog-release-control-") as workspace:
-            metrics = capacity_control_suite(binary, Path(workspace) / "control")
-        if isinstance(metrics, SuiteSkipped):
-            case.update(status="skip", detail=metrics.reason)
-        else:
-            metrics["fixture_removed"] = not Path(workspace).exists()
-            check(metrics["fixture_removed"], "control: fixture cleanup did not complete")
-            case.update(status="pass", evidence=metrics)
-    except Exception as exc:
-        case["detail"] = str(exc)
-        raise
+        for name, suite in suites:
+            start = len(processes)
+            case = cases[name] = {"status": "fail"}
+            try:
+                with tempfile.TemporaryDirectory(prefix="bog-release-control-") as workspace:
+                    metrics = suite(binary, Path(workspace) / name)
+                if isinstance(metrics, SuiteSkipped):
+                    case.update(status="skip", detail=metrics.reason)
+                else:
+                    metrics["fixture_removed"] = not Path(workspace).exists()
+                    check(metrics["fixture_removed"], f"{name}: fixture cleanup did not complete")
+                    case.update(status="pass", evidence=metrics)
+            except Exception as exc:
+                case["detail"] = str(exc)
+                raise
+            finally:
+                case["processes"] = processes[start:]
     finally:
         PROCESS_LOGS.reset(token)
-        report = {**expected, "cases": {"capacity_control": case}}
+        report = {**expected, "cases": cases}
         (directory / "control.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
@@ -634,6 +690,7 @@ def main():
     parser.add_argument("--require-fixed-boundaries", action="store_true")
     parser.add_argument("--require-backfill-timelines", action="store_true")
     parser.add_argument("--require-capacity-observations", action="store_true")
+    parser.add_argument("--require-replacement-restart", action="store_true")
     args = parser.parse_args()
     try:
         directory = args.directory.resolve()
@@ -641,7 +698,8 @@ def main():
         expected = identity(binary, args.revision, args.fixture)
         native_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
         if args.action == "control":
-            produce_control(binary, directory, {**expected, "arch": native_arch})
+            produce_control(binary, directory, {**expected, "arch": native_arch},
+                            require_replacement_restart=args.require_replacement_restart)
         elif args.action == "record-cleanup":
             check(args.fixture_parent is not None, "durability fixture parent is required")
             record_fixture_root_cleanup(directory, expected, args.fixture_parent)
@@ -657,6 +715,8 @@ def main():
                   f"candidate binary is not Linux {args.arch}")
             cutover = all((args.require_fixture_root_cleanup, args.require_fixed_boundaries,
                            args.require_backfill_timelines, args.require_capacity_observations))
+            check(not args.require_replacement_restart or cutover,
+                  "replacement restart evidence requires strict native cutover validation")
             if cutover or args.binary_sha256 is not None:
                 check(expected["binary_sha256"] == args.binary_sha256,
                       "candidate binary SHA-256 differs from the native build pin")
@@ -670,13 +730,16 @@ def main():
                      require_fixed_boundaries=args.require_fixed_boundaries,
                      require_backfill_timelines=args.require_backfill_timelines,
                      require_capacity_observations=args.require_capacity_observations,
-                     cutover_arch=args.arch if cutover else None)
+                     cutover_arch=args.arch if cutover else None,
+                     require_replacement_restart=args.require_replacement_restart)
             qualification = {**expected, "arch": args.arch}
             if cutover:
                 qualification["current_observations"] = True
                 qualification["crash_gate_revision"] = args.gate_revision
                 qualification["capacity_validation_revision"] = args.capacity_validation_revision
                 qualification[POST_RESTORE_ACK_CRASH] = True
+            if args.require_replacement_restart:
+                qualification[REPLACEMENT_RESTART] = True
             verdict.write_text(json.dumps(qualification) + "\n")
     except (Rejected, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         parser.exit(1, f"release evidence: {exc}\n")

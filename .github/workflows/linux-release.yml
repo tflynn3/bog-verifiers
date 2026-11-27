@@ -192,6 +192,7 @@ jobs:
           )
           capacity() (
             python3 -B verifiers/release_gate.py control "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" \
+              --require-replacement-restart \
               2>&1 | tee "$EVIDENCE/control.log" || exit
             case "$(jq -er '.cases.capacity_control.status' "$EVIDENCE/control.json")" in
               skip) echo "Live capacity skipped. See control.json."; exit 0 ;;
@@ -278,8 +279,24 @@ jobs:
           done
           exit "$failed"
 
+      - name: Race-test release verifier lifecycle
+        id: architecture-and-lifecycle
+        if: always() && steps.build.outcome == 'success'
+        working-directory: gate
+        timeout-minutes: 5
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          {
+            (cd ../candidate && go test -race -count=1 ./internal/archtest ./verify/linux) || exit 1
+            (cd ../admission && go test -race -count=1 ./verify/release -run 'BudgetWalk|FixedBudgetWire') || exit 1
+            go test -race -count=1 ./verify/release ./verify/query-model
+          } 2>&1 | tee "$EVIDENCE/verifier-race.log"
+
       - name: Validate reports and candidate identity
-        if: always() && steps.build.outcome == 'success' && steps.capacity-fixtures.outcome == 'success'
+        if: >-
+          always() && steps.build.outcome == 'success' && steps.capacity-fixtures.outcome == 'success' &&
+          steps.architecture-and-lifecycle.outcome == 'success'
         working-directory: capacity-validation
         env:
           PINNED_BINARY_SHA256: ${{ steps.build.outputs.binary_sha256 }}
@@ -301,21 +318,8 @@ jobs:
               --gate-revision "$(git -C ../crash-gate rev-parse HEAD)" \
               --capacity-validation-revision "$CAPACITY_VALIDATION_REVISION" \
               --require-fixture-root-cleanup --require-fixed-boundaries --require-backfill-timelines \
-              --require-capacity-observations
+              --require-capacity-observations --require-replacement-restart
           } 2>&1 | tee "$EVIDENCE/validation.log"
-
-      - name: Race-test release verifier lifecycle
-        if: always() && steps.build.outcome == 'success'
-        working-directory: gate
-        timeout-minutes: 5
-        env:
-          CGO_ENABLED: '1'
-        run: |
-          {
-            (cd ../candidate && go test -race -count=1 ./internal/archtest ./verify/linux) || exit 1
-            (cd ../admission && go test -race -count=1 ./verify/release -run 'BudgetWalk|FixedBudgetWire') || exit 1
-            go test -race -count=1 ./verify/release ./verify/query-model
-          } 2>&1 | tee "$EVIDENCE/verifier-race.log"
 
       - name: Publish release evidence
         if: always()
@@ -352,7 +356,8 @@ jobs:
               if $amd64.arch == "amd64" and $arm64.arch == "arm64" and
               ([$amd64, $arm64] | all(.schema_version == 1 and .current_observations == true and
                 .revision == $revision and .fixture == $fixture and .crash_gate_revision == $gate and
-                .post_restore_ack_crash == true and .capacity_validation_revision == $capacity_validation and
+                .post_restore_ack_crash == true and .replacement_restart == true and
+                .capacity_validation_revision == $capacity_validation and
                 (.binary_sha256 | test("^[0-9a-f]{64}$")))) and
               $amd64.binary_sha256 == $amd64_digest and $arm64.binary_sha256 == $arm64_digest and
               $amd64_digest != $arm64_digest then

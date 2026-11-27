@@ -382,6 +382,19 @@ pin count after terminal retry, and an empty HTTP 204 for the issued token
 followed by an observed zero. Slipway allows the retirement subprobe to skip on older controls.
 The release gate also checks the small fixture's process exits and removal.
 
+Both native jobs require the replacement and restart proof in `control.json`.
+The fixture holds a cursor at a fixed work budget across checkpoint replacement.
+Fresh ordinary and paged requests must match the full append-ledger order,
+including the duplicate rows and uncovered committed suffix, before and after
+reopening the same directory. The verifier checks framing and records ordered
+row digests and the raw terminal response and retry digests. A separate sparse,
+byte-trimmed fixture verifies exhaustion with a smaller continuation limit at
+the issuing budget. The low-budget opening may cleanly refuse the request
+before issuing a cursor. The higher-budget walk must issue and exhaust.
+Qualification also requires the architecture and lifecycle tests to pass.
+Historical report validation remains available without
+`--require-replacement-restart`.
+
 The release gate checks the binary's ELF machine against the native runner
 and binds each mandatory report to that runner's binary digest, revision,
 and fixture ID. Each runner passes its build-time SHA-256 directly to

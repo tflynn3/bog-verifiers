@@ -16,7 +16,7 @@ from release_gate import (CAPACITY_WORK_BUDGET, FIXTURE_ROOT_CLEANUP, MEMORY_LIM
                           validate_backfill_timelines, validate_budget, validate_budget_trials,
                           validate_capacity_observations, validate_cutover_control, validate_memory_peak,
                           validate_cutover_parity, validate_durability, validate_no_oom_kills,
-                          validate_restart_compaction)
+                          validate_replacement_restart, validate_restart_compaction)
 
 README_ONLY = "7655ed627bccad30700b8de4b6f47c8d7d5d8579"
 
@@ -90,6 +90,36 @@ class GateTest(unittest.TestCase):
             del cases[POST_RESTORE_ACK_CRASH]
             with self.assertRaisesRegex(verify.Rejected, f"missing required case {POST_RESTORE_ACK_CRASH}"):
                 validate_report()
+
+    def test_native_replacement_requires_ordered_suffix_and_terminal_retry(self):
+        rows, backfill, suffix = verify.replacement_fixture()
+        expected = verify.oracle([*rows, backfill, suffix], 0, verify.SECOND)
+        digest = verify.ordered_sha256(expected)
+        terminal = "a" * 64
+        replay = dict(work_budget=verify.REPLACEMENT_WORK_BUDGET, fresh_ordered_sha256=digest,
+                      restart_ordered_sha256=digest, terminal_sha256=terminal, terminal_retry_sha256=terminal)
+        low = dict(budget=32, first_limit=1, outcome="clean_rejection", status=503, ndjson_rows=0,
+                   next_cursor=False)
+        high = dict(budget=4096, first_limit=4, outcome="exhausted", first_rows=2, resume_limit=1, rows=4,
+                    ordered_sha256=verify.ordered_sha256(verify.oracle(verify.budget_probe_rows(), 0, 129, "@")),
+                    terminal_sha256=terminal, terminal_retry_sha256=terminal)
+        evidence = dict(response_byte_cap=112, fixture_removed=True, trials=[low, high])
+        report = {"cases": {"fixed_budget_replay": dict(status="pass", evidence=evidence,
+                  processes=[dict(expected_ready=True, exit_code=0) for _ in range(2)])}}
+        control = {"replacement_replay": replay}
+        validate_replacement_restart(report, control)
+        for target, changes, reason in (
+            (replay, {"restart_ordered_sha256": verify.ordered_sha256(expected[:-2] + expected[-1:])},
+             "committed suffix"),
+            (replay, {"fresh_ordered_sha256": verify.ordered_sha256(expected[1:])}, "ordered replay"),
+            (replay, {"terminal_retry_sha256": "b" * 64}, "byte-identical"),
+            (low, {"next_cursor": True}, "partial opening response"),
+            (high, {"outcome": "clean_rejection"}, "incomplete ordered walk"),
+            (high, {"terminal_retry_sha256": None}, "byte-identical"),
+        ):
+            with self.subTest(changes=changes), patch.dict(target, changes):
+                with self.assertRaisesRegex(verify.Rejected, reason):
+                    validate_replacement_restart(report, control)
 
     def test_cutover_requires_retirement_exit_and_cleanup_evidence(self):
         retirement = dict(status="pass", retire_http_status=204, terminal_page_retried=True,

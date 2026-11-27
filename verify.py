@@ -46,6 +46,8 @@ QUERY_ADMISSION_FLAGS = {"query-limits": ("-query-work-budget", 32), "query-admi
 QUERY_REJECTION_PROBES = ("ordinary", "first_page", "continuation")
 CAPACITY_ENV = "BOG_CAPACITY_CONTROL"
 CAPACITY_FLAG = "-enable-capacity-control"
+WORK_BUDGET_FLAG = "-query-work-budget"
+REPLACEMENT_WORK_BUDGET = 4096
 RETAINED_TAIL_FLAG = "-retained-tail-max-bytes"
 CAPACITY_PATH = "/_capacity/compaction"
 MAX_FRAME = 4 * 1024 * 1024
@@ -323,17 +325,21 @@ class Bog:
         return decode_rows(body), cursor
 
     def query_ndjson(self, args, *, exact_framing=False):
-        status, body, headers = self.checked_exchange("GET", query_target(args))
-        check(status == 200, f"query returned {status}: {body[:200]!r}")
-        if exact_framing:
-            check(headers.get_all("Content-Length") == [str(len(body))] and
-                  headers.get("Transfer-Encoding") is None and headers.get("Trailer") is None and
-                  body.endswith(b"\n"), "expected an exactly framed, newline-terminated query page")
-        cursors = headers.get_all(NEXT_CURSOR)
-        if cursors is not None:
-            check(len(cursors) == 1 and bool(cursors[0].strip()),
-                  f"expected a single nonempty {NEXT_CURSOR}")
-        return body, cursors[0] if cursors else None
+        return query_response(self.checked_exchange("GET", query_target(args)), exact_framing=exact_framing)
+
+
+def query_response(response, *, exact_framing=False):
+    status, body, headers = response
+    check(status == 200, f"query returned {status}: {body[:200]!r}")
+    if exact_framing:
+        check(headers.get_all("Content-Length") == [str(len(body))] and
+              headers.get("Transfer-Encoding") is None and headers.get("Trailer") is None and
+              body.endswith(b"\n"), "expected an exactly framed, newline-terminated query page")
+    cursors = headers.get_all(NEXT_CURSOR)
+    if cursors is not None:
+        check(len(cursors) == 1 and bool(cursors[0].strip()),
+              f"expected a single nonempty {NEXT_CURSOR}")
+    return body, cursors[0] if cursors else None
 
 
 def query_args(start, end, contains="", limit=None, offset=0):
@@ -394,13 +400,17 @@ def expect_query(bog, rows, start, end, *, contains="", limit=DEFAULT_QUERY_LIMI
                 expected[:DEFAULT_QUERY_LIMIT if limit is None else limit], label)
 
 
-def expect_page(bog, args, expected, position, limit, cursor, label):
+def expect_page(bog, args, expected, position, limit, cursor, label, *, exact_framing=False):
     paging = {"page": "1"} if cursor is None else {"cursor": cursor}
     if limit is not None:
         paging["limit"] = limit
     page_label = f"{label}, row offset {position}, limit {limit}"
     try:
-        actual, next_cursor = bog.query_page({**args, **paging})
+        if exact_framing:
+            body, next_cursor = bog.query_ndjson({**args, **paging}, exact_framing=True)
+            actual = decode_rows(body)
+        else:
+            actual, next_cursor = bog.query_page({**args, **paging})
     except Rejected as exc:
         raise Rejected(f"{page_label}: {exc}") from exc
     end = position + (DEFAULT_QUERY_LIMIT if limit is None else limit)
@@ -410,9 +420,10 @@ def expect_page(bog, args, expected, position, limit, cursor, label):
     return next_cursor
 
 
-def expect_walk(bog, args, expected, limits, label, *, position=0, cursor=None):
+def expect_walk(bog, args, expected, limits, label, *, position=0, cursor=None, exact_framing=False):
     for limit in itertools.cycle(limits):
-        cursor = expect_page(bog, args, expected, position, limit, cursor, label)
+        cursor = expect_page(bog, args, expected, position, limit, cursor, label,
+                             exact_framing=exact_framing)
         if cursor is None:
             return
         position += DEFAULT_QUERY_LIMIT if limit is None else limit
@@ -426,10 +437,16 @@ def expect_bad_query(bog, args, label):
 
 def expect_query_error(bog, args, expected, label, *, timeout=HTTP_TIMEOUT):
     started = time.monotonic()
-    status, body, headers = bog.checked_exchange("GET", query_target(args), timeout=timeout)
-    check(status == expected, f"{label}: expected HTTP {expected}, got {status}: {body[:150]!r}")
+    response = bog.checked_exchange("GET", query_target(args), timeout=timeout)
     if expected == 503:
         check(time.monotonic() - started < timeout, f"{label}: response took at least {timeout}s")
+    return query_error_evidence(response, expected, label)
+
+
+def query_error_evidence(response, expected, label):
+    status, body, headers = response
+    check(status == expected, f"{label}: expected HTTP {expected}, got {status}: {body[:150]!r}")
+    if expected == 503:
         check(headers.get_content_type() != "application/x-ndjson", f"{label}: error used NDJSON media type")
     check(headers.get_all(NEXT_CURSOR) is None, f"{label}: error returned {NEXT_CURSOR}")
     for line in body.split(b"\n"):
@@ -802,13 +819,25 @@ def advertised_flags(binary, directory):
     return set(re.findall(r"^[ \t]*(-[a-z0-9-]+)(?=[ \t=]|$)", help_result.stdout, re.MULTILINE))
 
 
-def capacity_control_suite(binary, directory):
-    legacy_flag = CAPACITY_FLAG in advertised_flags(binary, directory)
+def replacement_fixture():
+    return ([Row(2, "later"), Row(1, "duplicate"), Row(1, "duplicate")],
+            Row(0, "backfill"), Row(1, "uncovered tie"))
+
+
+def ordered_sha256(rows):
+    return hashlib.sha256(encode_rows(rows)).hexdigest()
+
+
+def capacity_control_suite(binary, directory, *, require_replacement_restart=False):
+    available = advertised_flags(binary, directory)
+    legacy_flag = CAPACITY_FLAG in available
+    strict_replay = require_replacement_restart or RETAINED_TAIL_FLAG in available
+    budget_flags = ()
+    if strict_replay and WORK_BUDGET_FLAG in available:
+        budget_flags = (f"{WORK_BUDGET_FLAG}={REPLACEMENT_WORK_BUDGET}",)
     directory.mkdir()
     store = directory / "store"
-    rows = [Row(2, "later"), Row(1, "duplicate"), Row(1, "duplicate")]
-    backfill = Row(0, "backfill")
-    tail = Row(1, "uncovered tie")
+    rows, backfill, tail = replacement_fixture()
     cutoff = len(rows) + 1
     status_path = f"{CAPACITY_PATH}?action=status&cutoff={cutoff}"
     start_path = f"{CAPACITY_PATH}?action=start&cutoff={cutoff}"
@@ -892,11 +921,20 @@ def capacity_control_suite(binary, directory):
         flags = (CAPACITY_FLAG,)
         with run_bog(binary, store, flags=flags) as bog:
             initial = seed_and_compact(bog)
-    launch = {"flags": flags, "capacity": not flags}
+    launch = {"flags": (*flags, *budget_flags), "capacity": not flags}
+    def fresh_parity(bog, label):
+        body, ordinary_cursor = bog.query_ndjson(args, exact_framing=strict_replay)
+        actual = decode_rows(body)
+        expect_rows(actual, fresh, f"{label}: ordinary query")
+        check(ordinary_cursor is None, f"{label}: ordinary query returned a cursor")
+        expect_walk(bog, args, fresh, (1, 2), f"{label}: paged query", exact_framing=strict_replay)
+        return ordered_sha256(actual)
+
     with run_bog(binary, store, **launch) as bog:
         check_reopened(bog, initial)
         expect_query(bog, rows, 0, SECOND, label="ordinary query after immediate compaction crash")
-        cursor = expect_page(bog, args, expected, 0, 1, None, "first page before compaction")
+        cursor = expect_page(bog, args, expected, 0, 1, None, "first page before compaction",
+                             exact_framing=strict_replay)
         bog.ingest([backfill])
         bog.ingest([tail])
         published = compact(bog, cutoff, initial, len(augmented))
@@ -918,10 +956,18 @@ def capacity_control_suite(binary, directory):
         expect_rows(decode_rows(terminal_body), expected[2:], "terminal held page")
         check(terminal_cursor is None, "terminal held page returned a continuation")
 
+        retry = None
+        if strict_replay or "retired_generation_pins" in metrics:
+            retry = bog.checked_exchange("GET", query_target(terminal))
+
+        def check_terminal_retry():
+            retry_body, retry_cursor = query_response(retry, exact_framing=True)
+            check(retry_body == terminal_body and retry_cursor is None,
+                  "terminal retry changed response bytes or exhaustion")
+
+        if strict_replay:
+            check_terminal_retry()
         if "retired_generation_pins" in metrics:
-            # Capture the retry before requesting retirement. Older controls
-            # may support compaction and pin metrics without capture retirement.
-            retry_status, retry_body, retry_headers = bog.checked_exchange("GET", query_target(terminal))
             retire_action = f"{CAPACITY_PATH}?action=retire"
             invalid_status, _ = bog.request("POST", retire_action + "&cursor=invalid")
             held = state(bog, "GET", status_path)
@@ -933,12 +979,8 @@ def capacity_control_suite(binary, directory):
             else:
                 check(retire_status == 204 and not retire_body,
                       f"capture retirement expected an empty HTTP 204, got HTTP {retire_status}")
-                check(retry_status == 200 and retry_body == terminal_body and
-                      retry_headers.get_all("Content-Length") == [str(len(terminal_body))] and
-                      retry_headers.get_content_type() == "application/x-ndjson" and
-                      all(retry_headers.get(header) is None for header in
-                          (NEXT_CURSOR, "Transfer-Encoding", "Trailer")),
-                      "terminal retry changed status, rows, framing, or exhaustion")
+                if not strict_replay:
+                    check_terminal_retry()
                 check(400 <= invalid_status < 500, f"invalid retirement token returned HTTP {invalid_status}")
                 check(type(pins) is int and pins > 0, f"terminal retry did not retain its predecessor pin: {pins!r}")
                 deadline = time.monotonic() + HTTP_TIMEOUT
@@ -956,8 +998,7 @@ def capacity_control_suite(binary, directory):
                               "invalid_cursor_http_status": invalid_status, "pins_while_held": pins,
                               "pins_after_release": remaining}
 
-        expect_query(bog, augmented, 0, SECOND, label="ordinary query after compaction")
-        expect_walk(bog, args, fresh, (1, 2), "fresh paged query after compaction")
+        fresh_digest = fresh_parity(bog, "after replacement")
         stale_cursor = expect_page(bog, args, fresh, 0, 1, None, "first page before restart")
         bog.kill()
 
@@ -973,11 +1014,10 @@ def capacity_control_suite(binary, directory):
         wildcard_exit = bog.process.returncode
         check(wildcard_exit == (0 if wildcard_checks else 1),
               f"capacity opt-in on wildcard exited with status {wildcard_exit}")
-    with run_bog(binary, store) as bog:
+    with run_bog(binary, store, flags=budget_flags) as bog:
         hidden(bog, "loopback restart with opt-in unset")
         expect_bad_query(bog, {**args, "cursor": stale_cursor}, "prior-process cursor after restart")
-        expect_query(bog, augmented, 0, SECOND, label="ordinary query after compacted restart")
-        expect_walk(bog, args, fresh, (1, 2), "paged query after compacted restart")
+        restart_digest = fresh_parity(bog, "same-directory restart")
         bog.stop()
     return {"default_http_status": 404, "wildcard_opt_in_exit": wildcard_exit,
             "wildcard_control_404_checks": wildcard_checks, "environment_opt_in": not flags,
@@ -987,7 +1027,75 @@ def capacity_control_suite(binary, directory):
             "initial_generation": initial["generation"], "published": published,
             "continuation_replayed": True, "retirement": retirement,
             "retire_hidden_checks": retire_hidden_checks,
-            "fresh_rows": len(fresh), "restart_rows": len(fresh)}
+            "fresh_rows": len(fresh), "restart_rows": len(fresh),
+            **({"replacement_replay": {
+                "work_budget": REPLACEMENT_WORK_BUDGET if budget_flags else None,
+                "fresh_ordered_sha256": fresh_digest, "restart_ordered_sha256": restart_digest,
+                "terminal_sha256": hashlib.sha256(terminal_body).hexdigest(),
+                "terminal_retry_sha256": hashlib.sha256(retry[1]).hexdigest(),
+            }} if strict_replay else {})}
+
+
+def budget_probe_rows():
+    return [Row(1, "@z"), Row(1, "@dup"), Row(1, "@dup"),
+            *(Row(ns, "scan gap") for ns in range(2, 128)), Row(128, "@last")]
+
+
+def fixed_budget_replay_suite(binary, directory):
+    response_flag = "-query-max-response-bytes"
+    missing = {WORK_BUDGET_FLAG, response_flag} - advertised_flags(binary, directory)
+    if missing:
+        return SuiteSkipped(f"Bog -help omits {', '.join(sorted(missing))}")
+
+    directory.mkdir()
+    rows = budget_probe_rows()
+    args = query_args(0, 129, "@")
+    captured = oracle(rows, 0, 129, "@")
+    trials = []
+    for budget, first_limit in ((32, 1), (4096, 4)):
+        trial = {"budget": budget, "first_limit": first_limit}
+        trials.append(trial)
+        flags = (f"{WORK_BUDGET_FLAG}={budget}", f"{response_flag}=112")
+        with run_bog(binary, directory / str(budget), flags=flags) as bog:
+            bog.ingest(rows)
+            opening = {**args, "page": "1", "limit": first_limit}
+            response = bog.checked_exchange("GET", query_target(opening))
+            if response[0] == 503 and budget == 32:
+                check(response[1].strip() == b"query work budget exhausted",
+                      f"opening at budget {budget}: unexpected refusal {response[1][:150]!r}")
+                trial.update(outcome="clean_rejection", **query_error_evidence(
+                    response, 503, f"opening at budget {budget}"))
+                bog.stop()
+                continue
+            check(response[0] == 200, f"opening at budget {budget}: HTTP {response[0]}")
+            body, cursor = query_response(response, exact_framing=True)
+            first_rows = 1 if first_limit == 1 else 2
+            actual = decode_rows(body)
+            expect_rows(actual, captured[:first_rows], f"opening at budget {budget}")
+            check(cursor and len(body) <= 112, f"opening at budget {budget}: missing cursor or byte cap exceeded")
+            bog.ingest([Row(0, "@backfill"), Row(1, "@tie")])
+            for offset in range(first_rows, len(captured)):
+                continuation = {**args, "cursor": cursor, "limit": 1}
+                try:
+                    body, cursor = bog.query_ndjson(continuation, exact_framing=True)
+                except Rejected as exc:
+                    raise Rejected(f"issued cursor failed at budget {budget}, row {offset}: {exc}") from exc
+                check(len(body) <= 112, f"continuation at budget {budget}: byte cap exceeded")
+                page = decode_rows(body)
+                expect_rows(page, captured[offset:offset + 1], f"continuation at budget {budget}, row {offset}")
+                actual.extend(page)
+                check((cursor is not None) == (offset + 1 < len(captured)),
+                      f"continuation at budget {budget}, row {offset}: wrong exhaustion marker")
+            # Append again before retrying the token that served the terminal page.
+            bog.ingest([Row(1, "@after terminal")])
+            retry, next_cursor = bog.query_ndjson(continuation, exact_framing=True)
+            check(retry == body and next_cursor is None, f"terminal retry changed at budget {budget}")
+            trial.update(outcome="exhausted", first_rows=first_rows, resume_limit=1, rows=len(actual),
+                         ordered_sha256=ordered_sha256(actual),
+                         terminal_sha256=hashlib.sha256(body).hexdigest(),
+                         terminal_retry_sha256=hashlib.sha256(retry).hexdigest())
+            bog.stop()
+    return {"response_byte_cap": 112, "trials": trials}
 
 
 def query_admission_required():
@@ -1031,15 +1139,29 @@ def query_limits_suite(binary, directory):
             return {"flag": flag, "flag_value": budget, "rejections": rejections}
         expect_rows(bog.query(0, second.ns + 1, "@", limit=2), [first, second],
                     "ordinary query fits the work budget")
-        cursor = expect_page(bog, args, [first, second, last], 0, 1, None, "first page fits budget")
         rejections = {
             "ordinary": expect_query_error(bog, {**args, "limit": 3}, 503,
                                            "ordinary query exceeds work budget"),
             "first_page": expect_query_error(bog, {**args, "limit": 2, "page": "1"}, 503,
                                              "first page exceeds work budget during lookahead"),
-            "continuation": expect_query_error(bog, {**args, "limit": 1, "cursor": cursor}, 503,
-                                               "continuation exceeds work budget during lookahead"),
         }
+        opening = {**args, "limit": 1, "page": "1"}
+        status, _, _ = bog.checked_exchange("GET", query_target(opening))
+        if status == 503:
+            rejections["uncertifiable_first_page"] = expect_query_error(
+                bog, opening, 503, "first page cannot certify the sparse walk")
+        else:
+            cursor = expect_page(bog, args, [first, second, last], 0, 1, None, "first page fits budget")
+            continuation = {**args, "limit": 1, "cursor": cursor}
+            status, _, _ = bog.checked_exchange("GET", query_target(continuation))
+            if status == 503:
+                # Historical candidates may issue before proving exhaustion.
+                # Native release qualification requires every issued cursor to finish.
+                rejections["continuation"] = expect_query_error(
+                    bog, continuation, 503, "historical continuation exceeds work budget")
+            else:
+                expect_walk(bog, args, [first, second, last], (1,), "sparse continuation",
+                            position=1, cursor=cursor)
         expect_rows(bog.query(last.ns, last.ns + 1, "@"), [last], "query after budget rejection")
     return {"flag": flag, "flag_value": budget, "rejections": rejections}
 
@@ -2881,7 +3003,10 @@ def require_query_admission_metrics(name, metrics):
     if metrics == expected:
         return
     if name == "query-limits":
-        expected["rejections"]["uncertifiable_first_page"] = expected["rejections"].pop("continuation")
+        continuation = expected["rejections"].pop("continuation")
+        if metrics == expected:
+            return
+        expected["rejections"]["uncertifiable_first_page"] = continuation
     check(metrics == expected, f"#19 {name} report is missing or mismatched")
 
 
