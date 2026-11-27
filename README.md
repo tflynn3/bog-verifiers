@@ -395,7 +395,17 @@ Qualification also requires the architecture and lifecycle tests to pass.
 Historical report validation remains available without
 `--require-replacement-restart` and `--require-control-scope`.
 
-Both native jobs require a passing `control_scope` case in `control.json`.
+Both native jobs require passing `TestReleaseCapacityControlScope` and
+`TestReleaseCapacityControlScope/loopback_with_opt_in` events in
+`capacity-control-scope-events.jsonl`. The pinned Go test verifies that
+each listener belongs to the candidate and is bound to the requested
+address. It checks HTTP 404 and health on default loopback and opted-in
+wildcard. On opted-in loopback it commits a seed row, requests cutoff 1,
+and polls for a newer generation covering exactly that row. An HTTP 404
+on the positive capability probe skips that subtest outside strict
+qualification.
+
+Both native jobs also require a passing `control_scope` case in `control.json`.
 The probe checks that the environment opt-in exposes status on the IPv4
 loopback listener. It then requires HTTP 404 for status, start at a valid
 committed cutoff, and retirement with an issued cursor on default and

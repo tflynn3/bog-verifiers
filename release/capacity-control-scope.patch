@@ -1,0 +1,45 @@
+diff --git a/verify/release/capacity_control_linux_test.go b/verify/release/capacity_control_linux_test.go
+--- a/verify/release/capacity_control_linux_test.go
++++ b/verify/release/capacity_control_linux_test.go
+@@ -32,3 +32,4 @@
+-		name  string
+-		ip    net.IP
+-		optIn string
++		name    string
++		ip      net.IP
++		optIn   string
++		publish bool
+@@ -37,0 +39 @@
++		{name: "loopback_with_opt_in", ip: net.IPv4(127, 0, 0, 1), optIn: "1", publish: true},
+@@ -69,0 +72 @@
++			supported := true
+@@ -72,0 +76,13 @@
++						if tc.publish {
++							probe, err := request(ctx, client, http.MethodGet, base+"/_capacity/compaction?action=status&cutoff=0", nil)
++							if err != nil {
++								return fmt.Errorf("probe loopback compaction capability: %w", err)
++							}
++							if probe.status == http.StatusNotFound {
++								supported = false
++								return nil
++							}
++							if probe.status != http.StatusOK {
++								return fmt.Errorf("probe loopback compaction capability returned HTTP %d: %.200s", probe.status, probe.body)
++							}
++						}
+@@ -77 +93,10 @@
+-						return checkCapacityControlAbsent(ctx, t, client, base)
++						if !tc.publish {
++							return checkCapacityControlAbsent(ctx, t, client, base)
++						}
++						published, err := publishBackfillGeneration(ctx, client, base, 1, nil)
++						if err != nil {
++							return fmt.Errorf("publish opted-in loopback cutoff: %w", err)
++						}
++						t.Logf("published generation=%d covered_rows=%d committed_rows=%d",
++							published.generation, published.covered, published.committed)
++						return nil
+@@ -81,0 +107,3 @@
++			}
++			if !supported {
++				t.Skip("candidate has no opted-in loopback compaction route")
