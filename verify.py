@@ -1043,6 +1043,9 @@ def capacity_control_suite(binary, directory, *, require_replacement_restart=Fal
                 retirement = {"status": "pass", "retire_http_status": retire_status, "terminal_page_retried": True,
                               "invalid_cursor_http_status": invalid_status, "pins_while_held": pins,
                               "pins_after_release": remaining}
+                if require_replacement_restart:
+                    refused = expect_query_error(bog, terminal, 410, "terminal cursor after retirement")
+                    retirement["resume_after_retire_http_status"] = refused["status"]
 
         fresh_digest = fresh_parity(bog, "after replacement")
         stale_cursor = expect_page(bog, args, fresh, 0, 1, None, "first page before restart")

@@ -181,7 +181,8 @@ class GateTest(unittest.TestCase):
 
     def test_cutover_requires_retirement_exit_and_cleanup_evidence(self):
         retirement = dict(status="pass", retire_http_status=204, terminal_page_retried=True,
-                          invalid_cursor_http_status=400, pins_while_held=1, pins_after_release=0)
+                          invalid_cursor_http_status=400, pins_while_held=1, pins_after_release=0,
+                          resume_after_retire_http_status=410)
         published = dict(state="complete", generation=2, covered_rows=4, committed_rows=5)
         reopened = dict(published)
         evidence = dict(retirement=retirement, continuation_replayed=True, fixture_removed=True,
@@ -196,6 +197,7 @@ class GateTest(unittest.TestCase):
             (retirement, {"pins_after_release": None}, "positive-to-zero"),
             (retirement, {"terminal_page_retried": False}, "terminal retry"),
             (retirement, {"invalid_cursor_http_status": 204}, "authenticated retirement"),
+            (retirement, {"resume_after_retire_http_status": 200}, "authenticated retirement"),
             (processes[1], {"exit_code": 0}, "unexpected candidate exit"),
             (reopened, {"generation": 1}, "exact generation"),
             (reopened, {"covered_rows": 5}, "exact generation"),
@@ -423,6 +425,15 @@ class GateTest(unittest.TestCase):
             parent = directory / "fixtures"
             report.write_text(json.dumps({**identity, "cases": cases}))
             validate_durability(directory, identity)
+            proof = cases["enospc"]["evidence"]
+            proof.update(observed_enospc=True, errno="ENOSPC", disposable_local_filesystem=True,
+                         recovered_after_space_freed=True)
+            report.write_text(json.dumps({**identity, "cases": cases}))
+            with self.assertRaisesRegex(verify.Rejected, "full-to-healthy restart replay"):
+                validate_durability(directory, identity, require_retarget_replay=True)
+            full["replayed_after_restart"] = True
+            report.write_text(json.dumps({**identity, "cases": cases}))
+            validate_durability(directory, identity, require_retarget_replay=True)
             with self.assertRaisesRegex(verify.Rejected, "missing required case fixture_root_cleanup"):
                 validate_durability(directory, identity, require_fixture_root_cleanup=True)
 

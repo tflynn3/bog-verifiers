@@ -223,12 +223,16 @@ docker start -a "$container"
 
 Run harness regressions with `python3 -B -m unittest discover -s tests -v`.
 
-## Linux release qualification for #53 and #70
+## Linux release qualification for #108
 
 Storage owns writable recovery and checkpoint publication under #53.
 Query/HTTP owns the cursor progress contract under #70.
 Release Verification owns the native producers and validators.
 Core Architecture owns the registry and fitness companion.
+Release Verification owns the gate and uses the existing Query/HTTP owner's
+paging and framing coverage. Recheck the HTTP read lease and retained paging
+handoff before dispatching #104. Keep #81 behind the #108 writable recovery
+handoff.
 
 Dispatch **Linux release verification** from the verifier ref with the full
 composed Bog commit SHA. The workflow builds one clean Go 1.27.0 binary on
@@ -256,7 +260,9 @@ The durability report must demonstrate prior-process cursor
 rejection and verify readiness and ingest in both filesystem retarget
 directions. The native workflow checks that the producer removed its fixture
 root and records `fixture_root_cleanup` in the schema v1 durability report.
-New native qualifications require that case to pass. Historical reports may
+New native qualifications require that case to pass, kernel-observed ENOSPC,
+exact restart replay in both retarget directions, and recovery after freeing
+space. Historical reports may
 omit it, and an explicit cleanup failure rejects either report format.
 
 At both 196,608 and 393,216 seed rows under the 128 MiB cgroup limit, the
@@ -339,8 +345,9 @@ The supplemental parity report checks legacy WAL replay, append, and restart, th
 bundle and starts the candidate on the verified v1 restore. Ordinary queries
 and framed cursor walks check restored rows and exact parity after restart.
 After the reopened restore acknowledges a second append with HTTP 204, the
-verifier requests SIGKILL of that live process and checks its reaped exit
-signal before restarting. Cutover qualification requires both observations
+verifier requests SIGKILL of that live process before reading or closing the
+response body and checks its reaped exit signal before restarting.
+Cutover qualification requires both observations
 and exact ordered replay of all eight rows. Restored launches use the shipped control defaults.
 The parity report counts six HTTP 404 responses across status, start, and
 retirement probes on restored startup and restart. When the operator CLI is available, a separate restored copy
@@ -379,7 +386,9 @@ the terminal page before retiring the capture with its continuation token.
 The default and wildcard listeners must hide the retirement action.
 Qualification requires rejection of a malformed token, a positive predecessor
 pin count after terminal retry, and an empty HTTP 204 for the issued token
-followed by an observed zero. Slipway allows the retirement subprobe to skip on older controls.
+followed by an observed zero. Native qualification also requires a clean
+HTTP 410 when the retired terminal cursor is resumed. Slipway allows the
+retirement subprobe to skip on older controls.
 The release gate also checks the small fixture's process exits and removal.
 
 Both native jobs require the replacement and restart proof in `control.json`.
@@ -417,4 +426,7 @@ probe records a skip, which is insufficient for native qualification.
 The release gate checks the binary's ELF machine against the native runner
 and binds each mandatory report to that runner's binary digest, revision,
 and fixture ID. Each runner passes its build-time SHA-256 directly to
-validation. The control report carries the architecture explicitly.
+validation. The control report carries the architecture explicitly. The
+joint verdict binds both architectures to the same verifier commit. Each
+runner records its filesystem, delegated cgroup settings, and explicit parity
+test events alongside the per-case reports and cleanup evidence.

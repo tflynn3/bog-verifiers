@@ -440,7 +440,7 @@ def validate_parity(evidence, *, require_writable_restore=False):
           "parity: incomplete generation replacement or snapshot evidence")
 
 
-def validate_durability(directory, expected, *, require_fixture_root_cleanup=False):
+def validate_durability(directory, expected, *, require_fixture_root_cleanup=False, require_retarget_replay=False):
     report = read_report(directory, "durability", expected)
     if require_fixture_root_cleanup or FIXTURE_ROOT_CLEANUP in report["cases"]:
         passing_case(report, "durability", FIXTURE_ROOT_CLEANUP)
@@ -454,6 +454,11 @@ def validate_durability(directory, expected, *, require_fixture_root_cleanup=Fal
           integer(full.get("readiness_status"), 503, 503) and full.get("readiness_reason") == "low_disk_headroom" and
           integer(full.get("ingest_status"), 503, 503) and full.get("post_ingest_reason") == "wal_rollback" and
           full.get("post_ingest_category") == "enospc", "durability: incomplete active-filesystem retarget evidence")
+    if require_retarget_replay:
+        check(proof.get("observed_enospc") is True and proof.get("errno") == "ENOSPC" and
+              proof.get("disposable_local_filesystem") is True and proof.get("recovered_after_space_freed") is True and
+              full.get("replayed_after_restart") is True,
+              "durability: missing kernel ENOSPC, full-to-healthy restart replay, or recovery after freeing space")
 
 
 def record_fixture_root_cleanup(directory, expected, parent):
@@ -526,6 +531,7 @@ def validate_cutover_control(case):
     retirement = control.get("retirement") or {}
     check(retirement.get("status") == "pass" and retirement.get("terminal_page_retried") is True and
           integer(retirement.get("retire_http_status"), 204, 204) and
+          integer(retirement.get("resume_after_retire_http_status"), 410, 410) and
           integer(retirement.get("invalid_cursor_http_status"), 400, 499) and
           integer(retirement.get("pins_while_held"), 1) and
           integer(retirement.get("pins_after_release"), 0, 0),
@@ -628,7 +634,8 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
           "missing, repeated or failing release producer status")
     validate_budget(case_evidence(directory, "admission", "work_budget", expected),
                     require_fixed_boundaries=require_fixed_boundaries, require_tied_byte_walk=bool(cutover_arch))
-    validate_durability(directory, expected, require_fixture_root_cleanup=require_fixture_root_cleanup)
+    validate_durability(directory, expected, require_fixture_root_cleanup=require_fixture_root_cleanup,
+                        require_retarget_replay=bool(cutover_arch))
     validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected),
                       require_backfill_timelines=require_backfill_timelines,
                       require_capacity_observations=require_capacity_observations,
@@ -715,6 +722,7 @@ def main():
     parser.add_argument("--arch", choices=("amd64", "arm64"))
     parser.add_argument("--binary-sha256")
     parser.add_argument("--gate-revision")
+    parser.add_argument("--verifier-revision")
     parser.add_argument("--capacity-validation-revision")
     parser.add_argument("--fixture-parent", type=Path)
     parser.add_argument("--require-fixture-root-cleanup", action="store_true")
@@ -759,6 +767,7 @@ def main():
                 check(platform.system() == "Linux" and native_arch == args.arch,
                       f"cutover must be validated on native Linux {args.arch}")
                 check(re.fullmatch(r"[0-9a-f]{40}", args.gate_revision or ""), "invalid crash gate checkout revision")
+                check(re.fullmatch(r"[0-9a-f]{40}", args.verifier_revision or ""), "invalid verifier checkout revision")
                 check(re.fullmatch(r"[0-9a-f]{40}", args.capacity_validation_revision or ""),
                       "invalid capacity validation checkout revision")
             validate(directory, expected, require_fixture_root_cleanup=args.require_fixture_root_cleanup,
@@ -772,6 +781,7 @@ def main():
             if cutover:
                 qualification["current_observations"] = True
                 qualification["crash_gate_revision"] = args.gate_revision
+                qualification["verifier_revision"] = args.verifier_revision
                 qualification["capacity_validation_revision"] = args.capacity_validation_revision
                 qualification[POST_RESTORE_ACK_CRASH] = True
             if args.require_replacement_restart:

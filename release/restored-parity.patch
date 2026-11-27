@@ -1,15 +1,35 @@
 diff --git a/verify/release/admission.go b/verify/release/admission.go
-index 801486d..4b3c430 100644
+index 801486d..7f8d845 100644
 --- a/verify/release/admission.go
 +++ b/verify/release/admission.go
-@@ -224 +224,14 @@ func serve(ctx context.Context, binary string, client *http.Client, flags []stri
+@@ -49,0 +50,4 @@ func request(ctx context.Context, client *http.Client, method, target string, bo
++	return requestWithAck(ctx, client, method, target, body, nil)
++}
++
++func requestWithAck(ctx context.Context, client *http.Client, method, target string, body io.Reader, onAck func() error) (result response, err error) {
+@@ -61,0 +66,4 @@ func request(ctx context.Context, client *http.Client, method, target string, bo
++	if onAck != nil && res.StatusCode == http.StatusNoContent {
++		// Request SIGKILL from the 204 response path, before reading the body.
++		return response{status: res.StatusCode}, onAck()
++	}
+@@ -95,0 +104,4 @@ func ingest(ctx context.Context, client *http.Client, base string, rows []row) (
++	return ingestWithAck(ctx, client, base, rows, nil)
++}
++
++func ingestWithAck(ctx context.Context, client *http.Client, base string, rows []row, onAck func() error) (int, error) {
+@@ -103 +115 @@ func ingest(ctx context.Context, client *http.Client, base string, rows []row) (
+-	res, err := request(ctx, client, http.MethodPost, base+"/ingest", &body)
++	res, err := requestWithAck(ctx, client, http.MethodPost, base+"/ingest", &body, onAck)
+@@ -224 +236,16 @@ func serve(ctx context.Context, binary string, client *http.Client, flags []stri
 -func serveDirectory(ctx context.Context, binary, dir string, client *http.Client, flags []string, check func(string) error) (err error) {
 +func serveDirectory(ctx context.Context, binary, dir string, client *http.Client, flags []string, check func(string) error) error {
 +	return serveDirectoryWithEnv(ctx, binary, dir, client, flags, false, check)
 +}
 +
 +func serveDirectoryWithEnv(ctx context.Context, binary, dir string, client *http.Client, flags []string, capacityEnv bool, check func(string) error) error {
-+	return serveDirectoryWithCrash(ctx, binary, dir, client, flags, capacityEnv, nil, check)
++	return serveDirectoryWithCrash(ctx, binary, dir, client, flags, capacityEnv, nil, func(base string, _ func() error) error {
++		return check(base)
++	})
 +}
 +
 +type crashProof struct {
@@ -17,8 +37,8 @@ index 801486d..4b3c430 100644
 +	Signal    int  `json:"exit_signal,omitempty"`
 +}
 +
-+func serveDirectoryWithCrash(ctx context.Context, binary, dir string, client *http.Client, flags []string, capacityEnv bool, crash *crashProof, check func(string) error) (err error) {
-@@ -233,0 +247,8 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
++func serveDirectoryWithCrash(ctx context.Context, binary, dir string, client *http.Client, flags []string, capacityEnv bool, crash *crashProof, check func(string, func() error) error) (err error) {
+@@ -233,0 +261,8 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 +	for _, entry := range cmd.Environ() {
 +		if !strings.HasPrefix(entry, "BOG_CAPACITY_CONTROL=") {
 +			cmd.Env = append(cmd.Env, entry)
@@ -27,28 +47,28 @@ index 801486d..4b3c430 100644
 +	if capacityEnv {
 +		cmd.Env = append(cmd.Env, "BOG_CAPACITY_CONTROL=1")
 +	}
-@@ -238 +259,2 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
+@@ -238 +273,2 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 -	cmd.Cancel = func() error {
 +	killGroup := func(afterProbe bool) error {
 +		var requestErr error
-@@ -239,0 +262,6 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
+@@ -239,0 +276,6 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 +			if afterProbe {
 +				requestErr = ctx.Err()
 +				if requestErr == nil {
 +					requestErr = requireCandidateRunning(cmd.Process.Pid)
 +				}
 +			}
-@@ -240,0 +269,3 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
+@@ -240,0 +283,3 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 +			if afterProbe && requestErr == nil && killErr == nil {
 +				crash.Requested = true
 +			}
-@@ -244,0 +276,3 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
+@@ -244,0 +290,3 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 +		if afterProbe && !crash.Requested {
 +			return errors.Join(errors.New("could not request SIGKILL of the live candidate after the probe"), requestErr, killErr)
 +		}
-@@ -246,0 +281 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
+@@ -246,0 +295 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 +	cmd.Cancel = func() error { return killGroup(false) }
-@@ -273,3 +308,8 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
+@@ -273,3 +322,8 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 -				if status, ok := exited.Sys().(syscall.WaitStatus); ok && status.Signal() == syscall.SIGKILL {
 -					err = errors.Join(err, killErr, observeErr)
 -					return
@@ -60,15 +80,11 @@ index 801486d..4b3c430 100644
 +						err = errors.Join(err, killErr, observeErr)
 +						return
 +					}
-@@ -306 +346,5 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
+@@ -306 +360 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 -			return check(base)
-+			if err := check(base); err != nil || crash == nil {
-+				return err
-+			}
-+			// The callback confirmed the append. Request the crash before cleanup.
-+			return killGroup(true)
++			return check(base, func() error { return killGroup(true) })
 diff --git a/verify/release/parity_linux_test.go b/verify/release/parity_linux_test.go
-index 2620d5d..b757e4d 100644
+index 2620d5d..646de2f 100644
 --- a/verify/release/parity_linux_test.go
 +++ b/verify/release/parity_linux_test.go
 @@ -12,0 +13 @@ import (
@@ -360,9 +376,9 @@ index 2620d5d..b757e4d 100644
 +	// immediately after acknowledging the append.
 +	reopenedAppend := row{rows[1].TS, "append after writable restore reopen [match]"}
 +	proof.ReopenedRestoreCrash = &crashProof{}
-+	if err := serveDirectoryWithCrash(ctx, binary, dir, client, restoreFlags, false, proof.ReopenedRestoreCrash, func(base string) error {
++	if err := serveDirectoryWithCrash(ctx, binary, dir, client, restoreFlags, false, proof.ReopenedRestoreCrash, func(base string, crash func() error) error {
 +		var ingestErr error
-+		proof.ReopenedRestoreAppendStatus, ingestErr = ingest(ctx, client, base, []row{reopenedAppend})
++		proof.ReopenedRestoreAppendStatus, ingestErr = ingestWithAck(ctx, client, base, []row{reopenedAppend}, crash)
 +		if ingestErr != nil || proof.ReopenedRestoreAppendStatus != http.StatusNoContent {
 +			return fmt.Errorf("append after writable restore reopen: HTTP %d (%v)", proof.ReopenedRestoreAppendStatus, ingestErr)
 +		}
