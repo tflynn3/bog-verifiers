@@ -1,0 +1,54 @@
+diff --git a/bench/retained-history/backfill.go b/bench/retained-history/backfill.go
+index d688676..1ae3e5f 100644
+--- a/bench/retained-history/backfill.go
++++ b/bench/retained-history/backfill.go
+@@ -3,0 +4 @@ import (
++	"bytes"
+@@ -96,0 +98 @@ func (f fixture) runBackfill(ctx context.Context, s service, o options, r *resul
++	held.recordTerminalBody = true
+@@ -112,0 +115,4 @@ func (f fixture) runBackfill(ctx context.Context, s service, o options, r *resul
++	if !bytes.Equal(terminal.terminalBody, held.terminalBody) {
++		return published, errors.New("retry of terminal page changed the NDJSON response bytes")
++	}
++	p.TerminalRetryByteIdentical = true
+diff --git a/bench/retained-history/main.go b/bench/retained-history/main.go
+index 2c18531..f32e349 100644
+--- a/bench/retained-history/main.go
++++ b/bench/retained-history/main.go
+@@ -46,0 +47,2 @@ type result struct {
++	RestartCompaction *compaction `json:"restart_compaction,omitempty"`
++
+diff --git a/bench/retained-history/platform_linux.go b/bench/retained-history/platform_linux.go
+index 1e5d358..1603e6d 100644
+--- a/bench/retained-history/platform_linux.go
++++ b/bench/retained-history/platform_linux.go
+@@ -379,0 +380,10 @@ func (r *result) exercise(ctx context.Context, o options, binary, dir, group str
++		if o.mode == "live" {
++			status, statusErr := probe.compact(work, o.control, "status", 0)
++			if statusErr != nil {
++				return p, fmt.Errorf("observe replacement after restart: %w", statusErr)
++			}
++			r.RestartCompaction = &status.compaction
++			if r.Compaction == nil || status.compaction != *r.Compaction {
++				return p, fmt.Errorf("restart compaction status %+v did not match publication %+v", status.compaction, r.Compaction)
++			}
++		}
+diff --git a/bench/retained-history/protocol.go b/bench/retained-history/protocol.go
+index 160260a..9dce0cd 100644
+--- a/bench/retained-history/protocol.go
++++ b/bench/retained-history/protocol.go
+@@ -167,0 +168,3 @@ type walk struct {
++	recordTerminalBody bool
++	terminalBody       []byte
++
+@@ -241,0 +245,3 @@ func (w *walk) page(ctx context.Context, s service, f fixture) (_ time.Duration,
++	if w.recordTerminalBody && w.cursor == "" {
++		w.terminalBody = data
++	}
+diff --git a/bench/retained-history/timeline.go b/bench/retained-history/timeline.go
+index fc19fde..1b835d8 100644
+--- a/bench/retained-history/timeline.go
++++ b/bench/retained-history/timeline.go
+@@ -128,0 +129,2 @@ type backfillTimeline struct {
++	TerminalRetryByteIdentical bool `json:"terminal_retry_byte_identical,omitempty"`
++

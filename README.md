@@ -263,18 +263,21 @@ At both 196,608 and 393,216 seed rows under the 128 MiB cgroup limit, the
 capacity producer records clustered and scattered backfill timelines.
 Each proves an acknowledged append and continuation during compaction,
 publication at the exact newer cutoff, exhaustion of the held snapshot,
-and fresh visibility. The workflow builds the capacity producer from the
-dispatched revision so the capacity evidence owner supplies the launcher
-and observations. The producer with a fixed query budget uses 2,147,483,648
+and fresh visibility. The workflow builds the capacity producer and both
+strict consumers from the pinned `e53a856` checkout and records the
+producer patch with the evidence. The producer with a fixed query budget uses 2,147,483,648
 work units for live queries. When the producer advertises an explicit
 `-query-work-budget`, the workflow passes 134,217,728 and the legacy report
 records it in `fixture.query_work_budget`. The report records peak sampled
 checkpoint staging bytes. After each held walk exhausts, the
-producer retries its terminal page, records the positive predecessor pin count,
-and retires the capture with the continuation token that fetched that page.
+producer retries its terminal page, checks the NDJSON response byte for
+byte, records the positive predecessor pin count, and retires the capture
+with the continuation token that fetched that page.
 Qualification requires an observed zero after retirement and an exact fresh
-walk. Each fixture also requires an exact full walk after restart and successful
-process, cgroup, and fixture root cleanup.
+walk. On restart in the same directory, the producer reads back the published
+generation, covered cutoff, and committed row count. The independent append
+ledger checks the full ordered walk through the committed suffix and terminal
+exhaustion. Each fixture also requires process, cgroup, and fixture root cleanup.
 
 The capacity producer handoff uses these additive fields in each schema v1 result.
 
@@ -321,10 +324,12 @@ fixture cleanup. Each native qualification records the crash gate checkout,
 candidate revision, fixture and candidate binary digest. The final job
 checks both crash verdicts and prints the checkout and both digests.
 Standard schema-v1 validation still accepts historical parity reports.
-The pinned capacity validation checkout checks the live capacity report.
-The #96 repair rejects a last backfill acknowledgment after the final
-timeline sample and accepts one at that sample's timestamp. Both consumer
-fixture suites run under the race detector with the shared proof tests.
+The shared proof and both strict consumers accept an acknowledgment at
+the fresh-visibility sample and reject one after that sample, even if it
+precedes the end of the full walk. Their fixtures cover the passing report
+and standard schema-v1 archive compatibility. Both native jobs run these
+tests under the race detector before collecting live evidence and record
+the capacity validation revision with the qualification.
 Route capacity fixture failures to the existing Release Verification owner
 with the native architecture, checkout and candidate revisions, and the
 capacity report and runner log. The crash gate owner retains the producer

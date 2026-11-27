@@ -15,7 +15,8 @@ from release_gate import (CAPACITY_WORK_BUDGET, FIXTURE_ROOT_CLEANUP, MEMORY_LIM
                           record_fixture_root_cleanup, validate_combined_parity,
                           validate_backfill_timelines, validate_budget, validate_budget_trials,
                           validate_capacity_observations, validate_cutover_control, validate_memory_peak,
-                          validate_cutover_parity, validate_durability, validate_no_oom_kills)
+                          validate_cutover_parity, validate_durability, validate_no_oom_kills,
+                          validate_restart_compaction)
 
 README_ONLY = "7655ed627bccad30700b8de4b6f47c8d7d5d8579"
 
@@ -234,12 +235,21 @@ class GateTest(unittest.TestCase):
         validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
 
         acks = scattered["acknowledged_backfill"]
-        end = scattered["samples"][-1]["elapsed_ns"]
-        with patch.dict(acks, last_ack_ns=end):
+        fresh = next(sample["elapsed_ns"] for sample in scattered["samples"]
+                     if sample["event"] == "fresh_visible")
+        with patch.dict(acks, last_ack_ns=fresh):
             validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
-        with patch.dict(acks, last_ack_ns=end + 1):
-            with self.assertRaisesRegex(verify.Rejected, "acknowledgment is after the end of observation"):
+        with patch.dict(acks, last_ack_ns=fresh + 1):
+            with self.assertRaisesRegex(verify.Rejected, "acknowledgment is after fresh visibility"):
                 validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
+
+        clustered["terminal_retry_byte_identical"] = True
+        with self.assertRaisesRegex(verify.Rejected, "missing byte-identical terminal retry"):
+            validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True,
+                                        require_wire_retry=True)
+        with patch.dict(scattered, terminal_retry_byte_identical=True):
+            validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True,
+                                        require_wire_retry=True)
 
         with patch.dict(scattered, terminal_page_retried=False):
             with self.assertRaisesRegex(verify.Rejected, "missing terminal retry"):
@@ -256,6 +266,18 @@ class GateTest(unittest.TestCase):
         with patch.dict(scattered["pin_drain"], retired_pins_after_exhaustion=1):
             with self.assertRaisesRegex(verify.Rejected, "incomplete pin-drain evidence"):
                 validate_backfill_timelines([clustered, scattered], seed, published)
+
+    def test_restart_must_reopen_the_published_generation_and_committed_suffix(self):
+        for seed in (196_608, 393_216):
+            published = dict(state="complete", generation=seed // 8192 + 1,
+                             covered_rows=seed + 64, committed_rows=seed + 2048)
+            validate_restart_compaction(dict(compaction=published, restart_compaction=published), str(seed))
+            for reopened in (None, dict(published, generation=published["generation"] - 1),
+                             dict(published, covered_rows=seed),
+                             dict(published, committed_rows=published["covered_rows"])):
+                with self.subTest(seed=seed, reopened=reopened):
+                    with self.assertRaisesRegex(verify.Rejected, "published generation, cutoff, and committed suffix"):
+                        validate_restart_compaction(dict(compaction=published, restart_compaction=reopened), str(seed))
 
     def test_native_release_requires_fixed_boundaries_and_snapshot_walks(self):
         def walk(budget, rows):

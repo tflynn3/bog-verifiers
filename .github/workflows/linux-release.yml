@@ -20,7 +20,7 @@ env:
   BOG_REPOSITORY: tflynn3/bog
   TOOLING_REVISION: abefdb5dcdc1f8bbbecdc9c0cc7ab39b309a87db
   CRASH_TOOLING_REVISION: 339ea819100ef3d8e2fca3b40936e4288ae313d3
-  CAPACITY_VALIDATION_REVISION: 89c7fc6dda91563540270576e45e097164534235
+  CAPACITY_VALIDATION_REVISION: e53a856eafbd3f4101757372c57c4a4fd8ea38bc
   ADMISSION_TOOLING_REVISION: 304749df78fe3dfaa75ce411efa34708269af659
   REVISION: ${{ inputs.revision }}
 
@@ -104,8 +104,8 @@ jobs:
         run: |
           cp admission/verify/release/README.md "$EVIDENCE/fixture.md"
           cp candidate/verify/linux/README.md "$EVIDENCE/durability-fixture.md"
-          cp candidate/bench/retained-history/README.md "$EVIDENCE/capacity-fixture.md"
-          cp verifiers/release/{fixed-budget,restored-parity,capacity-validation,post-restore-ack-crash}.patch "$EVIDENCE/"
+          cp capacity-validation/bench/retained-history/README.md "$EVIDENCE/capacity-fixture.md"
+          cp verifiers/release/{fixed-budget,restored-parity,capacity-wire-restart,post-restore-ack-crash}.patch "$EVIDENCE/"
           cp verifiers/release/admission/fixed-boundaries.patch "$EVIDENCE/"
           printf 'tooling_revision=%s\nverifier_revision=%s\n' "$(git -C gate rev-parse HEAD)" \
             "$(git -C verifiers rev-parse HEAD)" | tee -a "$EVIDENCE/run.txt"
@@ -114,11 +114,9 @@ jobs:
           admission_revision=$(git -C admission rev-parse HEAD)
           printf 'admission_tooling_revision=%s\n' "$admission_revision" | tee -a "$EVIDENCE/run.txt"
           [[ "$admission_revision" == "$ADMISSION_TOOLING_REVISION" ]]
-          capacity_revision=$(git -C candidate rev-parse HEAD)
-          printf 'capacity_tooling_revision=%s\n' "$capacity_revision" | tee -a "$EVIDENCE/run.txt"
-          [[ "$capacity_revision" == "$REVISION" ]]
           validation_revision=$(git -C capacity-validation rev-parse HEAD)
-          printf 'capacity_validation_revision=%s\n' "$validation_revision" | tee -a "$EVIDENCE/run.txt"
+          printf 'capacity_tooling_revision=%s\ncapacity_validation_revision=%s\n' \
+            "$validation_revision" "$validation_revision" | tee -a "$EVIDENCE/run.txt"
           [[ "$validation_revision" == "$CAPACITY_VALIDATION_REVISION" ]]
           crash_revision=$(git -C crash-gate rev-parse HEAD)
           printf 'crash_tooling_revision=%s\n' "$crash_revision" | tee -a "$EVIDENCE/run.txt"
@@ -126,7 +124,7 @@ jobs:
           git -C crash-gate apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/post-restore-ack-crash.patch
           git -C gate apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/{fixed-budget,restored-parity}.patch
           git -C admission apply --unidiff-zero "$GITHUB_WORKSPACE/verifiers/release/admission/fixed-boundaries.patch"
-          git -C capacity-validation apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/capacity-validation.patch
+          git -C capacity-validation apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/capacity-wire-restart.patch
 
       - uses: actions/setup-go@v5
         with:
@@ -155,6 +153,16 @@ jobs:
             [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
             printf 'binary_sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
           } 2>&1 | tee "$EVIDENCE/build.log"
+
+      - name: Check pinned capacity proof and consumer fixtures
+        id: capacity-fixtures
+        working-directory: capacity-validation
+        timeout-minutes: 4
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          go test -race -count=1 -v ./verify/capacityevidence ./bench/retained-history ./verify/release \
+            2>&1 | tee "$EVIDENCE/capacity-fixture-tests.log"
 
       - name: Run release evidence producers
         if: steps.build.outcome == 'success'
@@ -193,7 +201,7 @@ jobs:
                 ;;
               *) exit 1 ;;
             esac
-            cd candidate || exit
+            cd capacity-validation || exit
             work=$(mktemp -d "$RUNNER_TEMP/bog-capacity.XXXXXXXX") || exit
             producer="$RUNNER_TEMP/bog-capacity-producer"
             cleanup() {
@@ -271,7 +279,7 @@ jobs:
           exit "$failed"
 
       - name: Validate reports and candidate identity
-        if: always() && steps.build.outcome == 'success'
+        if: always() && steps.build.outcome == 'success' && steps.capacity-fixtures.outcome == 'success'
         working-directory: capacity-validation
         env:
           PINNED_BINARY_SHA256: ${{ steps.build.outputs.binary_sha256 }}
@@ -280,7 +288,7 @@ jobs:
           {
             failed=0
             sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
-            go run ./verify/release validate -require-cutover -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
+            BOG_RELEASE_REQUIRE_RETARGET=1 go run ./verify/release validate -require-cutover -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
               -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
               -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
             (cd ../crash-gate && go test -count=1 \
@@ -291,6 +299,7 @@ jobs:
               "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --arch "$RELEASE_ARCH" \
               --binary-sha256 "$PINNED_BINARY_SHA256" \
               --gate-revision "$(git -C ../crash-gate rev-parse HEAD)" \
+              --capacity-validation-revision "$CAPACITY_VALIDATION_REVISION" \
               --require-fixture-root-cleanup --require-fixed-boundaries --require-backfill-timelines \
               --require-capacity-observations
           } 2>&1 | tee "$EVIDENCE/validation.log"
@@ -305,8 +314,6 @@ jobs:
           {
             (cd ../candidate && go test -race -count=1 ./internal/archtest ./verify/linux) || exit 1
             (cd ../admission && go test -race -count=1 ./verify/release -run 'BudgetWalk|FixedBudgetWire') || exit 1
-            (cd ../capacity-validation &&
-              go test -race -count=1 ./verify/capacityevidence ./bench/retained-history ./verify/release) || exit 1
             go test -race -count=1 ./verify/release ./verify/query-model
           } 2>&1 | tee "$EVIDENCE/verifier-race.log"
 
@@ -340,14 +347,16 @@ jobs:
           read -r arm64_digest _ < "$arm64_dir/binary.sha256"
           jq -en --argjson amd64 "$amd64" --argjson arm64 "$arm64" \
             --arg amd64_digest "$amd64_digest" --arg arm64_digest "$arm64_digest" \
-            --arg revision "$REVISION" --arg fixture "$FIXTURE" --arg gate "$CRASH_TOOLING_REVISION" '
+            --arg revision "$REVISION" --arg fixture "$FIXTURE" --arg gate "$CRASH_TOOLING_REVISION" \
+            --arg capacity_validation "$CAPACITY_VALIDATION_REVISION" '
               if $amd64.arch == "amd64" and $arm64.arch == "arm64" and
               ([$amd64, $arm64] | all(.schema_version == 1 and .current_observations == true and
                 .revision == $revision and .fixture == $fixture and .crash_gate_revision == $gate and
-                .post_restore_ack_crash == true and
+                .post_restore_ack_crash == true and .capacity_validation_revision == $capacity_validation and
                 (.binary_sha256 | test("^[0-9a-f]{64}$")))) and
               $amd64.binary_sha256 == $amd64_digest and $arm64.binary_sha256 == $arm64_digest and
               $amd64_digest != $arm64_digest then
                 {revision: $revision, fixture: $fixture, crash_gate_revision: $gate,
+                  capacity_validation_revision: $capacity_validation,
                   binary_sha256: {amd64: $amd64_digest, arm64: $arm64_digest}}
-              else error("native qualification identities or crash verdicts did not match") end'
+              else error("native qualification identities or verdicts did not match") end'

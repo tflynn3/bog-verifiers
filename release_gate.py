@@ -56,7 +56,8 @@ def integer(value, low, high=None):
     return type(value) is int and value >= low and (high is None or value <= high)
 
 
-def validate_backfill_timelines(timelines, seed, published, *, require_pin_retirement=False):
+def validate_backfill_timelines(timelines, seed, published, *, require_pin_retirement=False,
+                                require_wire_retry=False):
     label = f"capacity ({seed} rows)"
     check(isinstance(timelines, list) and len(timelines) == 2,
           f"{label}: expected clustered and scattered backfill timelines")
@@ -123,8 +124,12 @@ def validate_backfill_timelines(timelines, seed, published, *, require_pin_retir
                   f"{name}: missing terminal retry, capture retirement, or exact fresh walk evidence")
             validate_retirement_samples(name, samples, boundaries, drain, publication["generation"], cutoff, final)
             if require_pin_retirement:
-                check(acks["last_ack_ns"] <= samples[-1]["elapsed_ns"],
-                      f"{name}: last backfill acknowledgment is after the end of observation")
+                fresh = next(sample for sample in boundaries if sample["event"] == "fresh_visible")
+                check(acks["last_ack_ns"] <= fresh["elapsed_ns"],
+                      f"{name}: last backfill acknowledgment is after fresh visibility")
+        if require_wire_retry:
+            check(trial.get("terminal_retry_byte_identical") is True,
+                  f"{name}: missing byte-identical terminal retry evidence")
     check(generations[0] < generations[1] == published["generation"],
           f"{label}: inconsistent replacement generations")
 
@@ -217,7 +222,16 @@ def validate_memory_peak(timeline, peak, label, *, required=False):
     check(not required or observed_overlap, f"{label}: missing memory.current overlap sample")
 
 
-def validate_capacity(evidence, *, require_backfill_timelines=False, require_capacity_observations=False):
+def validate_restart_compaction(run, label):
+    published, reopened = run["compaction"], run.get("restart_compaction")
+    check(isinstance(reopened, dict) and reopened.get("state") == "complete" and
+          all(integer(reopened.get(key), published[key], published[key])
+              for key in ("generation", "covered_rows", "committed_rows")),
+          f"{label}: restart did not observe the published generation, cutoff, and committed suffix")
+
+
+def validate_capacity(evidence, *, require_backfill_timelines=False, require_capacity_observations=False,
+                      require_wire_restart=False):
     check(isinstance(evidence, list) and len(evidence) == len(SEED_ROWS),
           "capacity: expected two fixture results")
     seen = set()
@@ -261,6 +275,8 @@ def validate_capacity(evidence, *, require_backfill_timelines=False, require_cap
         check(compaction["state"] == "complete" and integer(compaction.get("generation"), seed // 8192 + 1) and
               integer(compaction.get("covered_rows"), seed + BATCH_ROWS, seed + BATCH_ROWS) and
               integer(compaction.get("committed_rows"), total, total), f"{label}: invalid compaction evidence")
+        if require_wire_restart:
+            validate_restart_compaction(run, label)
         diagnostics = run["diagnostics"]
         current = "cgroup_memory_limit_bytes" in run
         if require_capacity_observations:
@@ -282,7 +298,8 @@ def validate_capacity(evidence, *, require_backfill_timelines=False, require_cap
                                  required=current and require_capacity_observations)
         if require_backfill_timelines or "backfill_timelines" in diagnostics:
             validate_backfill_timelines(diagnostics.get("backfill_timelines"), seed, compaction,
-                                        require_pin_retirement=require_backfill_timelines)
+                                        require_pin_retirement=require_backfill_timelines,
+                                        require_wire_retry=require_wire_restart)
         for phase in ("after_publication_continuation", "fresh_backfill", "restart_walk"):
             query = diagnostics["queries"][phase]
             last = query["last"]
@@ -543,7 +560,8 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
     validate_durability(directory, expected, require_fixture_root_cleanup=require_fixture_root_cleanup)
     validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected),
                       require_backfill_timelines=require_backfill_timelines,
-                      require_capacity_observations=require_capacity_observations)
+                      require_capacity_observations=require_capacity_observations,
+                      require_wire_restart=bool(cutover_arch))
     parity_report = read_report(directory, "supplemental-parity" if cutover_arch else "parity", expected)
     parity = passing_case(parity_report, "parity", "restored_parity")["evidence"]
     validate_parity(parity, require_writable_restore=require_backfill_timelines)
@@ -610,6 +628,7 @@ def main():
     parser.add_argument("--arch", choices=("amd64", "arm64"))
     parser.add_argument("--binary-sha256")
     parser.add_argument("--gate-revision")
+    parser.add_argument("--capacity-validation-revision")
     parser.add_argument("--fixture-parent", type=Path)
     parser.add_argument("--require-fixture-root-cleanup", action="store_true")
     parser.add_argument("--require-fixed-boundaries", action="store_true")
@@ -645,6 +664,8 @@ def main():
                 check(platform.system() == "Linux" and native_arch == args.arch,
                       f"cutover must be validated on native Linux {args.arch}")
                 check(re.fullmatch(r"[0-9a-f]{40}", args.gate_revision or ""), "invalid crash gate checkout revision")
+                check(re.fullmatch(r"[0-9a-f]{40}", args.capacity_validation_revision or ""),
+                      "invalid capacity validation checkout revision")
             validate(directory, expected, require_fixture_root_cleanup=args.require_fixture_root_cleanup,
                      require_fixed_boundaries=args.require_fixed_boundaries,
                      require_backfill_timelines=args.require_backfill_timelines,
@@ -654,6 +675,7 @@ def main():
             if cutover:
                 qualification["current_observations"] = True
                 qualification["crash_gate_revision"] = args.gate_revision
+                qualification["capacity_validation_revision"] = args.capacity_validation_revision
                 qualification[POST_RESTORE_ACK_CRASH] = True
             verdict.write_text(json.dumps(qualification) + "\n")
     except (Rejected, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
