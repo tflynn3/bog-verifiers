@@ -344,6 +344,30 @@ jobs:
             go test -race -count=1 ./verify/release ./verify/query-model
           } 2>&1 | tee "$EVIDENCE/verifier-race.log"
 
+      - name: Check operator command compatibility and restore drill
+        id: operator-command
+        if: always() && steps.build.outcome == 'success'
+        working-directory: candidate
+        timeout-minutes: 4
+        env:
+          CGO_ENABLED: '1'
+        run: |
+          sha256sum --check "$EVIDENCE/binary.sha256"
+          unset BOG_RESTORE_DRILL_BINARY
+          help=$("$BINARY" -help 2>&1)
+          if grep -Eq '^[[:space:]]*-retained-tail-max-bytes([[:space:]=]|$)' <<< "$help"; then
+            export BOG_RESTORE_DRILL_BINARY="$BINARY"
+          fi
+          events="$EVIDENCE/operator-command-events.jsonl"
+          go test -json -race -count=1 ./cmd/bog-verify | tee "$events"
+          jq -es '
+            [.[] | select(.Action == "pass" and .Package == "bog/cmd/bog-verify") | .Test] as $passed |
+            ("TestDrillCLIWaitsForOperatorSignal" | IN($passed[])) and
+            ("TestRestoreDrillPhases" | IN($passed[])) and
+            (env.BOG_RESTORE_DRILL_BINARY == null or ("TestRestoreDrillShippedServer" | IN($passed[])))
+          ' "$events" >/dev/null
+          sha256sum --check "$EVIDENCE/binary.sha256"
+
       - name: Qualify TCP query delivery and pinned fitting pages
         id: query-qualification
         if: always() && steps.build.outcome == 'success'
@@ -377,7 +401,8 @@ jobs:
       - name: Validate reports and candidate identity
         if: >-
           always() && steps.build.outcome == 'success' && steps.capacity-fixtures.outcome == 'success' &&
-          steps.architecture-and-lifecycle.outcome == 'success' && steps.query-qualification.outcome == 'success'
+          steps.architecture-and-lifecycle.outcome == 'success' && steps.operator-command.outcome == 'success' &&
+          steps.query-qualification.outcome == 'success'
         working-directory: capacity-validation
         env:
           PINNED_BINARY_SHA256: ${{ steps.build.outputs.binary_sha256 }}

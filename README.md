@@ -374,6 +374,20 @@ verifier requests SIGKILL of that live process before reading or closing the
 response body and checks its reaped exit signal before restarting.
 Cutover qualification requires both observations
 and exact ordered replay of all eight rows. Restored launches use the shipped control defaults.
+The two-cycle tail-only fixture also kills each live replacement after
+the held walk, pin retirement, and fresh walk. After exporting the exact
+selected suffix it reopens the same directory, appends a probe row, and
+kills the process directly on HTTP 204. A second reopen must replay that
+row and the complete ordered history. When status advertises
+generation-correlated predecessor pins, each cycle requires the matching
+reclamation observation after the final pin drains.
+
+Both native runners run the command-owned `cmd/bog-verify` race tests.
+They require the default drill phase and operator-signal tests to pass.
+For candidates advertising `-retained-tail-max-bytes`, they also require the
+shipped-server drill against the runner's pinned binary. The same package
+run includes #117's opt-in schema tests when such tests land.
+
 The parity report counts six HTTP 404 responses across status, start, and
 retirement probes on restored startup and restart. When the operator CLI is available, a separate restored copy
 serves the default backup comparison. If `compare -help` advertises `-max-pages`,

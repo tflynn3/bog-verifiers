@@ -67,13 +67,35 @@ def compaction_status(bog, method, action, cutoff):
     return json.loads(raw, object_pairs_hook=unique_fields)
 
 
-def predecessor_pins(bog, publication):
+def predecessor_observation(bog, publication):
     state = compaction_status(bog, "GET", "status", publication["covered_rows"])
     check(all(state.get(key) == publication[key] for key in ("state", "generation", "covered_rows", "committed_rows")),
           f"pin observation changed compaction publication: {state!r}")
-    pins = (state.get("metrics") or {}).get("retired_generation_pins")
+    metrics = state.get("metrics") or {}
+    pins = metrics.get("retired_generation_pins")
     check(type(pins) is int and pins >= 0, f"missing predecessor pin observation: {pins!r}")
-    return pins
+    return pins, metrics
+
+
+def reclaim_bytes(metrics, predecessor, successor):
+    fields = ("reclaimed_predecessor_generation", "reclaimed_replacement_generation", "reclaimed_bytes")
+    values = tuple(metrics.get(key) for key in fields)
+    if all(value is None for value in values):
+        return None
+    check(all(type(value) is int and value >= 0 for value in values),
+          f"invalid reclamation observation: {values!r}")
+    return values[2] if values[:2] == (predecessor, successor) else None
+
+
+def append_and_kill(bog, rows):
+    payload = encode_rows(rows)
+    with bog.open_ingest(len(payload)) as connection:
+        connection.send(payload)
+        with connection.getresponse() as response:
+            check(response.status == 204, f"post-restore ingest returned HTTP {response.status}")
+            # Kill before reading or closing the acknowledgement body.
+            bog.kill()
+    return -bog.process.returncode
 
 
 def bundle_point(bundle, version, covered, next_ordinal, committed, suffix, predecessor=None):
@@ -145,23 +167,43 @@ def restore_cycles(binary, directory, helper):
         with run_bog(binary, launch, capacity=True, flags=flags) as bog:
             if number == 1:
                 readiness = ready_after_retarget(bog, launch)
+            predecessor = compaction_status(bog, "GET", "status", point["next_ordinal"])["generation"]
             cursor = expect_page(bog, args, held, 0, 1, None, "initial retained page", exact_framing=True)
             bog.ingest(extra)
             publication = compaction(bog, len(rows), len(augmented))
-            pins_while_held = predecessor_pins(bog, publication)
-            check(pins_while_held > 0, "held cursor did not pin the predecessor")
             expect_walk(bog, args, held, (2, 1), "held retained walk after advance", position=1,
                         cursor=cursor, exact_framing=True)
+            pins_while_held, metrics = predecessor_observation(bog, publication)
+            check(pins_while_held > 0, "held cursor did not pin the predecessor")
+            successor = publication["generation"]
+            check(type(predecessor) is int and type(successor) is int and 0 <= predecessor < successor,
+                  f"compaction did not replace the predecessor: {predecessor!r} -> {successor!r}")
+            check(reclaim_bytes(metrics, predecessor, successor) is None,
+                  "replacement was reclaimed before final predecessor pin release")
+            observes_reclaim = "predecessor_pin_generation" in metrics
+            if observes_reclaim:
+                check(type(metrics["predecessor_pin_generation"]) is int and
+                      metrics["predecessor_pin_generation"] == predecessor,
+                      "held pin observation did not identify the predecessor")
             retire = urlencode({"action": "retire", "cursor": cursor})
             status, body = bog.request("POST", f"{CAPACITY_PATH}?{retire}")
             check(status == 204 and not body, f"predecessor capture retirement returned HTTP {status}: {body!r}")
             expect_query_error(bog, {**args, "cursor": cursor}, 410, "retired predecessor cursor")
             deadline = time.monotonic() + 5
-            while (pins_after_release := predecessor_pins(bog, publication)) != 0:
-                check(time.monotonic() < deadline, f"predecessor pins did not drain: {pins_after_release}")
+            while True:
+                pins_after_release, metrics = predecessor_observation(bog, publication)
+                reclaimed = reclaim_bytes(metrics, predecessor, successor)
+                check(pins_after_release == 0 or reclaimed is None,
+                      "replacement was reclaimed while predecessor pins remained")
+                if pins_after_release == 0 and (not observes_reclaim or reclaimed is not None):
+                    break
+                check(time.monotonic() < deadline,
+                      f"predecessor pin drain or reclamation did not finish: "
+                      f"remaining pins={pins_after_release}, reclaimed bytes={reclaimed}")
                 time.sleep(0.02)
             fresh = walk(bog, augmented, "fresh retained walk after advance")
-            bog.stop()
+            bog.kill()
+            replacement_signal = -bog.process.returncode
 
         manifests = []
         for path in active.glob("bog-checkpoint-*"):
@@ -183,24 +225,30 @@ def restore_cycles(binary, directory, helper):
         fixture_tool(helper, "restore", bundle, restored)
         parked = bundle.with_suffix(".parked")
         bundle.rename(parked)
+        restart_append = [Row(1, f"cycle {number} append after replacement restart")]
         with run_bog(binary, active, flags=flags) as bog:
             hidden, _ = bog.request("GET", f"{CAPACITY_PATH}?action=status")
             check(hidden == 404, f"default compaction status returned HTTP {hidden}")
             restarted = walk(bog, augmented, "same-directory restart after advance")
+            restart_append_signal = append_and_kill(bog, restart_append)
+        with run_bog(binary, active, flags=flags) as bog:
+            restart_append_rows = walk(bog, augmented + restart_append, "replay after replacement restart append")
             bog.stop()
         with run_bog(binary, restored, flags=flags) as bog:
             restored_rows = walk(bog, augmented, "independent writable restore")
             if number == 2:
                 last = [Row(1, "tie appended after second restore")]
-                bog.ingest(last)
-                bog.kill()
-                bog_exit = bog.process.returncode
+                bog_exit_signal = append_and_kill(bog, last)
             else:
                 bog.stop()
         check(exported == bundle_point(parked, 2, point["committed_end"], len(rows), len(augmented),
                                        next_suffix, point), f"cycle {number}: source backup changed")
         cycles.append(dict(input=point, exported=exported, append_status=204, held_rows=len(held),
                            fresh_rows=fresh, restart_rows=restarted, restored_rows=restored_rows,
+                           replacement_exit_signal=replacement_signal,
+                           restart_append_exit_signal=restart_append_signal,
+                           restart_append_replay_rows=restart_append_rows,
+                           reclaimed_bytes=reclaimed,
                            default_control_status=hidden, pins_while_held=pins_while_held,
                            pins_after_release=pins_after_release))
         active, point, rows = restored, exported, augmented
@@ -209,4 +257,4 @@ def restore_cycles(binary, directory, helper):
         final_rows = walk(bog, rows + last, "restart after acknowledged second-restore append")
         bog.stop()
     return dict(initial=initial, cycles=cycles, descriptor_ready_status=readiness,
-                final_append_status=204, final_exit_signal=-bog_exit, final_restart_rows=final_rows)
+                final_append_status=204, final_exit_signal=bog_exit_signal, final_restart_rows=final_rows)
