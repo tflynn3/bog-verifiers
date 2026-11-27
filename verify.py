@@ -44,6 +44,7 @@ CYCLE7_BASELINE_SHA = "be7f937a1025a57166d15888727012ed4989a6b4"
 NEXT_CURSOR = "Bog-Next-Cursor"
 QUERY_ADMISSION_FLAGS = {"query-limits": ("-query-work-budget", 32), "query-admission": ("-query-concurrency", 1)}
 QUERY_REJECTION_PROBES = ("ordinary", "first_page", "continuation")
+CAPACITY_ENV = "BOG_CAPACITY_CONTROL"
 CAPACITY_FLAG = "-enable-capacity-control"
 RETAINED_TAIL_FLAG = "-retained-tail-max-bytes"
 CAPACITY_PATH = "/_capacity/compaction"
@@ -152,7 +153,7 @@ def decode_rows(body):
 class Bog:
     """Public CLI and HTTP binding used by every workload."""
 
-    def __init__(self, binary, directory, log_path, *, flags=(), host="127.0.0.1"):
+    def __init__(self, binary, directory, log_path, *, flags=(), host="127.0.0.1", capacity=None):
         directory.mkdir(exist_ok=True)
         self.directory_name = directory.name
         with socket.socket() as probe:
@@ -160,11 +161,15 @@ class Bog:
             self.port = probe.getsockname()[1]
         self.log_path = log_path
         self.started = time.monotonic()
+        env = os.environ.copy()
+        env.pop(CAPACITY_ENV, None)
+        if capacity:
+            env[CAPACITY_ENV] = "1"
         with log_path.open("wb") as log:
             try:
                 self.process = subprocess.Popen(
                     [str(binary), "-addr", f"{host}:{self.port}", "-data-dir", str(directory), *flags],
-                    cwd=directory, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                    cwd=directory, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
                 )
             except (FileNotFoundError, PermissionError) as exc:
                 raise Rejected(f"unable to launch Bog: {exc}") from exc
@@ -317,9 +322,13 @@ class Bog:
         body, cursor = self.query_ndjson(args)
         return decode_rows(body), cursor
 
-    def query_ndjson(self, args):
+    def query_ndjson(self, args, *, exact_framing=False):
         status, body, headers = self.checked_exchange("GET", query_target(args))
         check(status == 200, f"query returned {status}: {body[:200]!r}")
+        if exact_framing:
+            check(headers.get_all("Content-Length") == [str(len(body))] and
+                  headers.get("Transfer-Encoding") is None and headers.get("Trailer") is None and
+                  body.endswith(b"\n"), "expected an exactly framed, newline-terminated query page")
         cursors = headers.get_all(NEXT_CURSOR)
         if cursors is not None:
             check(len(cursors) == 1 and bool(cursors[0].strip()),
@@ -341,14 +350,14 @@ def query_target(args):
 
 
 @contextlib.contextmanager
-def run_bog(binary, directory, *, ready=True, flags=(), host="127.0.0.1"):
+def run_bog(binary, directory, *, ready=True, flags=(), host="127.0.0.1", capacity=None):
     log_dir, cases = PROCESS_LOGS.get()
     path = log_dir / f"bog-{len(cases):02d}.log"
     case = {"store": directory.name, "log": str(path.relative_to(log_dir.parent)),
             "expected_ready": ready}
     cases.append(case)
     try:
-        bog = Bog(binary, directory, path, flags=flags, host=host)
+        bog = Bog(binary, directory, path, flags=flags, host=host, capacity=capacity)
         try:
             bog.startup_seconds = bog.wait_startup(ready)
             case["ready_ms"] = milliseconds(bog.startup_seconds) if ready else None
@@ -794,8 +803,7 @@ def advertised_flags(binary, directory):
 
 
 def capacity_control_suite(binary, directory):
-    if CAPACITY_FLAG not in advertised_flags(binary, directory):
-        return SuiteSkipped(f"Bog -help does not list {CAPACITY_FLAG}")
+    flags = (CAPACITY_FLAG,) if CAPACITY_FLAG in advertised_flags(binary, directory) else ()
     directory.mkdir()
     store = directory / "store"
     rows = [Row(2, "later"), Row(1, "duplicate"), Row(1, "duplicate")]
@@ -805,16 +813,22 @@ def capacity_control_suite(binary, directory):
     status_path = f"{CAPACITY_PATH}?action=status&cutoff={cutoff}"
     start_path = f"{CAPACITY_PATH}?action=start&cutoff={cutoff}"
     hidden_checks = 0
+    release_hidden_checks = 0
 
     def hidden(bog):
-        nonlocal hidden_checks
+        nonlocal hidden_checks, release_hidden_checks
         for method, path in (("GET", status_path), ("POST", start_path)):
             status, _ = bog.request(method, path)
             check(status == 404, f"capacity control with opt-in off: {method} returned HTTP {status}")
             hidden_checks += 1
+        status, _ = bog.request("POST", f"{CAPACITY_PATH}?action=release&cutoff={cutoff}")
+        check(status == 404, f"capacity release with opt-in off returned HTTP {status}")
+        release_hidden_checks += 1
 
-    def state(bog, method, path):
+    def state(bog, method, path, *, probe=False):
         status, body, _ = bog.checked_exchange(method, path)
+        if probe and status == 404:
+            return None
         check(200 <= status < 300, f"{method} {path} returned HTTP {status}: {body[:200]!r}")
         try:
             value = json.loads(body, object_pairs_hook=unique_fields)
@@ -826,43 +840,100 @@ def capacity_control_suite(binary, directory):
               f"invalid compaction state: {value!r}")
         return value
 
+    def compact(bog, count, previous, committed):
+        target = f"&cutoff={count}"
+        published = state(bog, "POST", f"{CAPACITY_PATH}?action=start{target}")
+        deadline = time.monotonic() + HTTP_TIMEOUT
+        while published["state"] == "running":
+            check(published["generation"] == previous["generation"] and
+                  published["covered_rows"] == previous["covered_rows"] and
+                  published["committed_rows"] == committed,
+                  f"running compaction changed published state: {published!r}")
+            check(time.monotonic() < deadline, f"compaction did not finish: {published!r}")
+            time.sleep(0.02)
+            published = state(bog, "GET", f"{CAPACITY_PATH}?action=status{target}")
+        check(published["generation"] == previous["generation"] + 1 and
+              published["covered_rows"] == count and published["committed_rows"] == committed,
+              f"capacity control did not publish the requested cutoff: {published!r}")
+        return published
+
     with run_bog(binary, store, host="0.0.0.0") as bog:
         hidden(bog)
-    with run_bog(binary, store, host="0.0.0.0", ready=False, flags=(CAPACITY_FLAG,)) as bog:
-        wildcard_exit = bog.process.returncode
-        check(wildcard_exit == 1, f"capacity opt-in on wildcard exited with status {wildcard_exit}")
+        bog.stop()
+
     args = query_args(0, SECOND)
     expected = oracle(rows, 0, SECOND)
     augmented = [*rows, backfill, tail]
     fresh = oracle(augmented, 0, SECOND)
-    with run_bog(binary, store, flags=(CAPACITY_FLAG,)) as bog:
-        initial = state(bog, "GET", f"{CAPACITY_PATH}?action=status&cutoff=0")
+    retirement = {"status": "skip", "detail": "status omits retired_generation_pins"}
+    with run_bog(binary, store, flags=flags, capacity=True) as bog:
+        empty = state(bog, "GET", f"{CAPACITY_PATH}?action=status&cutoff=0", probe=not flags)
+        if empty is None:
+            bog.stop()
+            return SuiteSkipped(f"candidate has no loopback compaction with {CAPACITY_ENV}=1")
         bog.ingest(rows)
+        initial = compact(bog, len(rows), empty, len(rows))
         cursor = expect_page(bog, args, expected, 0, 1, None, "first page before compaction")
         bog.ingest([backfill])
         bog.ingest([tail])
-        published = state(bog, "POST", start_path)
-        deadline = time.monotonic() + HTTP_TIMEOUT
-        while published["state"] == "running" and time.monotonic() < deadline:
-            time.sleep(0.02)
-            published = state(bog, "GET", status_path)
-        check(published["state"] == "complete" and published["generation"] == initial["generation"] + 1 and
-              published["covered_rows"] == cutoff and published["committed_rows"] == len(augmented),
-              f"capacity control did not publish the requested cutoff: {published!r}")
-        expect_walk(bog, args, expected, (1,), "held cursor after compaction", position=1, cursor=cursor)
+        published = compact(bog, cutoff, initial, len(augmented))
+        held = state(bog, "GET", status_path)
+        metrics = held.get("metrics", {})
+        check(isinstance(metrics, dict), f"invalid compaction metrics: {metrics!r}")
+        pins = metrics.get("retired_generation_pins")
+        check(all(held[key] == published[key] for key in ("state", "generation", "covered_rows", "committed_rows")),
+              f"status did not retain the published cutoff: {held!r}")
+
+        continuation = {**args, "cursor": cursor, "limit": 1}
+        body, next_cursor = bog.query_ndjson(continuation, exact_framing=True)
+        repeated, replay_cursor = bog.query_ndjson(continuation, exact_framing=True)
+        expect_rows(decode_rows(body), expected[1:2], "first held continuation")
+        expect_rows(decode_rows(repeated), expected[1:2], "replayed held continuation")
+        check(next_cursor and replay_cursor, "held continuation lost its next page on replay")
+        expect_walk(bog, args, expected, (1,), "held cursor after compaction", position=2, cursor=next_cursor)
+
+        if "retired_generation_pins" in metrics:
+            check(type(pins) is int and pins > 0, f"held cursor did not pin its predecessor: {pins!r}")
+            release_status, _ = bog.request("POST", f"{CAPACITY_PATH}?action=release&cutoff={cutoff}")
+            if release_status in (404, 405, 501):
+                retirement = {"status": "skip", "detail": f"release action returned HTTP {release_status}"}
+            else:
+                check(200 <= release_status < 300, f"release action returned HTTP {release_status}")
+                deadline = time.monotonic() + HTTP_TIMEOUT
+                while True:
+                    drained = state(bog, "GET", status_path)
+                    check(all(drained[key] == published[key] for key in
+                              ("state", "generation", "covered_rows", "committed_rows")),
+                          f"release changed the published cutoff: {drained!r}")
+                    remaining = (drained.get("metrics") or {}).get("retired_generation_pins")
+                    if type(remaining) is int and remaining == 0:
+                        break
+                    check(time.monotonic() < deadline, f"predecessor pins did not drain: {remaining!r}")
+                    time.sleep(0.02)
+                retirement = {"status": "pass", "release_http_status": release_status,
+                              "pins_while_held": pins, "pins_after_release": remaining}
+
         expect_query(bog, augmented, 0, SECOND, label="ordinary query after compaction")
         expect_walk(bog, args, fresh, (1, 2), "fresh paged query after compaction")
         stale_cursor = expect_page(bog, args, fresh, 0, 1, None, "first page before restart")
         bog.kill()
+
+    with run_bog(binary, directory / "wildcard", host="0.0.0.0", ready=False,
+                 flags=flags, capacity=True) as bog:
+        wildcard_exit = bog.process.returncode
+        check(wildcard_exit == 1, f"capacity opt-in on wildcard exited with status {wildcard_exit}")
     with run_bog(binary, store) as bog:
         hidden(bog)
         expect_bad_query(bog, {**args, "cursor": stale_cursor}, "prior-process cursor after restart")
         expect_query(bog, augmented, 0, SECOND, label="ordinary query after compacted restart")
         expect_walk(bog, args, fresh, (1, 2), "paged query after compacted restart")
+        bog.stop()
     return {"default_http_status": 404, "wildcard_opt_in_exit": wildcard_exit,
             "default_control_404_checks": hidden_checks,
             "snapshot_rows": len(expected), "stale_cursor_rejected": True,
             "initial_generation": initial["generation"], "published": published,
+            "continuation_replayed": True, "retirement": retirement,
+            "release_hidden_checks": release_hidden_checks,
             "fresh_rows": len(fresh), "restart_rows": len(fresh)}
 
 

@@ -1,6 +1,8 @@
 """Produce the small capacity control report and validate Linux release evidence."""
 import argparse
 import json
+import platform
+import signal
 from pathlib import Path
 import re
 import tempfile
@@ -29,6 +31,8 @@ def read_report(directory, producer, expected):
     with (directory / f"{producer}.json").open() as stream:
         report = json.load(stream, object_pairs_hook=unique_fields)
     for key, value in expected.items():
+        if key == "arch" and producer != "control" and key not in report:
+            continue  # The digest binds schema-v1 reports to the verified ELF.
         check(type(report.get(key)) is type(value) and report[key] == value,
               f"{producer}: mismatched {key}")
     if producer == "capacity":
@@ -381,8 +385,38 @@ def record_fixture_root_cleanup(directory, expected, parent):
     passing_case(report, "durability", FIXTURE_ROOT_CLEANUP)
 
 
+def validate_cutover_parity(evidence):
+    check(evidence.get("fixture_removed") is True, "parity: fixture cleanup did not complete")
+    check(integer(evidence.get("corrupt_restore_exit"), 1, 1) and
+          evidence.get("restore_metadata_preserved") is True,
+          "parity: missing fail-closed startup or immutable v1 backup metadata evidence")
+    check(integer(evidence.get("held_restore_rows"), 6, 6) and evidence.get("replayed_restore_page") is True,
+          "parity: missing framed restored continuation replay across append")
+
+
+def validate_cutover_control(case):
+    control = case["evidence"]
+    retirement = control.get("retirement") or {}
+    check(retirement.get("status") == "pass" and
+          integer(retirement.get("release_http_status"), 200, 299) and
+          integer(retirement.get("pins_while_held"), 1) and
+          integer(retirement.get("pins_after_release"), 0, 0),
+          "control: missing successful release and positive-to-zero predecessor pin evidence")
+    check(control.get("continuation_replayed") is True and control.get("fixture_removed") is True and
+          integer(control.get("release_hidden_checks"), 2, 2),
+          "control: missing continuation replay, disabled release, or fixture cleanup evidence")
+    launches = ((True, 0), (True, -signal.SIGKILL), (False, 1), (True, 0))
+    processes = case.get("processes")
+    check(isinstance(processes, list) and len(processes) == len(launches) and
+          all(proc.get("expected_ready") is ready and integer(proc.get("exit_code"), code, code)
+              for proc, (ready, code) in zip(processes, launches)),
+          "control: missing process teardown or unexpected candidate exit")
+
+
 def validate(directory, expected, *, require_fixture_root_cleanup=False, require_fixed_boundaries=False,
-             require_backfill_timelines=False, require_capacity_observations=False):
+             require_backfill_timelines=False, require_capacity_observations=False, cutover_arch=None):
+    if cutover_arch:
+        expected = {**expected, "arch": cutover_arch}
     statuses = (directory / "producers.txt").read_text().splitlines()
     check(len(statuses) == len(PRODUCERS) and
           set(statuses) == {f"{name} revision={expected['revision']} exit=0" for name in PRODUCERS},
@@ -393,9 +427,14 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
     validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected),
                       require_backfill_timelines=require_backfill_timelines,
                       require_capacity_observations=require_capacity_observations)
-    validate_parity(case_evidence(directory, "parity", "restored_parity", expected),
-                    require_writable_restore=require_backfill_timelines)
-    control = case_evidence(directory, "control", "capacity_control", expected)
+    parity = case_evidence(directory, "parity", "restored_parity", expected)
+    validate_parity(parity, require_writable_restore=require_backfill_timelines)
+    control_report = read_report(directory, "control", expected)
+    control_case = passing_case(control_report, "control", "capacity_control")
+    control = control_case["evidence"]
+    if cutover_arch:
+        validate_cutover_parity(parity)
+        validate_cutover_control(control_case)
     published = control["published"]
     expanded = "fresh_rows" in control
     covered, committed = (4, 5) if expanded else (3, 3)
@@ -425,6 +464,8 @@ def produce_control(binary, directory, expected):
         if isinstance(metrics, SuiteSkipped):
             case.update(status="skip", detail=metrics.reason)
         else:
+            metrics["fixture_removed"] = not Path(workspace).exists()
+            check(metrics["fixture_removed"], "control: fixture cleanup did not complete")
             case.update(status="pass", evidence=metrics)
     except Exception as exc:
         case["detail"] = str(exc)
@@ -453,12 +494,15 @@ def main():
         directory = args.directory.resolve()
         binary = args.binary.resolve()
         expected = identity(binary, args.revision, args.fixture)
+        native_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
         if args.action == "control":
-            produce_control(binary, directory, expected)
+            produce_control(binary, directory, {**expected, "arch": native_arch})
         elif args.action == "record-cleanup":
             check(args.fixture_parent is not None, "durability fixture parent is required")
             record_fixture_root_cleanup(directory, expected, args.fixture_parent)
         else:
+            verdict = directory / "qualified.json"
+            verdict.unlink(missing_ok=True)
             check(args.arch is not None, "native architecture is required")
             # Check the ELF machine independently of the runner label and reports.
             with binary.open("rb") as stream:
@@ -466,15 +510,20 @@ def main():
             machine = {"amd64": 62, "arm64": 183}[args.arch]
             check(header[:6] == b"\x7fELF\x02\x01" and int.from_bytes(header[18:20], "little") == machine,
                   f"candidate binary is not Linux {args.arch}")
+            cutover = all((args.require_fixture_root_cleanup, args.require_fixed_boundaries,
+                           args.require_backfill_timelines, args.require_capacity_observations))
+            if cutover:
+                check(platform.system() == "Linux" and native_arch == args.arch,
+                      f"cutover must be validated on native Linux {args.arch}")
             validate(directory, expected, require_fixture_root_cleanup=args.require_fixture_root_cleanup,
                      require_fixed_boundaries=args.require_fixed_boundaries,
                      require_backfill_timelines=args.require_backfill_timelines,
-                     require_capacity_observations=args.require_capacity_observations)
+                     require_capacity_observations=args.require_capacity_observations,
+                     cutover_arch=args.arch if cutover else None)
             qualification = {**expected, "arch": args.arch}
-            if all((args.require_fixture_root_cleanup, args.require_fixed_boundaries,
-                    args.require_backfill_timelines, args.require_capacity_observations)):
+            if cutover:
                 qualification["current_observations"] = True
-            (directory / "qualified.json").write_text(json.dumps(qualification) + "\n")
+            verdict.write_text(json.dumps(qualification) + "\n")
     except (Rejected, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         parser.exit(1, f"release evidence: {exc}\n")
 

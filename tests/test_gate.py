@@ -13,7 +13,8 @@ sys.path.insert(0, str(ROOT))
 import verify
 from release_gate import (CAPACITY_WORK_BUDGET, FIXTURE_ROOT_CLEANUP, MEMORY_LIMIT, record_fixture_root_cleanup,
                           validate_backfill_timelines, validate_budget, validate_budget_trials,
-                          validate_capacity_observations, validate_durability)
+                          validate_capacity_observations, validate_cutover_control,
+                          validate_cutover_parity, validate_durability)
 
 README_ONLY = "7655ed627bccad30700b8de4b6f47c8d7d5d8579"
 
@@ -44,6 +45,31 @@ def buildable_candidate(root):
 
 
 class GateTest(unittest.TestCase):
+    def test_cutover_requires_retirement_exit_and_cleanup_evidence(self):
+        retirement = dict(status="pass", release_http_status=204, pins_while_held=1, pins_after_release=0)
+        evidence = dict(retirement=retirement, continuation_replayed=True, fixture_removed=True,
+                        release_hidden_checks=2)
+        processes = [dict(expected_ready=ready, exit_code=code)
+                     for ready, code in ((True, 0), (True, -9), (False, 1), (True, 0))]
+        case = dict(evidence=evidence, processes=processes)
+        validate_cutover_control(case)
+        for item, changes, reason in (
+            (retirement, {"status": "skip"}, "successful release"),
+            (retirement, {"pins_after_release": None}, "positive-to-zero"),
+            (processes[1], {"exit_code": 0}, "unexpected candidate exit"),
+            (evidence, {"fixture_removed": False}, "fixture cleanup"),
+        ):
+            with self.subTest(changes=changes), patch.dict(item, changes):
+                with self.assertRaisesRegex(verify.Rejected, reason):
+                    validate_cutover_control(case)
+
+        parity = dict(fixture_removed=True, corrupt_restore_exit=1, restore_metadata_preserved=True,
+                      held_restore_rows=6, replayed_restore_page=True)
+        validate_cutover_parity(parity)
+        del parity["replayed_restore_page"]
+        with self.assertRaisesRegex(verify.Rejected, "continuation replay"):
+            validate_cutover_parity(parity)
+
     def test_capacity_observations_require_distinct_groups_and_attributed_teardown(self):
         seed = 196_608
         candidate = dict(lifetime="startup", reaped=True, exited_before_cleanup=False, exit_code=0)

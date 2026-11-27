@@ -322,3 +322,17 @@ available, it checks the disabled default, wildcard bind rejection, the
 exact cutoff with an uncovered tail, held and fresh HTTP ordering, and
 restart parity. The manually dispatched release gate requires the
 composed revision and passing evidence on both native architectures.
+
+Current cutover qualification also requires the corrupt v1 suffix to exit
+with status 1, unchanged backup metadata after writable restart, and exact
+replay of a byte-framed continuation across an acknowledged append. The
+short loopback fixture seeds a predecessor checkpoint before holding its
+cursor. It then checks exact continuation replay after replacement, the
+disabled release action, and positive predecessor pins followed by an
+observed zero after exhaustion and release. Missing retirement capability
+can skip that subprobe in Slipway. Cutover qualification requires it to
+pass and checks the small fixture's process exits and removal.
+
+The release gate checks the binary's ELF machine against the native runner
+and binds each mandatory report to that runner's binary digest, revision,
+and fixture ID. The control report carries the architecture explicitly.
