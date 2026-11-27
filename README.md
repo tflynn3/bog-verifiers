@@ -330,6 +330,16 @@ fixture cleanup. Each native qualification records the crash gate checkout,
 candidate revision, fixture and candidate binary digest. The final job
 checks both crash verdicts and prints the checkout and both digests.
 Standard schema-v1 validation still accepts historical parity reports.
+Strict native qualification also requires `writable_restore_cycles` in the
+combined parity report. The probe begins with a verified v1 checkpoint and
+suffix, advances the live candidate at two exact cutoffs, and exports and
+verifies a v2 image of each stopped generation through the backup fixture
+helper. It takes the source paths out of reach before writable startup,
+checks held and fresh framed walks and same-directory restart, and verifies
+an acknowledged append after the second independent restore through SIGKILL
+and replay. The first restore checks that `/ready` remains healthy after the
+configured directory symlink is retargeted to procfs. Candidates whose help
+omits `-retained-tail-max-bytes` record a skip for this case.
 The shared proof and both strict consumers accept an acknowledgment at
 the fresh-visibility sample and reject one after that sample, even if it
 precedes the end of the full walk. Their fixtures cover the passing report

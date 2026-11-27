@@ -22,6 +22,7 @@ BATCH_ROWS = 64
 PRODUCERS = {"admission", "durability", "capacity", "parity"}
 FIXTURE_ROOT_CLEANUP = "fixture_root_cleanup"
 POST_RESTORE_ACK_CRASH = "post_restore_ack_crash"
+WRITABLE_RESTORE_CYCLES = "writable_restore_cycles"
 REPLACEMENT_RESTART = "replacement_restart"
 FIXED_BUDGET_REPLAY = "fixed_budget_replay"
 CONTROL_SCOPE = "control_scope"
@@ -478,7 +479,7 @@ def record_fixture_root_cleanup(directory, expected, parent):
     passing_case(report, "durability", FIXTURE_ROOT_CLEANUP)
 
 
-def validate_combined_parity(directory, expected):
+def validate_combined_parity(directory, expected, *, require_restore_cycles=False):
     report = read_report(directory, "parity", expected)
     restored = passing_case(report, "parity", "restored_parity")["evidence"]
     check(all(integer(restored.get(key), count, count) for key, count in
@@ -498,6 +499,80 @@ def validate_combined_parity(directory, expected):
           f"{label}: expected exact replay of eight rows")
     check(all(crash.get(key) is True for key in ("crash_candidate_reaped", "restart_candidate_reaped", "fixture_removed")),
           f"{label}: expected both candidate processes reaped and fixture removed")
+
+    if require_restore_cycles:
+        validate_restore_cycles(report)
+
+
+def validate_restore_cycles(report):
+    label = f"parity: {WRITABLE_RESTORE_CYCLES}"
+    evidence = passing_case(report, "parity", WRITABLE_RESTORE_CYCLES).get("evidence")
+    check(isinstance(evidence, dict), f"{label}: missing evidence object")
+    cycles = evidence.get("cycles")
+    check(isinstance(cycles, list) and len(cycles) == 2, f"{label}: expected exactly two cycles")
+
+    def point(value, version, next_ordinal, committed_ordinal):
+        check(isinstance(value, dict), f"{label}: missing recovery point")
+        covered, end = value.get("covered_offset"), value.get("committed_end")
+        check(integer(value.get("version"), version, version) and
+              integer(covered, 9, (1 << 63) - 1) and integer(end, covered + 1, (1 << 63) - 1) and
+              integer(value.get("next_ordinal"), next_ordinal, next_ordinal) and
+              integer(value.get("committed_ordinal"), committed_ordinal, committed_ordinal) and
+              integer(value.get("suffix_bytes"), end - covered, end - covered) and
+              all(isinstance(value.get(key), str) and re.fullmatch(r"[0-9a-f]{64}", value[key]) and
+                  value[key] != "0" * 64 for key in ("generation", "suffix_sha256")),
+              f"{label}: invalid version, recovery bounds or digest")
+        return value
+
+    previous = point(evidence.get("initial"), 1, 3, 6)
+    generations = {previous["generation"]}
+    for number, cycle in enumerate(cycles, 1):
+        held = 3 + 3 * number
+        check(isinstance(cycle, dict), f"{label}: missing cycle {number} evidence")
+        source = point(cycle.get("input"), number, held - 3, held)
+        exported = point(cycle.get("exported"), 2, held, held + 3)
+        check(source == previous and exported["covered_offset"] == source["committed_end"] and
+              exported["generation"] not in generations and exported["suffix_sha256"] != source["suffix_sha256"],
+              f"{label}: cycle {number} does not advance the preceding restore")
+        check(all(integer(cycle.get(key), value, value) for key, value in dict(
+            append_status=204, held_rows=held, fresh_rows=held + 3, restart_rows=held + 3,
+            restored_rows=held + 3, default_control_status=404).items()),
+            f"{label}: incomplete cycle {number} append, paging, restart or restore evidence")
+        generations.add(exported["generation"])
+        previous = exported
+    check(evidence.get("fixture_removed") is True and
+          all(integer(evidence.get(key), value, value) for key, value in dict(
+              descriptor_ready_status=200, final_append_status=204, final_exit_signal=int(signal.SIGKILL),
+              final_restart_rows=13).items()), f"{label}: missing readiness, final restart or cleanup evidence")
+
+
+def record_restore_cycles(binary, directory, expected, helper):
+    from release_restore import restore_cycles
+
+    report = read_report(directory, "parity", expected)
+    case = report["cases"][WRITABLE_RESTORE_CYCLES] = {"status": "fail"}
+    logs = directory / "restore-cycles-processes"
+    logs.mkdir(exist_ok=True)
+    processes = []
+    token = PROCESS_LOGS.set((logs, processes))
+    try:
+        with tempfile.TemporaryDirectory(prefix="bog-release-restore-") as workspace:
+            evidence = restore_cycles(binary, Path(workspace) / "cycles", helper)
+        if isinstance(evidence, SuiteSkipped):
+            case.update(status="skip", detail=evidence.reason)
+        else:
+            evidence["fixture_removed"] = not Path(workspace).exists()
+            case.update(status="pass", evidence=evidence)
+            validate_restore_cycles(report)
+    except Exception as exc:
+        case.update(status="fail", detail=str(exc))
+        raise
+    finally:
+        PROCESS_LOGS.reset(token)
+        case["processes"] = processes
+        temporary = directory / "parity.tmp"
+        temporary.write_text(json.dumps(report, indent=2) + "\n")
+        temporary.replace(directory / "parity.json")
 
 
 def validate_cutover_parity(report, evidence):
@@ -647,7 +722,7 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
     control_case = passing_case(control_report, "control", "capacity_control")
     control = control_case["evidence"]
     if cutover_arch:
-        validate_combined_parity(directory, expected)
+        validate_combined_parity(directory, expected, require_restore_cycles=True)
         validate_cutover_parity(parity_report, parity)
         check(parity.get("corrupt_restore_preserved") is True,
               "parity: missing corrupt restore file preservation evidence")
@@ -714,7 +789,7 @@ def produce_control(binary, directory, expected, *, require_replacement_restart=
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("control", "record-cleanup", "validate"))
+    parser.add_argument("action", choices=("control", "record-cleanup", "record-restore-cycles", "validate"))
     parser.add_argument("binary", type=Path)
     parser.add_argument("revision")
     parser.add_argument("fixture")
@@ -731,6 +806,7 @@ def main():
     parser.add_argument("--require-capacity-observations", action="store_true")
     parser.add_argument("--require-replacement-restart", action="store_true")
     parser.add_argument("--require-control-scope", action="store_true")
+    parser.add_argument("--restore-helper", type=Path)
     args = parser.parse_args()
     try:
         directory = args.directory.resolve()
@@ -744,6 +820,9 @@ def main():
         elif args.action == "record-cleanup":
             check(args.fixture_parent is not None, "durability fixture parent is required")
             record_fixture_root_cleanup(directory, expected, args.fixture_parent)
+        elif args.action == "record-restore-cycles":
+            check(args.restore_helper is not None, "backup fixture helper path is required")
+            record_restore_cycles(binary, directory, expected, args.restore_helper.resolve())
         else:
             verdict = directory / "qualified.json"
             verdict.unlink(missing_ok=True)
@@ -784,6 +863,7 @@ def main():
                 qualification["verifier_revision"] = args.verifier_revision
                 qualification["capacity_validation_revision"] = args.capacity_validation_revision
                 qualification[POST_RESTORE_ACK_CRASH] = True
+                qualification[WRITABLE_RESTORE_CYCLES] = True
             if args.require_replacement_restart:
                 qualification[REPLACEMENT_RESTART] = True
             if args.require_control_scope:

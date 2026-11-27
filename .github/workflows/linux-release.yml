@@ -297,12 +297,27 @@ jobs:
               { echo "TestReleaseRestoredParity did not report a passing test event."; exit 1; }
             [[ -s "$EVIDENCE/parity.json" ]] || { echo "Combined parity report is missing."; exit 1; }
 
-            cd gate || exit
-            export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/supplemental-parity.json"
-            timeout --kill-after=5s 3m go test -json -count=1 -run '^TestReleaseRestoredParity$' ./verify/release |
-              tee "$EVIDENCE/supplemental-parity-events.jsonl" || exit
+            (
+              cd gate || exit
+              export BOG_RELEASE_PARITY_REPORT="$EVIDENCE/supplemental-parity.json"
+              timeout --kill-after=5s 3m go test -json -count=1 -run '^TestReleaseRestoredParity$' ./verify/release
+            ) | tee "$EVIDENCE/supplemental-parity-events.jsonl" || exit
             jq -es 'any(.[]; .Action == "pass" and .Package == "bog/verify/release" and
-              .Test == "TestReleaseRestoredParity")' "$EVIDENCE/supplemental-parity-events.jsonl" >/dev/null
+              .Test == "TestReleaseRestoredParity")' "$EVIDENCE/supplemental-parity-events.jsonl" >/dev/null || exit
+
+            local helper="$RUNNER_TEMP/bog-restore-fixture"
+            "$BINARY" -help > "$EVIDENCE/restore-cycles-help.txt" 2>&1 || exit
+            if grep -Eq '^[[:space:]]*-retained-tail-max-bytes([[:space:]=]|$)' "$EVIDENCE/restore-cycles-help.txt"; then
+              (
+                cd candidate || exit
+                source=$(mktemp -d ./restore-fixture.XXXXXXXX) || exit
+                trap 'rm -rf "$source"' EXIT
+                cp "$GITHUB_WORKSPACE/verifiers/release/restore_fixture.go" "$source/main.go" || exit
+                go build -trimpath -o "$helper" "$source"
+              ) || exit
+            fi
+            timeout --kill-after=5s 90s python3 -B verifiers/release_gate.py record-restore-cycles \
+              "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --restore-helper "$helper" || exit
           )
           failed=0
           for name in admission durability capacity parity; do
@@ -393,12 +408,13 @@ jobs:
               ([$amd64, $arm64] | all(.schema_version == 1 and .current_observations == true and
                 .revision == $revision and .fixture == $fixture and .crash_gate_revision == $gate and
                 .verifier_revision == $verifier and
-                .post_restore_ack_crash == true and .replacement_restart == true and .control_scope == true and
+                .post_restore_ack_crash == true and .writable_restore_cycles == true and
+                .replacement_restart == true and .control_scope == true and
                 .capacity_validation_revision == $capacity_validation and
                 (.binary_sha256 | test("^[0-9a-f]{64}$")))) and
               $amd64.binary_sha256 == $amd64_digest and $arm64.binary_sha256 == $arm64_digest and
               $amd64_digest != $arm64_digest then
                 {revision: $revision, fixture: $fixture, verifier_revision: $verifier, crash_gate_revision: $gate,
-                  capacity_validation_revision: $capacity_validation, control_scope: true,
+                  capacity_validation_revision: $capacity_validation, control_scope: true, writable_restore_cycles: true,
                   binary_sha256: {amd64: $amd64_digest, arm64: $arm64_digest}}
               else error("native qualification identities or verdicts did not match") end'

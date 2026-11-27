@@ -123,6 +123,8 @@ class GateTest(unittest.TestCase):
                 validate_combined_parity(directory, identity)
 
             validate_report()
+            with self.assertRaisesRegex(verify.Rejected, "missing required case writable_restore_cycles"):
+                validate_combined_parity(directory, identity, require_restore_cycles=True)
             for target, changes, reason in (
                 (report, {"revision": "c" * 40}, "mismatched revision"),
                 (report, {"binary_sha256": "c" * 64}, "mismatched binary_sha256"),
@@ -148,6 +150,51 @@ class GateTest(unittest.TestCase):
             del cases[POST_RESTORE_ACK_CRASH]
             with self.assertRaisesRegex(verify.Rejected, f"missing required case {POST_RESTORE_ACK_CRASH}"):
                 validate_report()
+
+    def test_restore_cycle_probe_skips_before_needing_new_fixture_helper(self):
+        from release_restore import restore_cycles
+
+        with patch("release_restore.advertised_flags", return_value=set()):
+            self.assertIsInstance(restore_cycles(ROOT / "bog", ROOT / "unused", ROOT / "missing-helper"),
+                                  verify.SuiteSkipped)
+
+    def test_strict_parity_requires_two_linked_writable_restore_cycles(self):
+        from release_gate import WRITABLE_RESTORE_CYCLES, validate_restore_cycles
+
+        def point(version, base, covered_rows, generation):
+            return dict(version=version, generation=generation * 64, covered_offset=base,
+                        next_ordinal=covered_rows, committed_end=base + 100,
+                        committed_ordinal=covered_rows + 3, suffix_bytes=100,
+                        suffix_sha256=generation * 63 + "0")
+
+        initial, first, second = point(1, 100, 3, "a"), point(2, 200, 6, "b"), point(2, 300, 9, "c")
+        cycles = [dict(input=source, exported=exported, held_rows=held,
+                       fresh_rows=held + 3, restart_rows=held + 3, restored_rows=held + 3,
+                       append_status=204, default_control_status=404)
+                  for source, exported, held in ((initial, first, 6), (first, second, 9))]
+        evidence = dict(initial=initial, cycles=cycles, descriptor_ready_status=200, fixture_removed=True,
+                        final_append_status=204, final_exit_signal=9, final_restart_rows=13)
+        cases = {}
+        report = dict(cases=cases)
+        with self.assertRaisesRegex(verify.Rejected, "missing required case"):
+            validate_restore_cycles(report)
+        case = cases[WRITABLE_RESTORE_CYCLES] = dict(status="pass", evidence=evidence)
+        validate_restore_cycles(report)
+        for target, changes, reason in (
+            (case, {"status": "skip"}, "did not pass"),
+            (evidence, {"cycles": cycles[:1]}, "exactly two"),
+            (evidence, {"cycles": [cycles[0], cycles[0]]}, "invalid version"),
+            (evidence, {"final_exit_signal": "9"}, "final restart"),
+            (evidence, {"descriptor_ready_status": 503}, "readiness"),
+            (cycles[0], {"held_rows": True}, "incomplete cycle 1"),
+            (cycles[1], {"restart_rows": 9}, "incomplete cycle 2"),
+            (second, {"suffix_bytes": 99}, "recovery bounds"),
+            (second, {"generation": first["generation"]}, "does not advance"),
+            (second, {"covered_offset": 301, "committed_end": 401}, "does not advance"),
+        ):
+            with self.subTest(changes=changes), patch.dict(target, changes):
+                with self.assertRaisesRegex(verify.Rejected, reason):
+                    validate_restore_cycles(report)
 
     def test_native_replacement_requires_ordered_suffix_and_terminal_retry(self):
         rows, backfill, suffix = verify.replacement_fixture()
