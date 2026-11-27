@@ -9,6 +9,7 @@ RUN mkdir -p /verifier/gocache && GOCACHE=/verifier/gocache go build -trimpath s
     && chown -R 65532:65532 /verifier/gocache
 COPY verify.sh verify.py /verifier/
 COPY corpus/ /verifier/corpus/
+COPY probes/ /verifier/probes/
 RUN chmod 0755 /verifier/verify.sh && command -v git && command -v python3 && command -v timeout \
     && test "$(go env GOOS)" = linux && go version | grep -Eq '^go version go1[.]27([.]| )'
 USER 65532:65532

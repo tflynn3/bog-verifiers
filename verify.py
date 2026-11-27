@@ -1302,6 +1302,46 @@ def query_admission_suite(binary, directory):
             "backfill_after_restart": "passed"}
 
 
+QUERY_AGGREGATE_SUITE = "query-aggregate-admission"
+QUERY_AGGREGATE_ENTRY = "TestSlipwayQueryAggregateAdmission"
+
+
+def query_aggregate_suite(source, directory, log_dir):
+    package = source / "internal" / "httpapi"
+    constructor = re.compile(r"^func NewWithQueryAdmissionLimits\s*\(", re.MULTILINE)
+    if not any(constructor.search(path.read_text(encoding="utf-8"))
+               for path in package.glob("*.go") if not path.name.endswith("_test.go")):
+        return SuiteSkipped("Bog httpapi does not expose NewWithQueryAdmissionLimits")
+
+    directory.mkdir()
+    overlay = directory / "overlay.json"
+    probe = CORPUS_DIR.parent / "probes" / "query_aggregate_test.go"
+    if not probe.is_file():
+        raise InfrastructureError("query aggregate admission probe is missing")
+    overlay.write_text(json.dumps({"Replace": {
+        str(package / "slipway_query_aggregate_test.go"): str(probe),
+    }}))
+    log = log_dir / "handler-test.log"
+    try:
+        with log.open("wb") as output:
+            result = subprocess.run(
+                ["go", "test", "-mod=readonly", "-trimpath", f"-overlay={overlay}", "-count=1", "-v",
+                 "-timeout=25s", "-run", f"^{QUERY_AGGREGATE_ENTRY}$", "./internal/httpapi"],
+                cwd=source, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT, timeout=75,
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise InfrastructureError("query aggregate admission probe exceeded its build and test deadline") from exc
+    tail = log_tail(log, 3500)
+    if result.returncode < 0:
+        raise InfrastructureError(f"query aggregate admission probe killed by signal {-result.returncode}")
+    if result.returncode != 0:
+        detail = next((line.strip() for line in tail.splitlines() if "slipway_query_aggregate_test.go:" in line),
+                      tail.strip()[-450:])
+        raise Rejected(f"query aggregate admission probe failed: {detail}")
+    check(f"--- PASS: {QUERY_AGGREGATE_ENTRY} (" in tail, "aggregate admission probe did not execute")
+    return {"coverage": "handler", "log": log.name}
+
+
 def query_response_bytes_suite(binary, directory):
     flag = "-query-max-response-bytes"
     if flag not in advertised_flags(binary, directory):
@@ -2909,6 +2949,7 @@ SUITES = (
     ("snapshot-pagination", pagination_suite),
     ("query-limits", query_limits_suite),
     ("query-admission", query_admission_suite),
+    (QUERY_AGGREGATE_SUITE, query_aggregate_suite),
     ("query-response-bytes", query_response_bytes_suite),
     ("capacity-control", capacity_control_suite),
     ("archived-corpus", replay_corpus_suite),
@@ -2927,6 +2968,7 @@ REQUIRED_SUITES = (
     "snapshot-pagination",
     "query-limits",
     "query-admission",
+    QUERY_AGGREGATE_SUITE,
     "query-response-bytes",
     "capacity-control",
     "archived-corpus",
@@ -3239,11 +3281,14 @@ def main(source, work, sha, profile="pr"):
                 metrics = run(binary, work / stage, rounds=56)
             elif stage == "kill-durability" and profile == "legacy":
                 metrics = run(binary, work / stage, paged=False)
+            elif stage == QUERY_AGGREGATE_SUITE:
+                metrics = run(source, work / stage, log_dir)
             else:
                 metrics = run(binary, work / stage)
             if isinstance(metrics, SuiteSkipped):
                 if stage in QUERY_ADMISSION_FLAGS:
                     check(not query_admission_required(), f"#19 requires {stage}: {metrics.reason}")
+                if stage in QUERY_ADMISSION_FLAGS or stage == QUERY_AGGREGATE_SUITE:
                     suite["coverage"] = "unavailable"
                 suite.update(status="skipped", diagnostic=metrics.reason)
                 completed.append(stage)
@@ -3257,7 +3302,10 @@ def main(source, work, sha, profile="pr"):
             if stage == LOG_REPLAY_COMPARISON or (profile == "indexed" and stage == comparison_stage):
                 failed = metrics["failed_targets"]
                 check(not failed, f"{stage} missed {len(failed)} targets: {', '.join(failed)}")
-            if not any(case.get("ready_ms") is not None for case in suite["processes"]):
+            if stage == QUERY_AGGREGATE_SUITE:
+                if not metrics or not (log_dir / metrics["log"]).is_file():
+                    raise InfrastructureError("aggregate admission suite ran without handler test evidence")
+            elif not any(case.get("ready_ms") is not None for case in suite["processes"]):
                 raise InfrastructureError("required suite ran without a ready Bog subprocess")
         except (Rejected, subprocess.TimeoutExpired, threading.BrokenBarrierError,
                 ConnectionError, TimeoutError, http.client.HTTPException) as exc:

@@ -80,6 +80,14 @@ the documented WAL and commit marker.
   succeed. After the held client disconnects, a retry succeeds, the existing
   cursor excludes the backfill, and a fresh walk includes it. The verifier
   also checks that the acknowledged backfill survives SIGKILL and restart.
+- The #129 aggregate admission probe runs when the candidate exposes
+  `httpapi.NewWithQueryAdmissionLimits`. A Go overlay installs the probe
+  without writing to the candidate checkout. The provisional binding uses
+  `QueryAdmissionLimits{PreparedBytes, ScanBuffers, Captures}` and gives each
+  resource its own deterministic limit. The probe checks complete plain-text
+  503s, the existing Go client's retry classification, and exact continuation
+  and terminal replay after capacity returns. Slot and work-budget refusals
+  retain their existing diagnostic text.
 - The response byte suite counts raw UTF-8 NDJSON, including JSON escapes
   and record newlines. It checks the exact-fit ordinary prefix and HTTP 422
   with no rows or cursor when the first matching record exceeds the cap by
