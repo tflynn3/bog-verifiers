@@ -1,0 +1,205 @@
+diff --git a/verify/release/tail_parity_linux_test.go b/verify/release/tail_parity_linux_test.go
+index c02d46b..0aaf056 100644
+--- a/verify/release/tail_parity_linux_test.go
++++ b/verify/release/tail_parity_linux_test.go
+@@ -1,18 +1,23 @@
+ package main
+
+ import (
++	"bytes"
+ 	"cmp"
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
++	"net/url"
+ 	"os"
+ 	"path/filepath"
+ 	"slices"
++	"syscall"
+ 	"testing"
+ 	"time"
+
+ 	"bog/internal/backup"
++	"bog/verify/capacityevidence"
+ 	querymodel "bog/verify/query-model"
+ )
+
+@@ -94,12 +99,27 @@ func runTailParityCycle(ctx context.Context, binary, dir, exported, archived, re
+ 		if _, err := requireTailParityStatus(ctx, client, base, input.NextOrdinal, input.CommittedOrdinal); err != nil {
+ 			return fmt.Errorf("writable restore status: %w", err)
+ 		}
+-		pager, err := newReleasePager(base, client, restoredPageCap)
++		pager, err := newObservedOraclePager(base, client, restoredPageCap)
+ 		if err != nil {
+ 			return err
+ 		}
+ 		walk := restoredWalk(pager, "", []int{1, 3})
+-		held, err := querymodel.VerifyWireWalk(ctx, log, walk, parityFetch(pager), func(ctx context.Context, _ string) error {
++		var predecessor, published backfillCompaction
++		var authority tailParityAuthority
++		var terminal querymodel.WireRequest
++		var terminalBody []byte
++		fetch := func(ctx context.Context, req querymodel.WireRequest) (querymodel.WirePage, error) {
++			var body []byte
++			page, _, err := fetchOraclePage(context.WithValue(ctx, oracleBodyKey{}, &body), pager, req)
++			if err == nil && authority.Tail != "" && page.NextCursor == "" {
++				if len(body) == 0 || int64(len(body)) != page.BodyBytes {
++					return page, errors.New("missing exact terminal response bytes")
++				}
++				terminal, terminalBody = req, body
++			}
++			return page, err
++		}
++		held, err := querymodel.VerifyWireWalk(ctx, log, walk, fetch, func(ctx context.Context, _ string) error {
+ 			for i, batch := range fixture.batches {
+ 				status, appendErr := appendTailParityRows(ctx, client, base, log, batch)
+ 				cycle.AppendStatuses[i] = status
+@@ -107,16 +127,39 @@ func runTailParityCycle(ctx context.Context, binary, dir, exported, archived, re
+ 					return fmt.Errorf("append batch %d: %w", i+1, appendErr)
+ 				}
+ 			}
+-			previous, err := requireTailParityStatus(ctx, client, base, input.NextOrdinal, fixture.export.CommittedOrdinal)
++			var err error
++			predecessor, err = requireTailParityStatus(ctx, client, base, input.NextOrdinal, fixture.export.CommittedOrdinal)
+ 			if err != nil {
+ 				return err
+ 			}
+-			_, err = publishReleaseGeneration(ctx, client, base, fixture.export.NextOrdinal, fixture.export.CommittedOrdinal, &previous)
++			authority, err = readTailParityAuthority(data)
++			if err != nil && !(probeSelector && errors.Is(err, os.ErrNotExist)) {
++				return fmt.Errorf("read predecessor selector: %w", err)
++			}
++			published, err = publishReleaseGeneration(ctx, client, base, fixture.export.NextOrdinal, fixture.export.CommittedOrdinal, &predecessor)
+ 			return err
+ 		})
+ 		if err != nil {
+ 			return fmt.Errorf("held walk across append and compaction: %w", err)
+ 		}
++		if authority.Tail != "" {
++			if terminal.Cursor == "" {
++				return errors.New("held walk issued no terminal request cursor")
++			}
++			var retry []byte
++			page, _, err := fetchOraclePage(context.WithValue(ctx, oracleBodyKey{}, &retry), pager, terminal)
++			if err != nil {
++				return fmt.Errorf("retry held terminal request: %w", err)
++			}
++			if page.NextCursor != "" || !bytes.Equal(terminalBody, retry) {
++				return errors.New("terminal retry changed response bytes or exhaustion")
++			}
++			if err := verifyTailParityReclamation(ctx, client, base, data, terminal.Cursor, authority, predecessor, published); err != nil {
++				return err
++			}
++		} else if _, err := data.Lstat(tailAuthorityName); !errors.Is(err, os.ErrNotExist) {
++			return errors.Join(errors.New("missing writable selector before replacement"), err)
++		}
+ 		cycle.HeldRows = held.Rows
+ 		cycle.FreshRows, err = walkTailParity(ctx, pager, log)
+ 		if err != nil {
+@@ -235,6 +278,104 @@ func runTailParityCycle(ctx context.Context, binary, dir, exported, archived, re
+ 	return cycle, nil
+ }
+
++// Correlate the control response with the selected predecessor tail observed
++// through the pinned directory, then require that exact inode to be unlinked.
++func verifyTailParityReclamation(ctx context.Context, client *http.Client, base string, data *os.Root,
++	cursor string, authority tailParityAuthority, predecessor, published backfillCompaction,
++) error {
++	const control = "/_capacity/compaction?action="
++	observe := func(ctx context.Context) (capacityevidence.RuntimeMetrics, error) {
++		var wire struct {
++			State      string          `json:"state"`
++			Generation uint64          `json:"generation"`
++			Covered    int             `json:"covered_rows"`
++			Committed  int             `json:"committed_rows"`
++			Metrics    json.RawMessage `json:"metrics"`
++		}
++		target := fmt.Sprintf("%s%sstatus&cutoff=%d", base, control, published.covered)
++		res, err := request(ctx, client, http.MethodGet, target, nil)
++		if err != nil {
++			return capacityevidence.RuntimeMetrics{}, err
++		}
++		if res.status != http.StatusOK {
++			return capacityevidence.RuntimeMetrics{}, fmt.Errorf("pin status returned HTTP %d", res.status)
++		}
++		if err := json.Unmarshal(res.body, &wire); err != nil {
++			return capacityevidence.RuntimeMetrics{}, err
++		}
++		if (backfillCompaction{wire.State, wire.Generation, wire.Covered, wire.Committed}) != published {
++			return capacityevidence.RuntimeMetrics{}, errors.New("pin observation changed the published replacement")
++		}
++		metrics, _, err := capacityevidence.DecodeRuntimeMetrics(wire.Metrics)
++		return metrics, err
++	}
++	metrics, err := observe(ctx)
++	if err != nil {
++		return fmt.Errorf("observe terminal predecessor pin: %w", err)
++	}
++	credited, err := metrics.Reclamation(predecessor.generation, published.generation)
++	if err != nil {
++		return err
++	}
++	if metrics.RetiredPins == nil || *metrics.RetiredPins == 0 ||
++		metrics.PredecessorPinGeneration == nil || *metrics.PredecessorPinGeneration != predecessor.generation || credited != nil {
++		return fmt.Errorf("expected predecessor generation %d pinned after terminal retry, before reclamation", predecessor.generation)
++	}
++	file, info, err := openTailArtifact(data, authority.Tail, tailParityByteLimit)
++	if err != nil {
++		return fmt.Errorf("open pinned predecessor tail: %w", err)
++	}
++	defer file.Close()
++	stat, ok := info.Sys().(*syscall.Stat_t)
++	if !ok || uint64(stat.Dev) != authority.TailDevice || uint64(stat.Ino) != authority.TailInode || stat.Nlink != 1 {
++		return errors.New("pinned predecessor tail does not match the selector or has unexpected links")
++	}
++
++	res, err := request(ctx, client, http.MethodPost, base+control+"retire&cursor="+url.QueryEscape(cursor), nil)
++	if err != nil {
++		return err
++	}
++	if res.status != http.StatusNoContent || len(res.body) != 0 {
++		return fmt.Errorf("terminal capture retirement returned HTTP %d with %d bytes, want empty 204", res.status, len(res.body))
++	}
++	drain, cancel := context.WithTimeout(ctx, 5*time.Second)
++	defer cancel()
++	ticker := time.NewTicker(candidatePollInterval)
++	defer ticker.Stop()
++	for {
++		metrics, err := observe(drain)
++		if err != nil {
++			return fmt.Errorf("observe final predecessor pin drain: %w", err)
++		}
++		if metrics.RetiredPins == nil {
++			return errors.New("missing retired pin count after retirement")
++		}
++		credited, err := metrics.Reclamation(predecessor.generation, published.generation)
++		if err != nil {
++			return err
++		}
++		if credited != nil && *metrics.RetiredPins != 0 {
++			return errors.New("reclamation credited before final predecessor pin drain")
++		}
++		info, err := file.Stat()
++		if err != nil {
++			return err
++		}
++		unlinked := info.Sys().(*syscall.Stat_t).Nlink == 0
++		if credited != nil && unlinked {
++			if _, err := data.Lstat(authority.Tail); !errors.Is(err, os.ErrNotExist) {
++				return errors.Join(errors.New("reclaimed predecessor tail path still reachable"), err)
++			}
++			return nil
++		}
++		select {
++		case <-drain.Done():
++			return fmt.Errorf("wait for final predecessor pin drain and tail reclamation: %w", drain.Err())
++		case <-ticker.C:
++		}
++	}
++}
++
+ func appendTailParityRows(ctx context.Context, client *http.Client, base string, log *querymodel.Log, batch []row) (int, error) {
+ 	modelRows := make([]querymodel.Row, 0, len(batch))
+ 	for _, r := range batch {

@@ -114,7 +114,7 @@ jobs:
           cp admission/verify/release/README.md "$EVIDENCE/fixture.md"
           cp candidate/verify/linux/README.md "$EVIDENCE/durability-fixture.md"
           cp capacity-validation/bench/retained-history/README.md "$EVIDENCE/capacity-fixture.md"
-          cp verifiers/release/{fixed-budget,restored-parity,capacity-wire-restart,selected-tail-probe,query-events,capacity-control-scope}.patch "$EVIDENCE/"
+          cp verifiers/release/{fixed-budget,restored-parity,capacity-wire-restart,selected-tail-probe,query-events,capacity-control-scope,capacity-control-ipv6,tail-parity-retirement}.patch "$EVIDENCE/"
           cp verifiers/release/{admission/fixed-boundaries.patch,selected_tail_linux_test.go} "$EVIDENCE/"
           printf 'tooling_revision=%s\nverifier_revision=%s\n' "$(git -C gate rev-parse HEAD)" \
             "$(git -C verifiers rev-parse HEAD)" | tee -a "$EVIDENCE/run.txt"
@@ -135,11 +135,13 @@ jobs:
           printf 'control_scope_tooling_revision=%s\n' "$control_scope_revision" | tee -a "$EVIDENCE/run.txt"
           [[ "$control_scope_revision" == "$CONTROL_SCOPE_TOOLING_REVISION" ]]
           git -C parity-gate apply "$GITHUB_WORKSPACE"/verifiers/release/{selected-tail-probe,query-events}.patch
+          git -C parity-gate apply "$GITHUB_WORKSPACE"/verifiers/release/tail-parity-retirement.patch
           cp verifiers/release/selected_tail_linux_test.go parity-gate/verify/release/
           git -C gate apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/{fixed-budget,restored-parity}.patch
           git -C admission apply --unidiff-zero "$GITHUB_WORKSPACE/verifiers/release/admission/fixed-boundaries.patch"
           git -C capacity-validation apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/capacity-wire-restart.patch
           git -C control-scope apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/capacity-control-scope.patch
+          git -C control-scope apply "$GITHUB_WORKSPACE"/verifiers/release/capacity-control-ipv6.patch
 
       - uses: actions/setup-go@v5
         with:
@@ -214,9 +216,10 @@ jobs:
             jq -es '
               [.[] | select(.Action == "pass" and .Package == "bog/verify/release") | .Test] as $passed |
               ("TestReleaseCapacityControlScope" | IN($passed[])) and
-              ("TestReleaseCapacityControlScope/loopback_with_opt_in" | IN($passed[]))
+              ("TestReleaseCapacityControlScope/loopback_with_opt_in" | IN($passed[])) and
+              ("TestReleaseCapacityControlScope/ipv6_loopback_with_opt_in" | IN($passed[]))
             ' "$events" >/dev/null ||
-              { echo "TestReleaseCapacityControlScope did not pass with opted-in loopback publication."; exit 1; }
+              { echo "TestReleaseCapacityControlScope did not pass with IPv4 publication and IPv6 route absence."; exit 1; }
           )
           capacity() (
             capacity_control_scope 2>&1 | tee "$EVIDENCE/capacity_control_scope.log" || exit

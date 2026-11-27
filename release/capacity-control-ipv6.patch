@@ -1,0 +1,271 @@
+diff --git a/verify/release/capacity_control_linux_test.go b/verify/release/capacity_control_linux_test.go
+index 7bd7499..377c0b4 100644
+--- a/verify/release/capacity_control_linux_test.go
++++ b/verify/release/capacity_control_linux_test.go
+@@ -7,6 +7,7 @@ import (
+ 	"net"
+ 	"net/http"
+ 	"net/http/httptest"
++	"net/url"
+ 	"os"
+ 	"path/filepath"
+ 	"strconv"
+@@ -28,6 +29,7 @@ func TestReleaseCapacityControlScope(t *testing.T) {
+ 	}
+ 	t.Logf("candidate revision=%s binary_sha256=%s fixture=%s", id.Revision, id.BinarySHA256, id.Fixture)
+
++	loopbackAvailable := false
+ 	for _, tc := range []struct {
+ 		name    string
+ 		ip      net.IP
+@@ -37,8 +39,13 @@ func TestReleaseCapacityControlScope(t *testing.T) {
+ 		{name: "loopback_without_opt_in", ip: net.IPv4(127, 0, 0, 1)},
+ 		{name: "wildcard_with_opt_in", ip: net.IPv4zero, optIn: "1"},
+ 		{name: "loopback_with_opt_in", ip: net.IPv4(127, 0, 0, 1), optIn: "1", publish: true},
++		{name: "ipv6_loopback_with_opt_in", ip: net.IPv6loopback, optIn: "1"},
+ 	} {
+ 		t.Run(tc.name, func(t *testing.T) {
++			ipv6 := tc.ip.Equal(net.IPv6loopback)
++			if ipv6 && !loopbackAvailable {
++				t.Skip("candidate has no opted-in IPv4 loopback control")
++			}
+ 			// Setenv registers restoration and prevents parallel execution. The
+ 			// default case must remove even an opt-in inherited from the runner.
+ 			t.Setenv(capacityOptIn, tc.optIn)
+@@ -69,6 +76,15 @@ func TestReleaseCapacityControlScope(t *testing.T) {
+ 					return nil
+ 				},
+ 			}
++			if ipv6 {
++				bind.owns = func(pid, port int) (bool, error) {
++					return capacityListenerOwned(pid, port, func(table, addr string) bool {
++						// Both native runners print each procfs IPv6 word in little-endian order.
++						return table == "/proc/net/tcp6" && addr == "00000000000000000000000001000000"
++					})
++				}
++				bind.verify = nil
++			}
+ 			supported := true
+ 			err := withFixtureRoot(func(dir string) error {
+ 				return serveDirectoryOn(ctx, binary, dir, client, nil, bind, (*candidateProcess).stop,
+@@ -91,6 +107,10 @@ func TestReleaseCapacityControlScope(t *testing.T) {
+ 							return fmt.Errorf("seed compaction cutoff: %w", err)
+ 						}
+ 						if !tc.publish {
++							if ipv6 {
++								return errors.Join(checkCapacityControlAbsent(ctx, t, client, base),
++									checkIPv6RetirementAbsent(ctx, client, base))
++							}
+ 							return checkCapacityControlAbsent(ctx, t, client, base)
+ 						}
+ 						published, err := publishBackfillGeneration(ctx, client, base, 1, nil)
+@@ -108,6 +128,9 @@ func TestReleaseCapacityControlScope(t *testing.T) {
+ 			if !supported {
+ 				t.Skip("candidate has no opted-in loopback compaction route")
+ 			}
++			if tc.publish {
++				loopbackAvailable = true
++			}
+ 		})
+ 	}
+ }
+@@ -137,14 +160,65 @@ func checkCapacityControlAbsent(ctx context.Context, t *testing.T, client *http.
+ 	return probeErr
+ }
+
++func checkIPv6RetirementAbsent(ctx context.Context, client *http.Client, base string) error {
++	tail := row{TS: fixtureStart, Line: "capacity scope continuation"}
++	if _, err := ingest(ctx, client, base, []row{tail}); err != nil {
++		return err
++	}
++	pager, err := newReleasePager(base, client, 4096)
++	if err != nil {
++		return err
++	}
++	first, _, err := pager.fetch(ctx, "", 1, "")
++	if err != nil {
++		return err
++	}
++	if err := checkBudgetPage(first, []row{{TS: fixtureStart, Line: "capacity scope seed"}}, false, nil); err != nil {
++		return fmt.Errorf("open IPv6 capture: %w", err)
++	}
++	target := base + "/_capacity/compaction?action=retire&cursor=" + url.QueryEscape(first.NextCursor)
++	retired, err := request(ctx, client, http.MethodPost, target, nil)
++	if err != nil {
++		return err
++	}
++	if retired.status != http.StatusNotFound {
++		return fmt.Errorf("IPv6 capture retirement returned HTTP %d, want 404", retired.status)
++	}
++	resumed, _, err := pager.fetch(ctx, "", 1, first.NextCursor)
++	if err != nil {
++		return fmt.Errorf("resume IPv6 capture after hidden retirement: %w", err)
++	}
++	if err := checkBudgetPage(resumed, []row{tail}, true, nil); err != nil {
++		return fmt.Errorf("resume IPv6 capture after hidden retirement: %w", err)
++	}
++	health, err := request(ctx, client, http.MethodGet, base+"/healthz", nil)
++	if err != nil {
++		return err
++	}
++	if health.status != http.StatusOK {
++		return fmt.Errorf("IPv6 health after cursor resume returned HTTP %d, want 200", health.status)
++	}
++	return nil
++}
++
+ // listener.Owns establishes ownership for IPv4 HTTP. Match the child's
+ // LISTEN inodes against procfs as well so a loopback fallback cannot pass the
+ // wildcard case, even if the process also owns an IPv6-only wildcard.
+ func requireCapacityBind(pid, port int, wildcard bool) error {
++	found, err := capacityListenerOwned(pid, port, func(_ string, addr string) bool {
++		return capacityBindMatches(addr, wildcard)
++	})
++	if err == nil && !found {
++		return fmt.Errorf("no owned LISTEN socket for candidate PID %d on port %d", pid, port)
++	}
++	return err
++}
++
++func capacityListenerOwned(pid, port int, matches func(table, addr string) bool) (bool, error) {
+ 	fdDir := filepath.Join("/proc", strconv.Itoa(pid), "fd")
+ 	entries, err := os.ReadDir(fdDir)
+ 	if err != nil {
+-		return fmt.Errorf("inspect candidate descriptors for bind: %w", err)
++		return false, fmt.Errorf("inspect candidate descriptors for bind: %w", err)
+ 	}
+ 	owned := make(map[string]bool, len(entries))
+ 	for _, entry := range entries {
+@@ -153,7 +227,7 @@ func requireCapacityBind(pid, port int, wildcard bool) error {
+ 			continue // Unrelated descriptors may close during inspection.
+ 		}
+ 		if err != nil {
+-			return fmt.Errorf("read candidate descriptor for bind: %w", err)
++			return false, fmt.Errorf("read candidate descriptor for bind: %w", err)
+ 		}
+ 		owned[target] = true
+ 	}
+@@ -168,7 +242,7 @@ func requireCapacityBind(pid, port int, wildcard bool) error {
+ 			continue // The kernel may have IPv6 disabled.
+ 		}
+ 		if err != nil {
+-			return fmt.Errorf("read candidate bind table %s: %w", table, err)
++			return false, fmt.Errorf("read candidate bind table %s: %w", table, err)
+ 		}
+ 		for line := range strings.SplitSeq(string(data), "\n") {
+ 			fields := strings.Fields(line)
+@@ -180,22 +254,19 @@ func requireCapacityBind(pid, port int, wildcard bool) error {
+ 				continue
+ 			}
+ 			if len(fields) < 10 {
+-				return fmt.Errorf("incomplete LISTEN entry in %s for port %s", table, port)
++				return false, fmt.Errorf("incomplete LISTEN entry in %s for port %s", table, port)
+ 			}
+ 			if !owned["socket:["+fields[9]+"]"] {
+ 				continue
+ 			}
+-			if !capacityBindMatches(addr, wildcard) {
+-				return fmt.Errorf("candidate PID %d listener on port %s has unexpected local address %s in %s",
++			if !matches(table, addr) {
++				return false, fmt.Errorf("candidate PID %d listener on port %s has unexpected local address %s in %s",
+ 					pid, port, addr, table)
+ 			}
+ 			found = true
+ 		}
+ 	}
+-	if !found {
+-		return fmt.Errorf("no owned LISTEN socket for candidate PID %d on port %d", pid, port)
+-	}
+-	return nil
++	return found, nil
+ }
+
+ func capacityBindMatches(addr string, wildcard bool) bool {
+diff --git a/verify/release/process.go b/verify/release/process.go
+index ea37b23..6daa020 100644
+--- a/verify/release/process.go
++++ b/verify/release/process.go
+@@ -180,7 +180,11 @@ func (p *candidateProcess) checkRunning() error {
+ }
+
+ func (p *candidateProcess) requireListener(port int) error {
+-	listening, err := listener.Owns(p.process.Pid, port)
++	return p.requireListenerOn(port, listener.Owns)
++}
++
++func (p *candidateProcess) requireListenerOn(port int, owns func(int, int) (bool, error)) error {
++	listening, err := owns(p.process.Pid, port)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -191,6 +195,10 @@ func (p *candidateProcess) requireListener(port int) error {
+ }
+
+ func (p *candidateProcess) awaitHealth(ctx context.Context, client *http.Client, base string, port int) error {
++	return p.awaitHealthOn(ctx, client, base, port, listener.Owns)
++}
++
++func (p *candidateProcess) awaitHealthOn(ctx context.Context, client *http.Client, base string, port int, owns func(int, int) (bool, error)) error {
+ 	startup, cancel := context.WithTimeout(ctx, candidateStartupTimeout)
+ 	defer cancel()
+ 	ticker := time.NewTicker(candidatePollInterval)
+@@ -199,7 +207,7 @@ func (p *candidateProcess) awaitHealth(ctx context.Context, client *http.Client,
+ 		if err := startup.Err(); err != nil {
+ 			return fmt.Errorf("startup health: %w", context.Cause(startup))
+ 		}
+-		owned, err := listener.Owns(p.process.Pid, port)
++		owned, err := owns(p.process.Pid, port)
+ 		if err != nil {
+ 			return fmt.Errorf("startup listener: %w", err)
+ 		}
+@@ -214,7 +222,7 @@ func (p *candidateProcess) awaitHealth(ctx context.Context, client *http.Client,
+ 			if res.status != http.StatusOK {
+ 				return fmt.Errorf("startup health returned HTTP %d", res.status)
+ 			}
+-			return p.requireListener(port)
++			return p.requireListenerOn(port, owns)
+ 		}
+ 		select {
+ 		case <-startup.Done():
+@@ -257,6 +265,7 @@ func serveDirectoryWithStop(ctx context.Context, binary, dir string, client *htt
+ type candidateBind struct {
+ 	ip     net.IP // nil defaults to IPv4 loopback
+ 	verify func(pid, port int) error
++	owns   func(pid, port int) (bool, error)
+ }
+
+ func serveDirectoryOn(ctx context.Context, binary, dir string, client *http.Client, flags []string, bind candidateBind, stopAfterProbe func(*candidateProcess, time.Duration) error, check func(context.Context, string) error) (err error) {
+@@ -264,7 +273,14 @@ func serveDirectoryOn(ctx context.Context, binary, dir string, client *http.Clie
+ 	if bind.ip == nil {
+ 		bind.ip = loopback
+ 	}
+-	reservation, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: bind.ip})
++	network := "tcp4"
++	if bind.ip.To4() == nil {
++		network, loopback = "tcp6", net.IPv6loopback
++	}
++	if bind.owns == nil {
++		bind.owns = listener.Owns
++	}
++	reservation, err := net.ListenTCP(network, &net.TCPAddr{IP: bind.ip})
+ 	if err != nil {
+ 		return fmt.Errorf("reserve release listener: %w", err)
+ 	}
+@@ -294,7 +310,7 @@ func serveDirectoryOn(ctx context.Context, binary, dir string, client *http.Clie
+ 	// Use loopback for HTTP even when the child listens on a wildcard.
+ 	probeAddr := net.TCPAddr{IP: loopback, Port: addr.Port}
+ 	base := "http://" + probeAddr.String()
+-	if err := p.awaitHealth(probes, client, base, addr.Port); err != nil {
++	if err := p.awaitHealthOn(probes, client, base, addr.Port, bind.owns); err != nil {
+ 		return err
+ 	}
+ 	if err := probes.Err(); err != nil {
+@@ -308,7 +324,7 @@ func serveDirectoryOn(ctx context.Context, binary, dir string, client *http.Clie
+ 	probeErr := check(probes, base)
+ 	// Keep the probe diagnostic first even when the listener or process
+ 	// disappeared during the last request.
+-	err = errors.Join(probeErr, p.requireListener(addr.Port))
++	err = errors.Join(probeErr, p.requireListenerOn(addr.Port, bind.owns))
+ 	if err == nil && bind.verify != nil {
+ 		err = bind.verify(p.process.Pid, addr.Port)
+ 	}
