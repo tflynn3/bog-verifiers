@@ -3186,6 +3186,9 @@ def publish_result(work, code, reason, requested_sha, tested_sha, profile="pr"):
 
 
 def main(source, work, sha, profile="pr"):
+    if profile == "journeys":
+        import journeys  # release acceptance journeys; see journeys.py
+        return journeys.main(source, work, sha, sys.modules[__name__])
     evidence = work / "artifacts"
     evidence.mkdir()
     build_log = evidence / "build.log"

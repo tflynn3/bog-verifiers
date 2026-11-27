@@ -7,7 +7,8 @@ ENV GOWORK=off GOTOOLCHAIN=local GOPROXY=off LC_ALL=C.UTF-8
 # cache built with the same -trimpath flag verify.py uses. Bog has no module dependencies.
 RUN mkdir -p /verifier/gocache && GOCACHE=/verifier/gocache go build -trimpath std \
     && chown -R 65532:65532 /verifier/gocache
-COPY verify.sh verify.py /verifier/
+COPY verify.sh verify.py journeys.py /verifier/
+COPY journeys/ /verifier/journeys/
 COPY corpus/ /verifier/corpus/
 COPY probes/ /verifier/probes/
 RUN chmod 0755 /verifier/verify.sh && command -v git && command -v python3 && command -v timeout \

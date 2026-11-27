@@ -19,6 +19,7 @@ profile=pr
 case "$mode" in
   full|compare) profile=full ;;
   legacy|post-cycle|indexed) profile=$mode ;;
+  journeys) profile=journeys ;;
 esac
 case "${1:-}" in
   --full|--compare)
@@ -31,7 +32,7 @@ case "${1:-}" in
     ;;
   --legacy)
     case "$profile" in
-      full|post-cycle|indexed) infra '--legacy cannot be combined with a comparison run' ;;
+      full|post-cycle|indexed|journeys) infra '--legacy cannot be combined with a comparison run' ;;
     esac
     profile=legacy
     shift
@@ -67,6 +68,14 @@ if [ -z "$repository$branch$expected" ]; then
       repository=${SLIPWAY_PARAM_REPOSITORY:-$factory_repository}
       branch=${SLIPWAY_PARAM_BRANCH:-main}
       expected=${SLIPWAY_INPUT_TESTEDCOMMIT:-${SLIPWAY_PARAM_COMMIT:-}}
+      if [ "$branch" = main ]; then allow_ancestor=true; fi
+      ;;
+    journeys:journeys)
+      # bog-conductor's release acceptance journeys (journeys.py): run the journeys listed in
+      # SLIPWAY_PARAM_JOURNEYS against an exact commit reachable from main.
+      repository=${SLIPWAY_PARAM_REPOSITORY:-$factory_repository}
+      branch=${SLIPWAY_PARAM_BRANCH:-main}
+      expected=${SLIPWAY_PARAM_COMMIT:-}
       if [ "$branch" = main ]; then allow_ancestor=true; fi
       ;;
     pr:post-land)
@@ -144,7 +153,7 @@ printf 'bog verification candidate_sha=%s profile=%s toolchain=%s\n' "$sha" "$pr
 
 watchdog=240
 case "$profile" in
-  full|post-cycle) watchdog=1800 ;;
+  full|post-cycle|journeys) watchdog=1800 ;;
   indexed) watchdog=7200 ;;
 esac
 status=0
