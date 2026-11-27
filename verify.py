@@ -166,7 +166,7 @@ class Bog:
         env = os.environ.copy()
         env.pop(CAPACITY_ENV, None)
         if capacity:
-            env[CAPACITY_ENV] = "1"
+            env[CAPACITY_ENV] = "1" if capacity is True else capacity
         with log_path.open("wb") as log:
             try:
                 self.process = subprocess.Popen(
@@ -826,6 +826,52 @@ def replacement_fixture():
 
 def ordered_sha256(rows):
     return hashlib.sha256(encode_rows(rows)).hexdigest()
+
+
+CONTROL_SCOPE_REQUESTS = (
+    ("status", "GET", f"{CAPACITY_PATH}?action=status&cutoff=0"),
+    ("start", "POST", f"{CAPACITY_PATH}?action=start&cutoff=2"),
+    ("retire", "POST", f"{CAPACITY_PATH}?action=retire"),
+)
+
+
+def control_scope_suite(binary, directory):
+    directory.mkdir()
+    store = directory / "store"
+    rows = [Row(0, "first"), Row(1, "second")]
+    _, method, path = CONTROL_SCOPE_REQUESTS[0]
+    with run_bog(binary, store, capacity=True) as bog:
+        status, body = bog.request(method, path)
+        if status != 404:
+            check(status == 200, f"loopback opt-in status returned HTTP {status}: {body[:200]!r}")
+            bog.ingest(rows)
+        bog.stop()
+    if status == 404:
+        return SuiteSkipped(f"candidate has no loopback compaction with {CAPACITY_ENV}=1")
+    evidence = {"loopback_enabled_status": status}
+    for label, host, capacity in (
+        ("loopback_default", "127.0.0.1", None),
+        ("loopback_disabled", "127.0.0.1", "0"),
+        ("wildcard_default", "0.0.0.0", None),
+        ("wildcard_enabled", "0.0.0.0", True),
+    ):
+        ready = None if label == "wildcard_enabled" else True
+        routes = {}
+        with run_bog(binary, store, host=host, capacity=capacity, ready=ready) as bog:
+            if bog.startup_seconds is not None:
+                cursor = expect_page(bog, query_args(0, SECOND), rows, 0, 1, None, label)
+                for action, method, path in CONTROL_SCOPE_REQUESTS:
+                    if action == "retire":
+                        path += "&" + urllib.parse.urlencode({"cursor": cursor})
+                    status, _ = bog.request(method, path)
+                    check(status == 404, f"{label}: {method} {action} returned HTTP {status}, expected 404")
+                    routes[action] = status
+                bog.stop()
+            else:
+                check(bog.process.returncode == 1,
+                      f"{label}: unexpected startup exit {bog.process.returncode}: {bog.log_tail()}")
+            evidence[label] = {"routes": routes, "exit_code": bog.process.returncode}
+    return evidence
 
 
 def capacity_control_suite(binary, directory, *, require_replacement_restart=False):

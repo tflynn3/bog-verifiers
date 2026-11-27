@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -14,7 +14,8 @@ import verify
 from release_gate import (CAPACITY_WORK_BUDGET, FIXTURE_ROOT_CLEANUP, MEMORY_LIMIT, POST_RESTORE_ACK_CRASH,
                           record_fixture_root_cleanup, validate_combined_parity,
                           validate_backfill_timelines, validate_budget, validate_budget_trials,
-                          validate_capacity_observations, validate_cutover_control, validate_memory_peak,
+                          validate_capacity_observations, validate_control_scope, validate_cutover_control,
+                          validate_memory_peak,
                           validate_cutover_parity, validate_durability, validate_no_oom_kills,
                           validate_replacement_restart, validate_restart_compaction)
 
@@ -47,6 +48,63 @@ def buildable_candidate(root):
 
 
 class GateTest(unittest.TestCase):
+    def test_native_control_scope_requires_passing_case_and_every_hidden_operation(self):
+        hidden = dict(status=404, start=404, retire=404)
+        evidence = dict(fixture_removed=True, loopback_enabled_status=200)
+        for label in ("loopback_default", "loopback_disabled", "wildcard_default", "wildcard_enabled"):
+            evidence[label] = dict(routes=hidden.copy(), exit_code=0)
+        processes = [dict(expected_ready=ready, exit_code=0, ready_ms=1)
+                     for ready in (True, True, True, True, None)]
+        case = dict(status="pass", evidence=evidence, processes=processes)
+        report = {"cases": {"control_scope": case}}
+        validate_control_scope(report)
+        with self.assertRaisesRegex(verify.Rejected, "missing required case control_scope"):
+            validate_control_scope({"cases": {}})
+        case["status"] = "skip"
+        with self.assertRaisesRegex(verify.Rejected, "control_scope did not pass"):
+            validate_control_scope(report)
+        case["status"] = "pass"
+        for label in ("loopback_default", "loopback_disabled", "wildcard_default", "wildcard_enabled"):
+            for action in hidden:
+                with self.subTest(label=label, action=action):
+                    evidence[label]["routes"][action] = 405
+                    with self.assertRaisesRegex(verify.Rejected, label):
+                        validate_control_scope(report)
+                    evidence[label]["routes"][action] = 404
+        evidence["wildcard_enabled"] = dict(routes={}, exit_code=1)
+        with self.assertRaisesRegex(verify.Rejected, "process teardown"):
+            validate_control_scope(report)
+        processes[-1].update(exit_code=1, ready_ms=None)
+        validate_control_scope(report)
+
+    def test_control_scope_skips_candidate_without_opt_in_route(self):
+        with tempfile.TemporaryDirectory() as workspace, patch.object(verify, "run_bog") as run_bog:
+            bog = run_bog.return_value.__enter__.return_value
+            bog.request.return_value = (404, b"")
+            binary, directory = ROOT / "bog", Path(workspace) / "probe"
+            self.assertIsInstance(verify.control_scope_suite(binary, directory), verify.SuiteSkipped)
+            run_bog.assert_called_once_with(binary, directory / "store", capacity=True)
+            bog.stop.assert_called_once()
+
+    def test_control_scope_probes_committed_cutoff_and_issued_cursor(self):
+        with tempfile.TemporaryDirectory() as workspace, patch.object(verify, "run_bog") as run_bog, \
+                patch.object(verify, "expect_page", return_value="issued+cursor"):
+            enabled = Mock()
+            enabled.request.return_value = (200, b"{}")
+            hidden = Mock()
+            hidden.request.return_value = (404, b"")
+            hidden.process.returncode = 0
+            hidden.startup_seconds = 0.01
+            run_bog.return_value.__enter__.side_effect = [enabled, hidden, hidden, hidden, hidden]
+            report = verify.control_scope_suite(ROOT / "bog", Path(workspace) / "probe")
+            self.assertEqual(report["loopback_enabled_status"], 200)
+            self.assertEqual(hidden.request.call_count, 12)
+            hidden.request.assert_any_call("POST", "/_capacity/compaction?action=start&cutoff=2")
+            hidden.request.assert_any_call("POST", "/_capacity/compaction?action=retire&cursor=issued%2Bcursor")
+            self.assertEqual(run_bog.call_args_list[2].kwargs["capacity"], "0")
+            self.assertEqual(run_bog.call_args_list[-1].kwargs,
+                             dict(host="0.0.0.0", capacity=True, ready=None))
+
     def test_combined_parity_requires_candidate_bound_typed_crash_evidence(self):
         identity = dict(schema_version=1, revision="a" * 40, fixture="linux-release-v1", binary_sha256="b" * 64)
         point = dict(Generation=[1] + [0] * 31, NextOrdinal=3, CoveredOffset=100, CommittedEnd=200)

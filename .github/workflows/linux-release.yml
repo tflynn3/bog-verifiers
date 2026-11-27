@@ -192,7 +192,7 @@ jobs:
           )
           capacity() (
             python3 -B verifiers/release_gate.py control "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" \
-              --require-replacement-restart \
+              --require-replacement-restart --require-control-scope \
               2>&1 | tee "$EVIDENCE/control.log" || exit
             case "$(jq -er '.cases.capacity_control.status' "$EVIDENCE/control.json")" in
               skip) echo "Live capacity skipped. See control.json."; exit 0 ;;
@@ -318,7 +318,7 @@ jobs:
               --gate-revision "$(git -C ../crash-gate rev-parse HEAD)" \
               --capacity-validation-revision "$CAPACITY_VALIDATION_REVISION" \
               --require-fixture-root-cleanup --require-fixed-boundaries --require-backfill-timelines \
-              --require-capacity-observations --require-replacement-restart
+              --require-capacity-observations --require-replacement-restart --require-control-scope
           } 2>&1 | tee "$EVIDENCE/validation.log"
 
       - name: Publish release evidence
@@ -356,12 +356,12 @@ jobs:
               if $amd64.arch == "amd64" and $arm64.arch == "arm64" and
               ([$amd64, $arm64] | all(.schema_version == 1 and .current_observations == true and
                 .revision == $revision and .fixture == $fixture and .crash_gate_revision == $gate and
-                .post_restore_ack_crash == true and .replacement_restart == true and
+                .post_restore_ack_crash == true and .replacement_restart == true and .control_scope == true and
                 .capacity_validation_revision == $capacity_validation and
                 (.binary_sha256 | test("^[0-9a-f]{64}$")))) and
               $amd64.binary_sha256 == $amd64_digest and $arm64.binary_sha256 == $arm64_digest and
               $amd64_digest != $arm64_digest then
                 {revision: $revision, fixture: $fixture, crash_gate_revision: $gate,
-                  capacity_validation_revision: $capacity_validation,
+                  capacity_validation_revision: $capacity_validation, control_scope: true,
                   binary_sha256: {amd64: $amd64_digest, arm64: $arm64_digest}}
               else error("native qualification identities or verdicts did not match") end'

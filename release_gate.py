@@ -9,7 +9,7 @@ import re
 import tempfile
 
 from verify import (PROCESS_LOGS, REPLACEMENT_WORK_BUDGET, SECOND, Rejected, SuiteSkipped,
-                    budget_probe_rows, capacity_control_suite, check, file_sha256,
+                    budget_probe_rows, capacity_control_suite, check, control_scope_suite, file_sha256,
                     fixed_budget_replay_suite, oracle, ordered_sha256, replacement_fixture, unique_fields)
 
 
@@ -24,6 +24,7 @@ FIXTURE_ROOT_CLEANUP = "fixture_root_cleanup"
 POST_RESTORE_ACK_CRASH = "post_restore_ack_crash"
 REPLACEMENT_RESTART = "replacement_restart"
 FIXED_BUDGET_REPLAY = "fixed_budget_replay"
+CONTROL_SCOPE = "control_scope"
 
 
 def identity(binary, revision, fixture):
@@ -551,6 +552,32 @@ def validate_cutover_control(case):
           "control: missing process teardown or unexpected candidate exit")
 
 
+def validate_control_scope(report):
+    case = passing_case(report, "control", CONTROL_SCOPE)
+    evidence = case["evidence"]
+    check(evidence.get("fixture_removed") is True and
+          integer(evidence.get("loopback_enabled_status"), 200, 200),
+          "control scope: missing loopback opt-in or fixture cleanup evidence")
+    actions = {"status", "start", "retire"}
+    for label in ("loopback_default", "loopback_disabled", "wildcard_default", "wildcard_enabled"):
+        scope = evidence.get(label) or {}
+        code, routes = scope.get("exit_code"), scope.get("routes")
+        hidden = (integer(code, 0, 0) and isinstance(routes, dict) and routes.keys() == actions and
+                  all(integer(status, 404, 404) for status in routes.values()))
+        refused = label == "wildcard_enabled" and integer(code, 1, 1) and routes == {}
+        check(hidden or refused,
+              f"control scope: {label} must hide status, start, and retire or refuse wildcard opt-in")
+    processes = case.get("processes")
+    wildcard_exit = evidence["wildcard_enabled"]["exit_code"]
+    check(isinstance(processes, list) and len(processes) == 5 and
+          all(proc.get("expected_ready") is ready and integer(proc.get("exit_code"), code, code) and
+              (proc.get("ready_ms") is None if code == 1 else
+               type(proc.get("ready_ms")) in (int, float) and proc["ready_ms"] >= 0)
+              for proc, ready, code in zip(processes, (True, True, True, True, None),
+                                           (0, 0, 0, 0, wildcard_exit))),
+          "control scope: missing listener readiness or process teardown")
+
+
 def validate_terminal_replay(evidence, label):
     terminal = evidence.get("terminal_sha256")
     check(isinstance(terminal, str) and re.fullmatch(r"[0-9a-f]{64}", terminal) and
@@ -592,7 +619,7 @@ def validate_replacement_restart(report, control):
 
 def validate(directory, expected, *, require_fixture_root_cleanup=False, require_fixed_boundaries=False,
              require_backfill_timelines=False, require_capacity_observations=False, cutover_arch=None,
-             require_replacement_restart=False):
+             require_replacement_restart=False, require_control_scope=False):
     if cutover_arch:
         expected = {**expected, "arch": cutover_arch}
     statuses = (directory / "producers.txt").read_text().splitlines()
@@ -620,6 +647,8 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
         validate_cutover_control(control_case)
     if require_replacement_restart:
         validate_replacement_restart(control_report, control)
+    if require_control_scope:
+        validate_control_scope(control_report)
     published = control["published"]
     expanded = "fresh_rows" in control
     covered, committed = (4, 5) if expanded else (3, 3)
@@ -642,11 +671,13 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
               "control: incomplete cursor evidence across compaction and restart")
 
 
-def produce_control(binary, directory, expected, *, require_replacement_restart=False):
+def produce_control(binary, directory, expected, *, require_replacement_restart=False, require_control_scope=False):
     suites = [("capacity_control", partial(capacity_control_suite,
                                           require_replacement_restart=require_replacement_restart))]
     if require_replacement_restart:
         suites.append((FIXED_BUDGET_REPLAY, fixed_budget_replay_suite))
+    if require_control_scope:
+        suites.append((CONTROL_SCOPE, control_scope_suite))
     processes = []
     token = PROCESS_LOGS.set((directory, processes))
     cases = {}
@@ -691,6 +722,7 @@ def main():
     parser.add_argument("--require-backfill-timelines", action="store_true")
     parser.add_argument("--require-capacity-observations", action="store_true")
     parser.add_argument("--require-replacement-restart", action="store_true")
+    parser.add_argument("--require-control-scope", action="store_true")
     args = parser.parse_args()
     try:
         directory = args.directory.resolve()
@@ -699,7 +731,8 @@ def main():
         native_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
         if args.action == "control":
             produce_control(binary, directory, {**expected, "arch": native_arch},
-                            require_replacement_restart=args.require_replacement_restart)
+                            require_replacement_restart=args.require_replacement_restart,
+                            require_control_scope=args.require_control_scope)
         elif args.action == "record-cleanup":
             check(args.fixture_parent is not None, "durability fixture parent is required")
             record_fixture_root_cleanup(directory, expected, args.fixture_parent)
@@ -717,6 +750,8 @@ def main():
                            args.require_backfill_timelines, args.require_capacity_observations))
             check(not args.require_replacement_restart or cutover,
                   "replacement restart evidence requires strict native cutover validation")
+            check(not args.require_control_scope or cutover,
+                  "control scope evidence requires strict native cutover validation")
             if cutover or args.binary_sha256 is not None:
                 check(expected["binary_sha256"] == args.binary_sha256,
                       "candidate binary SHA-256 differs from the native build pin")
@@ -731,7 +766,8 @@ def main():
                      require_backfill_timelines=args.require_backfill_timelines,
                      require_capacity_observations=args.require_capacity_observations,
                      cutover_arch=args.arch if cutover else None,
-                     require_replacement_restart=args.require_replacement_restart)
+                     require_replacement_restart=args.require_replacement_restart,
+                     require_control_scope=args.require_control_scope)
             qualification = {**expected, "arch": args.arch}
             if cutover:
                 qualification["current_observations"] = True
@@ -740,6 +776,8 @@ def main():
                 qualification[POST_RESTORE_ACK_CRASH] = True
             if args.require_replacement_restart:
                 qualification[REPLACEMENT_RESTART] = True
+            if args.require_control_scope:
+                qualification[CONTROL_SCOPE] = True
             verdict.write_text(json.dumps(qualification) + "\n")
     except (Rejected, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         parser.exit(1, f"release evidence: {exc}\n")

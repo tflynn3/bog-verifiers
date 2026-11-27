@@ -393,7 +393,16 @@ the issuing budget. The low-budget opening may cleanly refuse the request
 before issuing a cursor. The higher-budget walk must issue and exhaust.
 Qualification also requires the architecture and lifecycle tests to pass.
 Historical report validation remains available without
-`--require-replacement-restart`.
+`--require-replacement-restart` and `--require-control-scope`.
+
+Both native jobs require a passing `control_scope` case in `control.json`.
+The probe checks that the environment opt-in exposes status on the IPv4
+loopback listener. It then requires HTTP 404 for status, start at a valid
+committed cutoff, and retirement with an issued cursor on default and
+explicitly disabled loopback listeners, as well as on the wildcard listener.
+Wildcard opt-in can either hide all three operations or refuse startup with
+exit status 1. An older binary that returns HTTP 404 to the enabled loopback
+probe records a skip, which is insufficient for native qualification.
 
 The release gate checks the binary's ELF machine against the native runner
 and binds each mandatory report to that runner's binary digest, revision,
