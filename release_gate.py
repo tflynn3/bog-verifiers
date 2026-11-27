@@ -462,6 +462,10 @@ def validate_cutover_parity(report, evidence):
     check(integer(evidence.get("reopened_restore_append_status"), 204, 204) and
           integer(evidence.get("reopened_restore_restart_rows"), 8, 8),
           "parity: missing durable append after writable restore reopen")
+    crash = evidence.get("reopened_restore_crash")
+    check(isinstance(crash, dict) and crash.get("sigkill_requested") is True and
+          integer(crash.get("exit_signal"), int(signal.SIGKILL), int(signal.SIGKILL)),
+          "parity: missing requested and observed SIGKILL after writable restore append")
 
 
 def validate_cutover_control(case):

@@ -1,15 +1,24 @@
 diff --git a/verify/release/admission.go b/verify/release/admission.go
-index 801486d..c0de1f9 100644
+index 801486d..4b3c430 100644
 --- a/verify/release/admission.go
 +++ b/verify/release/admission.go
-@@ -224 +224,5 @@ func serve(ctx context.Context, binary string, client *http.Client, flags []stri
+@@ -224 +224,14 @@ func serve(ctx context.Context, binary string, client *http.Client, flags []stri
 -func serveDirectory(ctx context.Context, binary, dir string, client *http.Client, flags []string, check func(string) error) (err error) {
 +func serveDirectory(ctx context.Context, binary, dir string, client *http.Client, flags []string, check func(string) error) error {
 +	return serveDirectoryWithEnv(ctx, binary, dir, client, flags, false, check)
 +}
 +
-+func serveDirectoryWithEnv(ctx context.Context, binary, dir string, client *http.Client, flags []string, capacityEnv bool, check func(string) error) (err error) {
-@@ -233,0 +238,8 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
++func serveDirectoryWithEnv(ctx context.Context, binary, dir string, client *http.Client, flags []string, capacityEnv bool, check func(string) error) error {
++	return serveDirectoryWithCrash(ctx, binary, dir, client, flags, capacityEnv, nil, check)
++}
++
++type crashProof struct {
++	Requested bool `json:"sigkill_requested"`
++	Signal    int  `json:"exit_signal,omitempty"`
++}
++
++func serveDirectoryWithCrash(ctx context.Context, binary, dir string, client *http.Client, flags []string, capacityEnv bool, crash *crashProof, check func(string) error) (err error) {
+@@ -233,0 +247,8 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
 +	for _, entry := range cmd.Environ() {
 +		if !strings.HasPrefix(entry, "BOG_CAPACITY_CONTROL=") {
 +			cmd.Env = append(cmd.Env, entry)
@@ -18,8 +27,48 @@ index 801486d..c0de1f9 100644
 +	if capacityEnv {
 +		cmd.Env = append(cmd.Env, "BOG_CAPACITY_CONTROL=1")
 +	}
+@@ -238 +259,2 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
+-	cmd.Cancel = func() error {
++	killGroup := func(afterProbe bool) error {
++		var requestErr error
+@@ -239,0 +262,6 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
++			if afterProbe {
++				requestErr = ctx.Err()
++				if requestErr == nil {
++					requestErr = requireCandidateRunning(cmd.Process.Pid)
++				}
++			}
+@@ -240,0 +269,3 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
++			if afterProbe && requestErr == nil && killErr == nil {
++				crash.Requested = true
++			}
+@@ -244,0 +276,3 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
++		if afterProbe && !crash.Requested {
++			return errors.Join(errors.New("could not request SIGKILL of the live candidate after the probe"), requestErr, killErr)
++		}
+@@ -246,0 +281 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
++	cmd.Cancel = func() error { return killGroup(false) }
+@@ -273,3 +308,8 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
+-				if status, ok := exited.Sys().(syscall.WaitStatus); ok && status.Signal() == syscall.SIGKILL {
+-					err = errors.Join(err, killErr, observeErr)
+-					return
++				if status, ok := exited.Sys().(syscall.WaitStatus); ok && status.Signaled() {
++					if crash != nil {
++						crash.Signal = int(status.Signal())
++					}
++					if status.Signal() == syscall.SIGKILL {
++						err = errors.Join(err, killErr, observeErr)
++						return
++					}
+@@ -306 +346,5 @@ func serveDirectory(ctx context.Context, binary, dir string, client *http.Client
+-			return check(base)
++			if err := check(base); err != nil || crash == nil {
++				return err
++			}
++			// The callback confirmed the append. Request the crash before cleanup.
++			return killGroup(true)
 diff --git a/verify/release/parity_linux_test.go b/verify/release/parity_linux_test.go
-index 2620d5d..4571782 100644
+index 2620d5d..b757e4d 100644
 --- a/verify/release/parity_linux_test.go
 +++ b/verify/release/parity_linux_test.go
 @@ -12,0 +13 @@ import (
@@ -47,14 +96,15 @@ index 2620d5d..4571782 100644
 +			RestartRows  int `json:"restart_rows"`
 +		}{proof.LegacyRows, proof.LegacyAppendStatus, proof.LegacyRestartRows}, nil))
 +	}
-@@ -57,5 +76,25 @@ type parityProof struct {
+@@ -57,5 +76,26 @@ type parityProof struct {
 -	Point          backup.Point `json:"verified_point"`
 -	CapturedRows   int          `json:"captured_rows"`
 -	PostRestore204 bool         `json:"post_restore_204"`
 -	PostAppendRows int          `json:"post_append_rows"`
 -	RestartRows    int          `json:"restart_rows"`
-+	ReopenedRestoreAppendStatus int `json:"reopened_restore_append_status,omitempty"`
-+	ReopenedRestoreRestartRows  int `json:"reopened_restore_restart_rows,omitempty"`
++	ReopenedRestoreCrash        *crashProof `json:"reopened_restore_crash,omitempty"`
++	ReopenedRestoreAppendStatus int         `json:"reopened_restore_append_status,omitempty"`
++	ReopenedRestoreRestartRows  int         `json:"reopened_restore_restart_rows,omitempty"`
 +
 +	FixtureRemoved           bool              `json:"fixture_removed"`
 +	CorruptRestorePreserved  bool              `json:"corrupt_restore_preserved,omitempty"`
@@ -78,13 +128,13 @@ index 2620d5d..4571782 100644
 +	Replacement              *replacementProof `json:"live_replacement,omitempty"`
 +	PostAppendRows           int               `json:"post_append_rows"`
 +	RestartRows              int               `json:"restart_rows"`
-@@ -80,5 +118,0 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -80,5 +119,0 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -	dir, point, err := makeRestoredFixture(ctx, root, rows)
 -	if err != nil {
 -		return proof, fmt.Errorf("prepare verified restore: %w", err)
 -	}
 -	proof.Point = point
-@@ -90,0 +125,160 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -90,0 +126,160 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 +	legacy := filepath.Join(root, "legacy")
 +	if err := os.Mkdir(legacy, 0700); err != nil {
 +		return proof, err
@@ -245,16 +295,16 @@ index 2620d5d..4571782 100644
 +			return proof, err
 +		}
 +	}
-@@ -94 +288,4 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -94 +289,4 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
 +	err = serveDirectory(ctx, binary, dir, client, restoreFlags, func(base string) error {
 +		if err := checkControlHidden(base); err != nil {
 +			return err
 +		}
-@@ -99 +296 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -99 +297 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -		if err := checkRestoredWalks(ctx, pager, rows); err != nil {
 +		if err := checkQueries(base, rows); err != nil {
-@@ -102,0 +300,19 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -102,0 +301,19 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 +		want, err := parityRowsFor(rows, "")
 +		if err != nil {
 +			return err
@@ -274,7 +324,7 @@ index 2620d5d..4571782 100644
 +		if err != nil {
 +			return err
 +		}
-@@ -108 +324,6 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -108 +325,6 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
 +		if err := requireReplayedRestore(ctx, pager, first.NextCursor, want[3:], saved); err != nil {
 +			return err
@@ -282,13 +332,13 @@ index 2620d5d..4571782 100644
 +		proof.ReplayedRestorePage = true
 +		proof.HeldRestoreRows = len(want)
 +		if err := checkQueries(base, augmented); err != nil {
-@@ -125 +346,4 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -125 +347,4 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -	err = serveDirectory(ctx, binary, dir, client, flags, func(base string) error {
 +	err = serveDirectory(ctx, binary, dir, client, restoreFlags, func(base string) error {
 +		if err := checkControlHidden(base); err != nil {
 +			return err
 +		}
-@@ -128,0 +353,35 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -128,0 +354,36 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 +		proof.StaleCursorRejected = true
 +		if err := checkQueries(base, augmented); err != nil {
 +			return err
@@ -306,10 +356,11 @@ index 2620d5d..4571782 100644
 +		return proof, err
 +	}
 +
-+	// A reopened restore must still authorize writes. serveDirectory kills
-+	// the process after each callback, so the final walk uses crash recovery.
++	// A reopened restore must still authorize writes and survive a crash
++	// immediately after acknowledging the append.
 +	reopenedAppend := row{rows[1].TS, "append after writable restore reopen [match]"}
-+	if err := serveDirectory(ctx, binary, dir, client, restoreFlags, func(base string) error {
++	proof.ReopenedRestoreCrash = &crashProof{}
++	if err := serveDirectoryWithCrash(ctx, binary, dir, client, restoreFlags, false, proof.ReopenedRestoreCrash, func(base string) error {
 +		var ingestErr error
 +		proof.ReopenedRestoreAppendStatus, ingestErr = ingest(ctx, client, base, []row{reopenedAppend})
 +		if ingestErr != nil || proof.ReopenedRestoreAppendStatus != http.StatusNoContent {
@@ -317,26 +368,26 @@ index 2620d5d..4571782 100644
 +		}
 +		return nil
 +	}); err != nil {
-+		return proof, err
++		return proof, fmt.Errorf("append and crash writable restore: %w", err)
 +	}
 +	reopenedRows := append(slices.Clone(augmented), reopenedAppend)
 +	if err := serveDirectory(ctx, binary, dir, client, restoreFlags, func(base string) error {
 +		if err := checkUnpaged(ctx, client, base, reopenedRows); err != nil {
 +			return err
 +		}
-@@ -133 +392 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -133 +394 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -		if err := checkRestoredWalks(ctx, pager, augmented); err != nil {
 +		if err := checkRestoredWalks(ctx, pager, reopenedRows); err != nil {
-@@ -136 +395 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -136 +397 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -		proof.RestartRows = len(augmented)
 +		proof.ReopenedRestoreRestartRows = len(reopenedRows)
-@@ -138 +397,4 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -138 +399,4 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -	})
 +	}); err != nil {
 +		return proof, fmt.Errorf("restart after writable restore reopen append: %w", err)
 +	}
 +	current, err := os.ReadFile(metadataPath)
-@@ -140 +402,201 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
+@@ -140 +404,201 @@ func restoredParity(ctx context.Context, binary, root string) (proof parityProof
 -		err = fmt.Errorf("restart with acknowledged post-restore write: %w", err)
 +		return proof, err
 +	}
@@ -539,7 +590,7 @@ index 2620d5d..4571782 100644
 +	})
 +	if err == nil {
 +		proof.Status = "pass"
-@@ -147,5 +609,3 @@ func checkRestoredWalks(ctx context.Context, pager *releasePager, appendOrder []
+@@ -147,5 +611,3 @@ func checkRestoredWalks(ctx context.Context, pager *releasePager, appendOrder []
 -		var want []row
 -		for _, r := range appendOrder {
 -			if strings.Contains(r.Line, filter) {
@@ -548,9 +599,9 @@ index 2620d5d..4571782 100644
 +		want, err := parityRowsFor(appendOrder, filter)
 +		if err != nil {
 +			return err
-@@ -153 +612,0 @@ func checkRestoredWalks(ctx context.Context, pager *releasePager, appendOrder []
+@@ -153 +614,0 @@ func checkRestoredWalks(ctx context.Context, pager *releasePager, appendOrder []
 -		slices.SortStableFunc(want, func(a, b row) int { return strings.Compare(a.TS, b.TS) })
-@@ -164,2 +623,5 @@ func checkRestoredWalk(ctx context.Context, pager *releasePager, filter string,
+@@ -164,2 +625,5 @@ func checkRestoredWalk(ctx context.Context, pager *releasePager, filter string,
 -	seen := make(map[string]bool)
 -	cursor := ""
 +	return resumeRestoredWalk(ctx, pager, filter, limit, want, "")
@@ -558,11 +609,65 @@ index 2620d5d..4571782 100644
 +
 +func resumeRestoredWalk(ctx context.Context, pager *releasePager, filter string, limit int, want []row, cursor string) error {
 +	seen := map[string]bool{cursor: true}
-@@ -172,2 +634,2 @@ func checkRestoredWalk(ctx context.Context, pager *releasePager, filter string,
+@@ -172,2 +636,2 @@ func checkRestoredWalk(ctx context.Context, pager *releasePager, filter string,
 -		if n > limit {
 -			return fmt.Errorf("page %d exceeded row limit", number)
 +		if n > limit || (len(want) > 0 && n == 0) {
 +			return fmt.Errorf("page %d: invalid row count %d with limit %d and %d remaining", number, n, limit, len(want))
+diff --git a/verify/release/process_linux.go b/verify/release/process_linux.go
+index 13f66b2..bb696a1 100644
+--- a/verify/release/process_linux.go
++++ b/verify/release/process_linux.go
+@@ -3,0 +4 @@ import (
++	"errors"
+@@ -12 +13,18 @@ func waitCandidate(cmd *exec.Cmd, cleanGroup func() error) (waitErr, observeErr
+-	const pid = 1       // Linux waitid P_PID
++	_, observeErr = candidateExited(cmd.Process.Pid, 0)
++	cleanGroup() // The teardown caller receives the cached cleanup result.
++	return cmd.Wait(), observeErr
++}
++
++func requireCandidateRunning(pid int) error {
++	exited, err := candidateExited(pid, syscall.WNOHANG)
++	if err != nil {
++		return err
++	}
++	if exited {
++		return errors.New("candidate exited before the requested SIGKILL")
++	}
++	return nil
++}
++
++func candidateExited(pid int, options int) (bool, error) {
++	const pidType = 1   // Linux waitid P_PID
+@@ -15,2 +33,2 @@ func waitCandidate(cmd *exec.Cmd, cleanGroup func() error) (waitErr, observeErr
+-		_, _, errno := syscall.Syscall6(syscall.SYS_WAITID, pid, uintptr(cmd.Process.Pid),
+-			uintptr(unsafe.Pointer(&info)), syscall.WEXITED|syscall.WNOWAIT, 0, 0)
++		_, _, errno := syscall.Syscall6(syscall.SYS_WAITID, pidType, uintptr(pid),
++			uintptr(unsafe.Pointer(&info)), uintptr(syscall.WEXITED|syscall.WNOWAIT|options), 0, 0)
+@@ -21 +39 @@ func waitCandidate(cmd *exec.Cmd, cleanGroup func() error) (waitErr, observeErr
+-			observeErr = fmt.Errorf("observe candidate exit: %w", errno)
++			return false, fmt.Errorf("observe candidate exit: %w", errno)
+@@ -23,2 +41,2 @@ func waitCandidate(cmd *exec.Cmd, cleanGroup func() error) (waitErr, observeErr
+-		cleanGroup() // The teardown caller receives the cached cleanup result.
+-		return cmd.Wait(), observeErr
++		// si_signo stays zero when a non-blocking wait finds no exit.
++		return *(*int32)(unsafe.Pointer(&info[0])) != 0, nil
+diff --git a/verify/release/process_other.go b/verify/release/process_other.go
+index c7a10ab..3801979 100644
+--- a/verify/release/process_other.go
++++ b/verify/release/process_other.go
+@@ -5 +5,4 @@ package main
+-import "os/exec"
++import (
++	"errors"
++	"os/exec"
++)
+@@ -11,0 +15,4 @@ func waitCandidate(cmd *exec.Cmd, cleanGroup func() error) (error, error) {
++
++func requireCandidateRunning(int) error {
++	return errors.New("requested crash verification requires Linux waitid")
++}
 diff --git a/verify/release/replacement_linux_test.go b/verify/release/replacement_linux_test.go
 new file mode 100644
 index 0000000..b369a7e

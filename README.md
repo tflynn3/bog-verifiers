@@ -312,8 +312,11 @@ Historical schema v1 parsing remains available without the current evidence flag
 
 Restored parity checks legacy WAL replay, append, and restart, then removes the original data and
 bundle and starts the candidate on the verified v1 restore. Ordinary queries
-and framed cursor walks check restored rows and exact parity after SIGKILL,
-including a second acknowledged append made after reopening the restore. Restored launches use the shipped control defaults.
+and framed cursor walks check restored rows and exact parity after restart.
+After the reopened restore acknowledges a second append with HTTP 204, the
+verifier requests SIGKILL of that live process and checks its reaped exit
+signal before restarting. Cutover qualification requires both observations
+and exact ordered replay of all eight rows. Restored launches use the shipped control defaults.
 The parity report counts six HTTP 404 responses across status, start, and
 retirement probes on restored startup and restart. When the operator CLI is available, a separate restored copy
 serves the default backup comparison. If `compare -help` advertises `-max-pages`,

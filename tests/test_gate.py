@@ -76,6 +76,7 @@ class GateTest(unittest.TestCase):
         parity = dict(fixture_removed=True, corrupt_restore_exit=1, restore_metadata_preserved=True,
                       held_restore_rows=6, replayed_restore_page=True, legacy_restart_unpaged=True,
                       restored_control_404_checks=6, reopened_restore_append_status=204,
+                      reopened_restore_crash=dict(sigkill_requested=True, exit_signal=9),
                       reopened_restore_restart_rows=8, legacy_rows=6, legacy_append_status=204,
                       legacy_restart_rows=7)
         ordinary = dict(reopened_rows=6, append_status=204, restart_rows=7)
@@ -87,6 +88,12 @@ class GateTest(unittest.TestCase):
                     validate_cutover_parity(report, parity)
         with self.assertRaisesRegex(verify.Rejected, "missing required case ordinary_wal_reopen"):
             validate_cutover_parity({"cases": {}}, parity)
+        for crash in (None, {"sigkill_requested": False, "exit_signal": 9},
+                      {"sigkill_requested": True}, {"sigkill_requested": True, "exit_signal": 15},
+                      {"sigkill_requested": True, "exit_signal": "9"}):
+            with self.subTest(crash=crash), patch.dict(parity, reopened_restore_crash=crash):
+                with self.assertRaisesRegex(verify.Rejected, "requested and observed SIGKILL"):
+                    validate_cutover_parity(report, parity)
         del parity["replayed_restore_page"]
         with self.assertRaisesRegex(verify.Rejected, "continuation replay"):
             validate_cutover_parity(report, parity)
