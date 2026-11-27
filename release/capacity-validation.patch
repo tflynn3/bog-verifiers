@@ -1,0 +1,39 @@
+diff --git a/bench/retained-history/cutover.go b/bench/retained-history/cutover.go
+index da5032e..f014f2c 100644
+--- a/bench/retained-history/cutover.go
++++ b/bench/retained-history/cutover.go
+@@ -114 +114 @@ func (r result) validateCutover(f fixture) error {
+-		if err := t.validateLiveMemory(f.MemoryBytes); err != nil {
++		if err := t.validateLiveMemory(*r.CgroupPeak); err != nil {
+@@ -195 +195 @@ func (t *backfillTimeline) validateLiveMemory(limit uint64) error {
+-			return errors.New("missing or out-of-limit live memory.current bytes")
++			return errors.New("missing or out-of-limit live memory.current bytes (outside the fixture cgroup peak)")
+diff --git a/bench/retained-history/cutover_test.go b/bench/retained-history/cutover_test.go
+index 44afb2c..bd8d686 100644
+--- a/bench/retained-history/cutover_test.go
++++ b/bench/retained-history/cutover_test.go
+@@ -104 +104,2 @@ func TestStrictCutoverReportProof(t *testing.T) {
+-		{"live bytes at cap", "", func(r *result, b *backfillTimeline) { *b.Samples[1].Memory.Bytes = r.Fixture.MemoryBytes }},
++		{"live bytes above peak", "fixture cgroup peak", func(r *result, b *backfillTimeline) { *b.Samples[1].Memory.Bytes = *r.CgroupPeak + 1 }},
++		{"live bytes at peak", "", func(r *result, b *backfillTimeline) { *b.Samples[1].Memory.Bytes = *r.CgroupPeak }},
+diff --git a/verify/release/capacity_cutover.go b/verify/release/capacity_cutover.go
+index c272091..668faa8 100644
+--- a/verify/release/capacity_cutover.go
++++ b/verify/release/capacity_cutover.go
+@@ -46,0 +47,3 @@ type backfillSample struct {
++	Memory *struct {
++		Bytes *uint64 `json:"bytes"`
++	} `json:"cgroup_memory_current"`
+@@ -79,0 +83,5 @@ func (r capacityEvidence) validateCutover() error {
++		for _, sample := range timeline.Samples {
++			if sample.Memory != nil && (sample.Memory.Bytes == nil || *sample.Memory.Bytes == 0 || *sample.Memory.Bytes > r.CgroupPeak) {
++				return fmt.Errorf("%s cutover backfill: memory.current sample outside the fixture cgroup peak", timeline.Pattern)
++			}
++		}
+diff --git a/verify/release/capacity_cutover_test.go b/verify/release/capacity_cutover_test.go
+index 8d23e8d..4614752 100644
+--- a/verify/release/capacity_cutover_test.go
++++ b/verify/release/capacity_cutover_test.go
+@@ -78,0 +79,2 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
++		{"live bytes at peak", `"event":"overlap"`, `"cgroup_memory_current":{"read_start_ns":26,"read_end_ns":29,"bytes":100000000},"event":"overlap"`, ""},
++		{"live bytes above peak", `"event":"overlap"`, `"cgroup_memory_current":{"read_start_ns":26,"read_end_ns":29,"bytes":100000001},"event":"overlap"`, "outside the fixture cgroup peak"},

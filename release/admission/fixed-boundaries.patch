@@ -1,5 +1,5 @@
 diff --git a/verify/release/budget_walk.go b/verify/release/budget_walk.go
-index b60a142..2276b16 100644
+index b60a142..bb81ad6 100644
 --- a/verify/release/budget_walk.go
 +++ b/verify/release/budget_walk.go
 @@ -12,4 +12 @@ import (
@@ -8,14 +8,22 @@ index b60a142..2276b16 100644
 -	budgetWalkDeadline = time.Minute
 -)
 +const budgetWalkDeadline = time.Minute
-@@ -30 +27,2 @@ type budgetWalkProof struct {
+@@ -30 +27,10 @@ type budgetWalkProof struct {
 -	SparseWalk sparseBudgetWalkProof `json:"sparse_walk"`
 +	SparseWalk    sparseBudgetWalkProof `json:"sparse_walk"`
++	TiedByteWalk  byteTrimmedTiedProof  `json:"tied_byte_walk"`
 +	DuplicateWalk budgetProbe           `json:"duplicate_walk"`
-@@ -42 +40 @@ type budgetFixture struct {
++}
++
++type byteTrimmedTiedProof struct {
++	budgetProbe
++	ResponseByteCap int `json:"response_byte_cap"`
++	FirstLimit      int `json:"first_limit"`
++	FirstRows       int `json:"first_rows"`
+@@ -42 +48 @@ type budgetFixture struct {
 -	seed, want              []row
 +	seed, want, afterIssue  []row
-@@ -60,5 +58,7 @@ type budgetProbe struct {
+@@ -60,5 +66,7 @@ type budgetProbe struct {
 -	Budget  int                 `json:"budget"`
 -	Outcome budgetProbeOutcome  `json:"outcome"`
 -	Pages   int                 `json:"pages"`
@@ -28,7 +36,7 @@ index b60a142..2276b16 100644
 +	AppendedRows int                 `json:"post_issuance_append_rows,omitempty"`
 +	ResumeLimit  int                 `json:"resume_limit,omitempty"`
 +	Failure      *budgetProbeFailure `json:"failure,omitempty"`
-@@ -169,6 +168,29 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
+@@ -169,6 +177,35 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
 -	tied, tiedErr := findBudgetWalk(ctx, client, budgetWalkMax, launch(0))
 -	fixture := sparseBudgetFixture()
 -	sparse, sparseErr := findSparseBudgetWalk(ctx, client, budgetWalkMax, fixture, launch(fixture.byteCap))
@@ -47,6 +55,17 @@ index b60a142..2276b16 100644
 +	sparse.afterIssue = []row{sparse.want[2], {"2020-01-01T00:00:01Z", "@backfill"}}
 +	sparseStats, sparseErr := requireBudgetBoundary(ctx, client, 314, sparse, launch(sparse.byteCap))
 +
++	// Four short ties force a byte cut after two rows with a row limit of four.
++	// The smaller resume limit must progress through the rest of the tie.
++	tiedBytes := budgetFixture{
++		want:       []row{{fixtureStart, "@last"}, {fixtureStart, "@tied"}, {fixtureStart, "@tied"}, {fixtureStart, "@next"}},
++		firstLimit: 4, resumeLimit: 1, firstRows: 2, byteCap: 96,
++	}
++	tiedBytes.seed = tiedBytes.want
++	tiedBytes.afterIssue = []row{tiedBytes.want[2], {fixtureStart, "@late"}}
++	tiedByteProbe, tiedByteErr := tryBudgetWalk(ctx, client, launch(tiedBytes.byteCap), 4096, tiedBytes)
++	tiedByteErr = errors.Join(tiedByteErr, requireBudgetOutcome(tiedByteProbe, probeExhausted))
++
 +	duplicate := tied
 +	duplicate.seed = []row{tied.want[0], tied.want[1], tied.want[0]}
 +	duplicate.want = duplicate.seed
@@ -59,15 +78,22 @@ index b60a142..2276b16 100644
 +	}
 +	if sparseStats.FirstCursorBudget > 0 {
 +		sparseProof.FirstRows = sparse.firstRows
-+	}
+@@ -176 +213,13 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
+-	return proof, errors.Join(tiedErr, sparseErr)
 +	proof := budgetWalkProof{
 +		budgetWalkStats: tiedStats,
 +		SparseWalk:      sparseProof,
 +		DuplicateWalk:   duplicateProbe,
-@@ -176 +198 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
--	return proof, errors.Join(tiedErr, sparseErr)
-+	return proof, errors.Join(tiedErr, sparseErr, duplicateErr)
-@@ -179,3 +201,19 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
++		TiedByteWalk: byteTrimmedTiedProof{
++			budgetProbe: tiedByteProbe, ResponseByteCap: tiedBytes.byteCap,
++			FirstLimit: tiedBytes.firstLimit,
++		},
++	}
++	if tiedByteProbe.Outcome == probeExhausted {
++		proof.TiedByteWalk.FirstRows = tiedBytes.firstRows
++	}
++	return proof, errors.Join(tiedErr, sparseErr, duplicateErr, tiedByteErr)
+@@ -179,3 +228,19 @@ func probeBudgetWalk(ctx context.Context, binary string, client *http.Client) (b
 -func findBudgetWalk(ctx context.Context, client *http.Client, maxBudget int, launch budgetLaunch) (budgetWalkStats, error) {
 -	// Equal timestamps and equal line lengths keep the fixture small while
 -	// making append order observable across both continuations.
@@ -90,26 +116,25 @@ index b60a142..2276b16 100644
 +
 +func tiedBudgetFixture() budgetFixture {
 +	// Equal timestamps and equal line lengths make append order observable.
-@@ -183 +221,5 @@ func findBudgetWalk(ctx context.Context, client *http.Client, maxBudget int, lau
+@@ -183 +248,5 @@ func findBudgetWalk(ctx context.Context, client *http.Client, maxBudget int, lau
 -	fixture := budgetFixture{seed: want, want: want, firstLimit: 1, resumeLimit: 1, firstRows: 1}
 +	return budgetFixture{seed: want, want: want, firstLimit: 1, resumeLimit: 1, firstRows: 1}
 +}
 +
 +func findBudgetWalk(ctx context.Context, client *http.Client, maxBudget int, launch budgetLaunch) (budgetWalkStats, error) {
 +	fixture := tiedBudgetFixture()
-@@ -255 +297,4 @@ func runBudgetWalk(ctx context.Context, raw *http.Client, base string, budget in
+@@ -255 +324,4 @@ func runBudgetWalk(ctx context.Context, raw *http.Client, base string, budget in
 -	return checkBudgetWalk(ctx, pager, budget, fixture), nil
 +	return checkBudgetWalk(ctx, pager, budget, fixture, func() error {
 +		_, err := ingest(ctx, raw, base, fixture.afterIssue)
 +		return err
 +	}), nil
-@@ -258 +303 @@ func runBudgetWalk(ctx context.Context, raw *http.Client, base string, budget in
+@@ -258,2 +330,2 @@ func runBudgetWalk(ctx context.Context, raw *http.Client, base string, budget in
 -func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture) budgetProbe {
-+func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture, appendRows func() error) budgetProbe {
-@@ -259 +304 @@ func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture) budgetProbe {
 -	probe := budgetProbe{Budget: budget, Outcome: probeIndeterminate}
++func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixture budgetFixture, appendRows func() error) budgetProbe {
 +	probe := budgetProbe{Budget: budget, Outcome: probeIndeterminate, ResumeLimit: fixture.resumeLimit}
-@@ -296,0 +342,8 @@ func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixtu
+@@ -295,0 +368,8 @@ func checkBudgetWalk(ctx context.Context, pager *releasePager, budget int, fixtu
 +		if number == 1 && len(fixture.afterIssue) > 0 {
 +			if err := appendRows(); err != nil {
 +				probe.Failure = &budgetProbeFailure{Budget: budget, Page: number, Limit: limit,

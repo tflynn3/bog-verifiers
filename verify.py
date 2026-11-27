@@ -866,7 +866,7 @@ def capacity_control_suite(binary, directory):
     augmented = [*rows, backfill, tail]
     fresh = oracle(augmented, 0, SECOND)
     retirement = {"status": "skip", "detail": "status omits retired_generation_pins"}
-    with run_bog(binary, store, flags=flags, capacity=True) as bog:
+    with run_bog(binary, store, flags=flags, capacity=not flags) as bog:
         empty = state(bog, "GET", f"{CAPACITY_PATH}?action=status&cutoff=0", probe=not flags)
         if empty is None:
             bog.stop()
@@ -939,7 +939,7 @@ def capacity_control_suite(binary, directory):
         bog.kill()
 
     with run_bog(binary, directory / "wildcard", host="0.0.0.0", ready=False,
-                 flags=flags, capacity=True) as bog:
+                 flags=flags, capacity=not flags) as bog:
         wildcard_exit = bog.process.returncode
         check(wildcard_exit == 1, f"capacity opt-in on wildcard exited with status {wildcard_exit}")
     with run_bog(binary, store) as bog:

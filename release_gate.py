@@ -197,6 +197,18 @@ def validate_capacity_observations(run, seed, label, cgroups):
                   not candidate.get("wait_error"), f"{label}: unexpected {lifetime} exit")
 
 
+def validate_memory_peak(timeline, peak, label, *, required=False):
+    observed_overlap = False
+    for sample in timeline["samples"]:
+        if "cgroup_memory_current" not in sample:
+            continue
+        memory = sample["cgroup_memory_current"]
+        check(isinstance(memory, dict) and not memory.get("error") and integer(memory.get("bytes"), 1, peak),
+              f"{label}: memory.current sample outside the fixture cgroup peak or unavailable")
+        observed_overlap |= sample["event"] == "overlap"
+    check(not required or observed_overlap, f"{label}: missing memory.current overlap sample")
+
+
 def validate_capacity(evidence, *, require_backfill_timelines=False, require_capacity_observations=False):
     check(isinstance(evidence, list) and len(evidence) == len(SEED_ROWS),
           "capacity: expected two fixture results")
@@ -242,12 +254,23 @@ def validate_capacity(evidence, *, require_backfill_timelines=False, require_cap
               integer(compaction.get("covered_rows"), seed + BATCH_ROWS, seed + BATCH_ROWS) and
               integer(compaction.get("committed_rows"), total, total), f"{label}: invalid compaction evidence")
         diagnostics = run["diagnostics"]
+        current = "cgroup_memory_limit_bytes" in run
         if require_capacity_observations:
-            validate_capacity_observations(run, seed, label, cgroups)
+            if current:
+                check(integer(run.get("cgroup_memory_limit_bytes"), MEMORY_LIMIT, MEMORY_LIMIT) and
+                      integer(run.get("cgroup_swap_max_bytes"), 0, 0) and
+                      integer(run.get("cgroup_oom_kill_count"), 0, 0) and
+                      run["cleanup"].get("store_removed") is True,
+                      f"{label}: incomplete kernel readbacks or fixture store cleanup")
+            else:
+                validate_capacity_observations(run, seed, label, cgroups)
         if require_backfill_timelines:
-            check(integer(fixture.get("query_work_budget"), 1), f"{label}: missing explicit query work budget")
+            check(current or integer(fixture.get("query_work_budget"), 1), f"{label}: missing explicit query work budget")
             check(integer(diagnostics.get("peak_sampled_checkpoint_staging_bytes"), 0),
                   f"{label}: missing peak checkpoint staging bytes")
+        for timeline in diagnostics.get("backfill_timelines", ()):
+            validate_memory_peak(timeline, run["cgroup_peak_memory_bytes"], label,
+                                 required=current and require_capacity_observations)
         if require_backfill_timelines or "backfill_timelines" in diagnostics:
             validate_backfill_timelines(diagnostics.get("backfill_timelines"), seed, compaction,
                                         require_pin_retirement=require_backfill_timelines)
@@ -286,7 +309,7 @@ def validate_budget_trials(walk, name, rows, budget):
           f"admission: unproven {name} budget boundary")
 
 
-def validate_budget(evidence, *, require_fixed_boundaries=False):
+def validate_budget(evidence, *, require_fixed_boundaries=False, require_tied_byte_walk=False):
     check(integer(evidence.get("http_status"), 503, 503) and
           integer(evidence.get("ndjson_rows"), 0, 0) and evidence.get("next_cursor") is False and
           integer(evidence.get("elapsed_ms"), 0, 1999), "admission: incomplete work budget rejection")
@@ -317,6 +340,13 @@ def validate_budget(evidence, *, require_fixed_boundaries=False):
               all(integer(duplicate.get(key), value, value) for key, value in
                   {"budget": 11, "pages": 3, "rows": 3, "post_issuance_append_rows": 2, "resume_limit": 1}.items()),
               "admission: incomplete duplicate-row walk")
+    if require_tied_byte_walk or "tied_byte_walk" in tied:
+        trimmed = tied.get("tied_byte_walk", {})
+        check(trimmed.get("outcome") == "exhausted" and "failure" not in trimmed and
+              all(integer(trimmed.get(key), value, value) for key, value in
+                  {"budget": 4096, "pages": 3, "rows": 4, "post_issuance_append_rows": 2, "resume_limit": 1,
+                   "response_byte_cap": 96, "first_limit": 4, "first_rows": 2}.items()),
+              "admission: incomplete tied byte-trimmed walk")
     check((require_fixed_boundaries or tied["rejected_budgets"] == tied["first_cursor_budget"] - 1) and
           all(integer(sparse.get(key), value, value) for key, value in
               {"response_byte_cap": 96, "first_limit": 4, "first_rows": 2, "resume_limit": 1}.items()),
@@ -448,7 +478,7 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
           set(statuses) == {f"{name} revision={expected['revision']} exit=0" for name in PRODUCERS},
           "missing, repeated or failing release producer status")
     validate_budget(case_evidence(directory, "admission", "work_budget", expected),
-                    require_fixed_boundaries=require_fixed_boundaries)
+                    require_fixed_boundaries=require_fixed_boundaries, require_tied_byte_walk=bool(cutover_arch))
     validate_durability(directory, expected, require_fixture_root_cleanup=require_fixture_root_cleanup)
     validate_capacity(case_evidence(directory, "capacity", "retained_history_capacity", expected),
                       require_backfill_timelines=require_backfill_timelines,
@@ -460,6 +490,8 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
     control = control_case["evidence"]
     if cutover_arch:
         validate_cutover_parity(parity)
+        check(parity.get("corrupt_restore_preserved") is True,
+              "parity: missing corrupt restore file preservation evidence")
         validate_cutover_control(control_case)
     published = control["published"]
     expanded = "fresh_rows" in control

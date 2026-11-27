@@ -19,6 +19,7 @@ env:
   FIXTURE: linux-release-v1
   BOG_REPOSITORY: tflynn3/bog
   TOOLING_REVISION: abefdb5dcdc1f8bbbecdc9c0cc7ab39b309a87db
+  CAPACITY_VALIDATION_REVISION: def96df01d2b7b21186d20848f8b2cfafc4db0c4
   ADMISSION_TOOLING_REVISION: 304749df78fe3dfaa75ce411efa34708269af659
   REVISION: ${{ inputs.revision }}
 
@@ -80,6 +81,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: ${{ env.BOG_REPOSITORY }}
+          ref: ${{ env.CAPACITY_VALIDATION_REVISION }}
+          path: capacity-validation
+          persist-credentials: false
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BOG_REPOSITORY }}
           ref: ${{ inputs.revision }}
           path: candidate
           persist-credentials: false
@@ -89,7 +97,7 @@ jobs:
           cp admission/verify/release/README.md "$EVIDENCE/fixture.md"
           cp candidate/verify/linux/README.md "$EVIDENCE/durability-fixture.md"
           cp candidate/bench/retained-history/README.md "$EVIDENCE/capacity-fixture.md"
-          cp verifiers/release/{fixed-budget,restored-parity}.patch "$EVIDENCE/"
+          cp verifiers/release/{fixed-budget,restored-parity,capacity-validation}.patch "$EVIDENCE/"
           cp verifiers/release/admission/fixed-boundaries.patch "$EVIDENCE/"
           printf 'tooling_revision=%s\nverifier_revision=%s\n' "$(git -C gate rev-parse HEAD)" \
             "$(git -C verifiers rev-parse HEAD)" | tee -a "$EVIDENCE/run.txt"
@@ -198,30 +206,30 @@ jobs:
             budget=$(PYTHONPATH="$GITHUB_WORKSPACE/verifiers" python3 -B -c \
               'from release_gate import CAPACITY_WORK_BUDGET; print(CAPACITY_WORK_BUDGET)') || exit
             "$producer" -help > "$EVIDENCE/capacity-help.txt" 2>&1 || exit
-            if ! grep -Eq '^[[:blank:]]*-query-work-budget([[:blank:]=]|$)' "$EVIDENCE/capacity-help.txt"; then
-              echo "The capacity producer must advertise -query-work-budget for Linux release qualification."
-              exit 1
+            budget_flags=()
+            if grep -Eq '^[[:blank:]]*-query-work-budget([[:blank:]=]|$)' "$EVIDENCE/capacity-help.txt"; then
+              budget_flags=(-query-work-budget "$budget")
             fi
             sudo -n systemd-run --quiet --wait --pipe --collect --expand-environment=no \
               --uid="$(id -u)" --gid="$(id -g)" -p 'Delegate=memory io' -p DelegateSubgroup=runner \
               -p RuntimeMaxSec=24min -p TimeoutStopSec=10s \
               /bin/bash -euo pipefail -c '
-                work=$1 evidence=$2 producer=$3 budget=$4
-                shift 4
+                work=$1 evidence=$2 producer=$3
+                shift 3
                 read -r unified </proc/self/cgroup
                 [[ "$unified" == 0::/*/runner ]]
                 group="/sys/fs/cgroup${unified#0::}"
                 parent="${group%/*}"
                 printf "+memory +io\n" > "$parent/cgroup.subtree_control"
                 {
-                  printf "capacity_mode=live\ncapacity_cgroup=%s\ncapacity_work_dir=%s\nquery_work_budget=%s\n" "$parent" "$work" "$budget"
+                  printf "capacity_mode=live\ncapacity_cgroup=%s\ncapacity_work_dir=%s\n" "$parent" "$work"
                   cat "$parent/cgroup.controllers" "$parent/cgroup.subtree_control"
                   findmnt --target "$work"
                   df -h "$work"
                 } | tee "$evidence/capacity-runner.txt"
                 exec "$producer" "$@" -mode live -cgroup-parent "$parent" \
-                  -query-work-budget "$budget" -work-dir "$work" -report "$evidence/capacity.json"
-              ' capacity "$work" "$EVIDENCE" "$producer" "$budget" "${common[@]}" || exit
+                  -work-dir "$work" -report "$evidence/capacity.json"
+              ' capacity "$work" "$EVIDENCE" "$producer" "${common[@]}" "${budget_flags[@]}" || exit
             exit "$control_status"
           )
           parity() (
@@ -246,15 +254,16 @@ jobs:
 
       - name: Validate reports and candidate identity
         if: always() && steps.build.outcome == 'success'
-        working-directory: gate
+        working-directory: capacity-validation
         timeout-minutes: 3
         run: |
           {
             failed=0
             sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
-            go run ./verify/release validate -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
+            go run ./verify/release validate -require-cutover -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
               -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
               -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
+            go run ./bench/retained-history -validate-cutover "$EVIDENCE/capacity.json" || failed=1
             if (( failed != 0 )); then exit "$failed"; fi
             python3 -B "$GITHUB_WORKSPACE/verifiers/release_gate.py" validate \
               "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --arch "$RELEASE_ARCH" \
@@ -273,6 +282,7 @@ jobs:
             (cd ../candidate && go test -race -count=1 ./internal/archtest ./verify/linux ./verify/release) || exit 1
             (cd ../admission && go test -race -count=1 ./verify/release -run 'BudgetWalk|FixedBudgetWire') || exit 1
             (cd ../candidate && go test -race -count=1 ./bench/retained-history) || exit 1
+            (cd ../capacity-validation && go test -count=1 ./verify/release ./bench/retained-history -run 'Cutover') || exit 1
             go test -race -count=1 ./verify/release ./verify/query-model
           } 2>&1 | tee "$EVIDENCE/verifier-race.log"
 

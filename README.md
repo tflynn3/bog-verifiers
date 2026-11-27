@@ -223,7 +223,12 @@ docker start -a "$container"
 
 Run harness regressions with `python3 -B -m unittest discover -s tests -v`.
 
-## Linux release qualification for #53
+## Linux release qualification for #53 and #70
+
+Storage owns writable recovery and checkpoint publication under #53.
+Query/HTTP owns the cursor progress contract under #70.
+Release Verification owns the native producers and validators.
+Core Architecture owns the registry and fitness companion.
 
 Dispatch **Linux release verification** from the verifier ref with the full
 composed Bog commit SHA. The workflow builds one clean Go 1.27.0 binary on
@@ -241,7 +246,11 @@ at 11. The sparse fixture must reject cleanly at 313 and exhaust at 314 with
 a 96-byte response cap and resume limit 1. The walks check exact row order,
 duplicate multiplicity, and snapshot membership after acknowledged appends
 between issuance and resume. Current reports record resume limit 1 for each
-successful tied, duplicate, and sparse boundary walk. Schema version 1 reports record the failure
+successful tied, duplicate, and sparse boundary walk. A separate tied
+fixture uses a 96-byte cap to trim the four-row request to two rows, then
+resumes at limit 1 after appending two more ties. The snapshot must exhaust
+in exactly three pages with the original four rows, including duplicates.
+Schema version 1 reports record the failure
 page, budget, HTTP status, and diagnostic when issuance or continuation fails.
 The durability report must demonstrate prior-process cursor
 rejection and verify readiness and ingest in both filesystem retarget
@@ -256,10 +265,11 @@ Each proves an acknowledged append and continuation during compaction,
 publication at the exact newer cutoff, exhaustion of the held snapshot,
 and fresh visibility. The workflow builds the capacity producer from the
 dispatched revision so the capacity evidence owner supplies the launcher
-and observations. The workflow passes `-query-work-budget 134217728`.
-Each fixture records that value in `fixture.query_work_budget`,
-used for initial queries, continuations, and full restart walks, and the
-peak sampled checkpoint staging bytes. After each held walk exhausts, the
+and observations. The producer with a fixed query budget uses 2,147,483,648
+work units for live queries. When the producer advertises an explicit
+`-query-work-budget`, the workflow passes 134,217,728 and the legacy report
+records it in `fixture.query_work_budget`. The report records peak sampled
+checkpoint staging bytes. After each held walk exhausts, the
 producer retries its terminal page, records the positive predecessor pin count,
 and retires the capture with the continuation token that fetched that page.
 Qualification requires an observed zero after retirement and an exact fresh
@@ -274,19 +284,24 @@ The capacity producer handoff uses these additive fields in each schema v1 resul
 - `cgroup_peak_memory_bytes` and `diagnostics.cgroup_memory_events` come
   from `memory.peak` and `memory.events` before subtree removal, including
   on early exit. Qualification requires zero `oom_kill` and `oom_group_kill`
-  when the group counter is present.
+  when the group counter is present. The capacity tooling and release
+  validators read the same producer report file. A timed
+  `cgroup_memory_current.bytes` observation may equal the reported peak
+  for its fixture cgroup. A higher value rejects qualification.
 - `diagnostics.seed_progress` reports `acknowledged_rows`, `published_rows`,
   and the last observed checkpoint `generation`. Update each as acknowledgements
   and exact checkpoint publications arrive so an early exit preserves progress.
-- The capacity evidence owner keeps missing pin counters pending through the
+- Release Verification keeps missing pin counters pending through the
   drain deadline. An observed zero after explicit retirement completes the
   proof. An observation window ending with a missing counter preserves
   pending evidence for diagnosis.
-- The Linux Release owner supplies `diagnostics.candidates[].teardown_sigkill_sent`
+- Release Verification records `diagnostics.candidates[].teardown_sigkill_sent`
   from the teardown path for the reaped candidate lifetime. Record attribution
   only when the verifier's own forced termination accounts for the wait result.
   Qualification also checks that the candidate was live at teardown and that
-  the kernel recorded zero OOM kills.
+  the kernel recorded zero OOM kills. The current producer reports
+  clean startup and restart exits, kernel memory and swap limit readbacks,
+  and fixture store removal.
 
 Failed runs upload the producer report and logs when available. The workflow
 records the fixture-root check even when the producer exits with an error.
@@ -316,13 +331,15 @@ object.
 
 Candidate help gates the retained-history probes. The short Slipway suite
 skips when the candidate lacks `-enable-capacity-control`. With the flag
-available, it checks the disabled default, wildcard bind rejection, the
+available, it checks the disabled default, explicit flag-only loopback
+startup, wildcard bind rejection, the
 exact cutoff with an uncovered tail, held and fresh HTTP ordering, and
 restart parity. The manually dispatched release gate requires the
 composed revision and passing evidence on both native architectures.
 
 Current cutover qualification also requires the corrupt v1 suffix to exit
-with status 1, unchanged backup metadata after writable restart, and exact
+with status 1 and unchanged suffix, checkpoint manifest, and backup metadata.
+It also requires unchanged backup metadata after writable restart and exact
 replay of a byte-framed continuation across an acknowledged append. The
 short loopback fixture seeds a predecessor checkpoint before holding its
 cursor. It checks exact continuation replay after replacement, then retries

@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 import verify
 from release_gate import (CAPACITY_WORK_BUDGET, FIXTURE_ROOT_CLEANUP, MEMORY_LIMIT, record_fixture_root_cleanup,
                           validate_backfill_timelines, validate_budget, validate_budget_trials,
-                          validate_capacity_observations, validate_cutover_control,
+                          validate_capacity_observations, validate_cutover_control, validate_memory_peak,
                           validate_cutover_parity, validate_durability)
 
 README_ONLY = "7655ed627bccad30700b8de4b6f47c8d7d5d8579"
@@ -102,6 +102,16 @@ class GateTest(unittest.TestCase):
                 with self.assertRaisesRegex(verify.Rejected, reason):
                     validate_capacity_observations(run, seed, "fixture", set())
 
+    def test_timed_memory_sample_is_bounded_by_its_fixture_peak(self):
+        memory = dict(read_start_ns=26, read_end_ns=29, bytes=100_000_000)
+        timeline = {"samples": [dict(event="overlap", cgroup_memory_current=memory)]}
+        validate_memory_peak(timeline, 100_000_000, "fixture", required=True)
+        with self.assertRaisesRegex(verify.Rejected, "outside the fixture cgroup peak"):
+            validate_memory_peak(timeline, 99_999_999, "fixture", required=True)
+        validate_memory_peak({"samples": []}, 100_000_000, "historical")
+        with self.assertRaisesRegex(verify.Rejected, "missing memory.current overlap"):
+            validate_memory_peak({"samples": []}, 100_000_000, "fixture", required=True)
+
     def test_backfill_timeline_requires_handoff_and_drain_evidence(self):
         def timeline(pattern, held, cutoff, final, rows, generation):
             opening = dict(state="running", generation=generation - 1, covered_rows=held, committed_rows=cutoff)
@@ -178,7 +188,14 @@ class GateTest(unittest.TestCase):
         report = dict(http_status=503, ndjson_rows=0, next_cursor=False, elapsed_ms=1, fixed_budget_walk=tied)
         validate_budget(report, require_fixed_boundaries=True)
 
+        with self.assertRaisesRegex(verify.Rejected, "incomplete tied byte-trimmed walk"):
+            validate_budget(report, require_tied_byte_walk=True)
+        tied["tied_byte_walk"] = dict(tied["probes"][1], budget=4096, rows=4, response_byte_cap=96,
+                                    first_limit=4, first_rows=2)
+        validate_budget(report, require_fixed_boundaries=True, require_tied_byte_walk=True)
+
         for target, changes, reason in (
+            (tied["tied_byte_walk"], {"resume_limit": 4}, "incomplete tied byte-trimmed walk"),
             (tied["sparse_walk"], walk(315, 4), "expected sparse boundary at budget 314"),
             (tied["probes"][1], {"post_issuance_append_rows": 0}, "missing tied post-issuance appends"),
             (tied["duplicate_walk"], {"outcome": "issued_cursor"}, "incomplete duplicate-row walk"),
