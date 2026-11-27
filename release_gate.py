@@ -135,7 +135,9 @@ def validate_backfill_timelines(timelines, seed, published, *, require_pin_retir
                 check(acks["last_ack_ns"] <= fresh["elapsed_ns"],
                       f"{name}: last backfill acknowledgment is after fresh visibility")
         if require_wire_retry:
-            check(trial.get("terminal_retry_byte_identical") is True,
+            retry_key = ("terminal_page_bytes_equal" if "terminal_page_bytes_equal" in trial
+                         else "terminal_retry_byte_identical")
+            check(trial.get(retry_key) is True,
                   f"{name}: missing byte-identical terminal retry evidence")
     check(generations[0] < generations[1] == published["generation"],
           f"{label}: inconsistent replacement generations")
@@ -230,7 +232,14 @@ def validate_memory_peak(timeline, peak, label, *, required=False):
 
 
 def validate_restart_compaction(run, label):
-    published, reopened = run["compaction"], run.get("restart_compaction")
+    published = run["compaction"]
+    diagnostics = run.get("diagnostics", {})
+    if "restart" in diagnostics:
+        restart = diagnostics["restart"]
+        check(isinstance(restart, dict), f"{label}: missing restart proof")
+        reopened = restart.get("recovered_checkpoint")
+    else:
+        reopened = run.get("restart_compaction")
     check(isinstance(reopened, dict) and reopened.get("state") == "complete" and
           all(integer(reopened.get(key), published[key], published[key])
               for key in ("generation", "covered_rows", "committed_rows")),
@@ -537,8 +546,10 @@ def validate_restore_cycles(report):
               exported["generation"] not in generations and exported["suffix_sha256"] != source["suffix_sha256"],
               f"{label}: cycle {number} does not advance the preceding restore")
         check(all(integer(cycle.get(key), value, value) for key, value in dict(
-            append_status=204, held_rows=held, fresh_rows=held + 3, restart_rows=held + 3,
-            restored_rows=held + 3, default_control_status=404).items()),
+            append_status=204, rejected_append_status=400, held_rows=held, fresh_rows=held + 3,
+            restart_rows=held + 3, restored_rows=held + 3, default_control_status=404,
+            replacement_exit_signal=int(signal.SIGKILL), restart_append_exit_signal=int(signal.SIGKILL),
+            restart_append_replay_rows=held + 4).items()) and cycle.get("terminal_retry_byte_identical") is True,
             f"{label}: incomplete cycle {number} append, paging, restart or restore evidence")
         check(integer(cycle.get("pins_while_held"), 1) and integer(cycle.get("pins_after_release"), 0, 0),
               f"{label}: cycle {number} is missing measured predecessor pin drain")

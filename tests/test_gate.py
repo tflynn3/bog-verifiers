@@ -181,7 +181,9 @@ class GateTest(unittest.TestCase):
         initial, first, second = point(1, 100, 3, "a"), point(2, 200, 6, "b"), point(2, 300, 9, "c")
         cycles = [dict(input=source, exported=exported, held_rows=held,
                        fresh_rows=held + 3, restart_rows=held + 3, restored_rows=held + 3,
-                       append_status=204, default_control_status=404, pins_while_held=1, pins_after_release=0)
+                       append_status=204, rejected_append_status=400, terminal_retry_byte_identical=True,
+                       replacement_exit_signal=9, restart_append_exit_signal=9, restart_append_replay_rows=held + 4,
+                       default_control_status=404, pins_while_held=1, pins_after_release=0)
                   for source, exported, held in ((initial, first, 6), (first, second, 9))]
         evidence = dict(initial=initial, cycles=cycles, descriptor_ready_status=200, fixture_removed=True,
                         final_append_status=204, final_exit_signal=9, final_restart_rows=13)
@@ -198,6 +200,8 @@ class GateTest(unittest.TestCase):
             (evidence, {"final_exit_signal": "9"}, "final restart"),
             (evidence, {"descriptor_ready_status": 503}, "readiness"),
             (cycles[0], {"held_rows": True}, "incomplete cycle 1"),
+            (cycles[0], {"rejected_append_status": 204}, "incomplete cycle 1"),
+            (cycles[0], {"terminal_retry_byte_identical": False}, "incomplete cycle 1"),
             (cycles[1], {"restart_rows": 9}, "incomplete cycle 2"),
             (cycles[0], {"pins_while_held": 0}, "cycle 1 is missing measured predecessor pin drain"),
             (cycles[1], {"pins_after_release": 1}, "cycle 2 is missing measured predecessor pin drain"),
@@ -397,7 +401,7 @@ class GateTest(unittest.TestCase):
         with self.assertRaisesRegex(verify.Rejected, "missing byte-identical terminal retry"):
             validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True,
                                         require_wire_retry=True)
-        with patch.dict(scattered, terminal_retry_byte_identical=True):
+        with patch.dict(scattered, terminal_page_bytes_equal=True):
             validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True,
                                         require_wire_retry=True)
 
@@ -422,12 +426,18 @@ class GateTest(unittest.TestCase):
             published = dict(state="complete", generation=seed // 8192 + 1,
                              covered_rows=seed + 64, committed_rows=seed + 2048)
             validate_restart_compaction(dict(compaction=published, restart_compaction=published), str(seed))
+            run = dict(compaction=published, restart_compaction=published,
+                       diagnostics={"restart": {"recovered_checkpoint": published}})
+            validate_restart_compaction(run, str(seed))
             for reopened in (None, dict(published, generation=published["generation"] - 1),
                              dict(published, covered_rows=seed),
                              dict(published, committed_rows=published["covered_rows"])):
                 with self.subTest(seed=seed, reopened=reopened):
                     with self.assertRaisesRegex(verify.Rejected, "published generation, cutoff, and committed suffix"):
                         validate_restart_compaction(dict(compaction=published, restart_compaction=reopened), str(seed))
+                    with patch.dict(run["diagnostics"]["restart"], recovered_checkpoint=reopened):
+                        with self.assertRaisesRegex(verify.Rejected, "published generation, cutoff, and committed suffix"):
+                            validate_restart_compaction(run, str(seed))
 
     def test_native_release_requires_fixed_boundaries_and_snapshot_walks(self):
         def walk(budget, rows):

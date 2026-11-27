@@ -284,12 +284,11 @@ At both 196,608 and 393,216 seed rows under the 128 MiB cgroup limit, the
 capacity producer records clustered and scattered backfill timelines.
 Each proves an acknowledged append and continuation during compaction,
 publication at the exact newer cutoff, exhaustion of the held snapshot,
-and fresh visibility. The workflow builds the capacity producer and both
-strict consumers from the pinned `e53a856` checkout and records the
-producer patch with the evidence. The producer with a fixed query budget uses 2,147,483,648
-work units for live queries. When the producer advertises an explicit
-`-query-work-budget`, the workflow passes 134,217,728 and the legacy report
-records it in `fixture.query_work_budget`. The report records peak sampled
+and fresh visibility. The workflow builds the capacity producer, pinned query
+model, and both strict consumers from `93fe02f`. The strict release consumer
+also receives the query model and TCP handler event files and checks the
+replacement test's candidate identity. The producer uses 2,147,483,648
+work units for live queries. The report records peak sampled
 checkpoint staging bytes. After each held walk exhausts, the
 producer retries its terminal page, checks the NDJSON response byte for
 byte, records the positive predecessor pin count, and retires the capture
@@ -302,9 +301,9 @@ exhaustion. Each fixture also requires process, cgroup, and fixture root cleanup
 
 The capacity producer handoff uses these additive fields in each schema v1 result.
 
-- `cgroup.path` identifies the disposable fixture subtree. Read back
-  `cgroup.memory_max_bytes` and `cgroup.memory_swap_max_bytes` from the
-  kernel before launching the candidate. The two scales use distinct subtrees.
+- The producer uses distinct disposable subtrees for the two scales and
+  records `cgroup_memory_limit_bytes` and `cgroup_swap_max_bytes` from
+  kernel readbacks. Strict validation requires 128 MiB and disabled swap.
 - `cgroup_peak_memory_bytes` and `diagnostics.cgroup_memory_events` come
   from `memory.peak` and `memory.events` before subtree removal, including
   on early exit. Qualification requires zero `oom_kill` and `oom_group_kill`
@@ -315,20 +314,17 @@ The capacity producer handoff uses these additive fields in each schema v1 resul
   report and reject the same serialized fixtures with missing, null, or nonzero
   raw `oom_kill`, decreasing sample time, terminal replay before exhaustion,
   or a 128 MiB overlap observation with a 64 MiB final peak.
-- `diagnostics.seed_progress` reports `acknowledged_rows`, `published_rows`,
-  and the last observed checkpoint `generation`. Update each as acknowledgements
-  and exact checkpoint publications arrive so an early exit preserves progress.
+- `diagnostics.restart` records the same directory identity across process
+  lifetimes, the recovered checkpoint, and the exact acknowledged ledger
+  and WAL suffix counts.
 - Release Verification keeps missing pin counters pending through the
   drain deadline. An observed zero after explicit retirement completes the
   proof. An observation window ending with a missing counter preserves
   pending evidence for diagnosis.
-- Release Verification records `diagnostics.candidates[].teardown_sigkill_sent`
-  from the teardown path for the reaped candidate lifetime. Record attribution
-  only when the verifier's own forced termination accounts for the wait result.
-  Qualification also checks that the candidate was live at teardown and that
-  the kernel recorded zero OOM kills. The current producer reports
-  clean startup and restart exits, kernel memory and swap limit readbacks,
-  and fixture store removal.
+- `diagnostics.candidates` records clean exit and reaping for the startup
+  and restart processes. Qualification also checks that each process was
+  live at teardown, the kernel recorded zero OOM kills, and the fixture
+  store was removed.
 
 Failed runs upload the producer report and logs when available. The workflow
 records the fixture-root check even when the producer exits with an error.
@@ -381,7 +377,9 @@ response body and checks its reaped exit signal before restarting.
 Cutover qualification requires both observations
 and exact ordered replay of all eight rows. Restored launches use the shipped control defaults.
 The two-cycle tail-only fixture also kills each live replacement after
-the held walk, pin retirement, and fresh walk. After exporting the exact
+the held walk, byte-exact terminal retry, pin retirement, and fresh walk.
+Each cycle submits a malformed batch after opening a cursor and checks that
+its valid prefix never enters the visible or recovered history. After exporting the exact
 selected suffix it reopens the same directory, appends a probe row, and
 kills the process directly on HTTP 204. A second reopen must replay that
 row and the complete ordered history. When status advertises
