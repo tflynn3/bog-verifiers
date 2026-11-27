@@ -19,7 +19,7 @@ env:
   FIXTURE: linux-release-v1
   BOG_REPOSITORY: tflynn3/bog
   TOOLING_REVISION: abefdb5dcdc1f8bbbecdc9c0cc7ab39b309a87db
-  CAPACITY_VALIDATION_REVISION: def96df01d2b7b21186d20848f8b2cfafc4db0c4
+  CAPACITY_VALIDATION_REVISION: b3cd5607e71e1b40872045d2097aac693de0269e
   ADMISSION_TOOLING_REVISION: 304749df78fe3dfaa75ce411efa34708269af659
   REVISION: ${{ inputs.revision }}
 
@@ -109,8 +109,12 @@ jobs:
           capacity_revision=$(git -C candidate rev-parse HEAD)
           printf 'capacity_tooling_revision=%s\n' "$capacity_revision" | tee -a "$EVIDENCE/run.txt"
           [[ "$capacity_revision" == "$REVISION" ]]
+          validation_revision=$(git -C capacity-validation rev-parse HEAD)
+          printf 'capacity_validation_revision=%s\n' "$validation_revision" | tee -a "$EVIDENCE/run.txt"
+          [[ "$validation_revision" == "$CAPACITY_VALIDATION_REVISION" ]]
           git -C gate apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/{fixed-budget,restored-parity}.patch
           git -C admission apply --unidiff-zero "$GITHUB_WORKSPACE/verifiers/release/admission/fixed-boundaries.patch"
+          git -C capacity-validation apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/capacity-validation.patch
 
       - uses: actions/setup-go@v5
         with:
@@ -147,16 +151,6 @@ jobs:
           }
           common=(-binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE")
           unset BOG_CAPACITY_CONTROL
-          capacity_control_available() {
-            if ! timeout --kill-after=2s 5s "$BINARY" -help > "$EVIDENCE/candidate-help.txt" 2>&1; then
-              echo "Candidate capability probe failed. See candidate-help.txt."
-              return 2
-            fi
-            if ! grep -Eq '^[[:blank:]]*-enable-capacity-control([[:blank:]=]|$)' "$EVIDENCE/candidate-help.txt"; then
-              echo "Live capacity unavailable. Candidate help omits -enable-capacity-control."
-              return 1
-            fi
-          }
           admission() (
             cd admission || exit
             timeout --kill-after=5s 2m go run ./verify/release "${common[@]}" -report "$EVIDENCE/admission.json"
@@ -174,15 +168,12 @@ jobs:
             exit "$cleanup_status"
           )
           capacity() (
-            control_status=0
             python3 -B verifiers/release_gate.py control "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" \
-              2>&1 | tee "$EVIDENCE/control.log" || control_status=$?
-            capability_status=0
-            capacity_control_available || capability_status=$?
-            case "$capability_status" in
-              1) exit "$control_status" ;;
-              0) ;;
-              *) exit "$capability_status" ;;
+              2>&1 | tee "$EVIDENCE/control.log" || exit
+            case "$(jq -er '.cases.capacity_control.status' "$EVIDENCE/control.json")" in
+              skip) echo "Live capacity skipped. See control.json."; exit 0 ;;
+              pass) ;;
+              *) exit 1 ;;
             esac
             cd candidate || exit
             work=$(mktemp -d "$RUNNER_TEMP/bog-capacity.XXXXXXXX") || exit
@@ -230,7 +221,6 @@ jobs:
                 exec "$producer" "$@" -mode live -cgroup-parent "$parent" \
                   -work-dir "$work" -report "$evidence/capacity.json"
               ' capacity "$work" "$EVIDENCE" "$producer" "${common[@]}" "${budget_flags[@]}" || exit
-            exit "$control_status"
           )
           parity() (
             unset BOG_RELEASE_OPERATOR
@@ -264,6 +254,7 @@ jobs:
               -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
               -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
             go run ./bench/retained-history -validate-cutover "$EVIDENCE/capacity.json" || failed=1
+            go test -count=1 -run '^TestValidateCutoverCapacityProof$' ./verify/release || failed=1
             if (( failed != 0 )); then exit "$failed"; fi
             python3 -B "$GITHUB_WORKSPACE/verifiers/release_gate.py" validate \
               "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --arch "$RELEASE_ARCH" \
@@ -282,7 +273,6 @@ jobs:
             (cd ../candidate && go test -race -count=1 ./internal/archtest ./verify/linux ./verify/release) || exit 1
             (cd ../admission && go test -race -count=1 ./verify/release -run 'BudgetWalk|FixedBudgetWire') || exit 1
             (cd ../candidate && go test -race -count=1 ./bench/retained-history) || exit 1
-            (cd ../capacity-validation && go test -count=1 ./verify/release ./bench/retained-history -run 'Cutover') || exit 1
             go test -race -count=1 ./verify/release ./verify/query-model
           } 2>&1 | tee "$EVIDENCE/verifier-race.log"
 

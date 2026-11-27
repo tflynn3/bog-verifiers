@@ -287,7 +287,9 @@ The capacity producer handoff uses these additive fields in each schema v1 resul
   when the group counter is present. The capacity tooling and release
   validators read the same producer report file. A timed
   `cgroup_memory_current.bytes` observation may equal the reported peak
-  for its fixture cgroup. A higher value rejects qualification.
+  for its fixture cgroup. Both validators must accept the producer's passing
+  report and reject the same serialized fixture with a 128 MiB overlap
+  observation and a 64 MiB final peak.
 - `diagnostics.seed_progress` reports `acknowledged_rows`, `published_rows`,
   and the last observed checkpoint `generation`. Update each as acknowledgements
   and exact checkpoint publications arrive so an early exit preserves progress.
@@ -329,10 +331,11 @@ ordinary and framed HTTP queries after replacement and restart. The
 schema v1 report identifies the store in its existing `live_replacement`
 object.
 
-Candidate help gates the retained-history probes. The short Slipway suite
-skips when the candidate lacks `-enable-capacity-control`. With the flag
-available, it checks the disabled default, explicit flag-only loopback
-startup, wildcard bind rejection, the
+Candidate help gates the writable restore probe. The capacity probes use
+`-enable-capacity-control` when advertised and otherwise try
+`BOG_CAPACITY_CONTROL=1` on loopback. An HTTP 404 from that fallback skips
+the capacity probe. The short Slipway suite checks the disabled default,
+opt-in loopback startup, wildcard bind rejection, the
 exact cutoff with an uncovered tail, held and fresh HTTP ordering, and
 restart parity. The manually dispatched release gate requires the
 composed revision and passing evidence on both native architectures.
