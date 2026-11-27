@@ -233,6 +233,14 @@ class GateTest(unittest.TestCase):
             del trial["pin_drain"]["release_http_status"], trial["pin_drain"]["reclaimed_bytes"]
         validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
 
+        acks = scattered["acknowledged_backfill"]
+        end = scattered["samples"][-1]["elapsed_ns"]
+        with patch.dict(acks, last_ack_ns=end):
+            validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
+        with patch.dict(acks, last_ack_ns=end + 1):
+            with self.assertRaisesRegex(verify.Rejected, "acknowledgment is after the end of observation"):
+                validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
+
         with patch.dict(scattered, terminal_page_retried=False):
             with self.assertRaisesRegex(verify.Rejected, "missing terminal retry"):
                 validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)

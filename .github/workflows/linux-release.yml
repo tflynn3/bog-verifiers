@@ -20,7 +20,7 @@ env:
   BOG_REPOSITORY: tflynn3/bog
   TOOLING_REVISION: abefdb5dcdc1f8bbbecdc9c0cc7ab39b309a87db
   CRASH_TOOLING_REVISION: 339ea819100ef3d8e2fca3b40936e4288ae313d3
-  CAPACITY_VALIDATION_REVISION: b3cd5607e71e1b40872045d2097aac693de0269e
+  CAPACITY_VALIDATION_REVISION: 89c7fc6dda91563540270576e45e097164534235
   ADMISSION_TOOLING_REVISION: 304749df78fe3dfaa75ce411efa34708269af659
   REVISION: ${{ inputs.revision }}
 
@@ -151,6 +151,9 @@ jobs:
             grep -Eq '^[[:space:]]+build[[:space:]]+vcs.modified=false$' "$EVIDENCE/build-info.txt"
             grep -Eq "^[[:space:]]+build[[:space:]]+GOARCH=$RELEASE_ARCH$" "$EVIDENCE/build-info.txt"
             sha256sum "$BINARY" | tee "$EVIDENCE/binary.sha256"
+            read -r digest _ < "$EVIDENCE/binary.sha256"
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+            printf 'binary_sha256=%s\n' "$digest" >> "$GITHUB_OUTPUT"
           } 2>&1 | tee "$EVIDENCE/build.log"
 
       - name: Run release evidence producers
@@ -270,6 +273,8 @@ jobs:
       - name: Validate reports and candidate identity
         if: always() && steps.build.outcome == 'success'
         working-directory: capacity-validation
+        env:
+          PINNED_BINARY_SHA256: ${{ steps.build.outputs.binary_sha256 }}
         timeout-minutes: 3
         run: |
           {
@@ -277,14 +282,14 @@ jobs:
             sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
             go run ./verify/release validate -require-cutover -binary "$BINARY" -revision "$REVISION" -fixture "$FIXTURE" \
               -admission "$EVIDENCE/admission.json" -durability "$EVIDENCE/durability.json" \
-              -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/supplemental-parity.json" || failed=1
+              -capacity "$EVIDENCE/capacity.json" -parity "$EVIDENCE/parity.json" || failed=1
             (cd ../crash-gate && go test -count=1 \
               -run '^(TestValidatePostRestoreAckCrashEvidence|TestAppendAndCrashOrdering)$' ./verify/release) || failed=1
             go run ./bench/retained-history -validate-cutover "$EVIDENCE/capacity.json" || failed=1
-            go test -count=1 -run '^TestValidateCutoverCapacityProof$' ./verify/release || failed=1
             if (( failed != 0 )); then exit "$failed"; fi
             python3 -B "$GITHUB_WORKSPACE/verifiers/release_gate.py" validate \
               "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" --arch "$RELEASE_ARCH" \
+              --binary-sha256 "$PINNED_BINARY_SHA256" \
               --gate-revision "$(git -C ../crash-gate rev-parse HEAD)" \
               --require-fixture-root-cleanup --require-fixed-boundaries --require-backfill-timelines \
               --require-capacity-observations
@@ -298,9 +303,10 @@ jobs:
           CGO_ENABLED: '1'
         run: |
           {
-            (cd ../candidate && go test -race -count=1 ./internal/archtest ./verify/linux ./verify/release) || exit 1
+            (cd ../candidate && go test -race -count=1 ./internal/archtest ./verify/linux) || exit 1
             (cd ../admission && go test -race -count=1 ./verify/release -run 'BudgetWalk|FixedBudgetWire') || exit 1
-            (cd ../candidate && go test -race -count=1 ./bench/retained-history) || exit 1
+            (cd ../capacity-validation &&
+              go test -race -count=1 ./verify/capacityevidence ./bench/retained-history ./verify/release) || exit 1
             go test -race -count=1 ./verify/release ./verify/query-model
           } 2>&1 | tee "$EVIDENCE/verifier-race.log"
 

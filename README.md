@@ -322,9 +322,13 @@ candidate revision, fixture and candidate binary digest. The final job
 checks both crash verdicts and prints the checkout and both digests.
 Standard schema-v1 validation still accepts historical parity reports.
 The pinned capacity validation checkout checks the live capacity report.
+The #96 repair rejects a last backfill acknowledgment after the final
+timeline sample and accepts one at that sample's timestamp. Both consumer
+fixture suites run under the race detector with the shared proof tests.
 Route capacity fixture failures to the existing Release Verification owner
 with the native architecture, checkout and candidate revisions, and the
-capacity report and runner log.
+capacity report and runner log. The crash gate owner retains the producer
+checkout and immediate SIGKILL fixture.
 
 The supplemental parity report checks legacy WAL replay, append, and restart, then removes the original data and
 bundle and starts the candidate on the verified v1 restore. Ordinary queries
@@ -375,4 +379,5 @@ The release gate also checks the small fixture's process exits and removal.
 
 The release gate checks the binary's ELF machine against the native runner
 and binds each mandatory report to that runner's binary digest, revision,
-and fixture ID. The control report carries the architecture explicitly.
+and fixture ID. Each runner passes its build-time SHA-256 directly to
+validation. The control report carries the architecture explicitly.

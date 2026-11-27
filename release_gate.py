@@ -122,6 +122,9 @@ def validate_backfill_timelines(timelines, seed, published, *, require_pin_retir
                   integer(trial.get("fresh_rows_checked"), final if pattern == "scattered" else rows + 1, final),
                   f"{name}: missing terminal retry, capture retirement, or exact fresh walk evidence")
             validate_retirement_samples(name, samples, boundaries, drain, publication["generation"], cutoff, final)
+            if require_pin_retirement:
+                check(acks["last_ack_ns"] <= samples[-1]["elapsed_ns"],
+                      f"{name}: last backfill acknowledgment is after the end of observation")
     check(generations[0] < generations[1] == published["generation"],
           f"{label}: inconsistent replacement generations")
 
@@ -605,6 +608,7 @@ def main():
     parser.add_argument("fixture")
     parser.add_argument("directory", type=Path)
     parser.add_argument("--arch", choices=("amd64", "arm64"))
+    parser.add_argument("--binary-sha256")
     parser.add_argument("--gate-revision")
     parser.add_argument("--fixture-parent", type=Path)
     parser.add_argument("--require-fixture-root-cleanup", action="store_true")
@@ -634,6 +638,9 @@ def main():
                   f"candidate binary is not Linux {args.arch}")
             cutover = all((args.require_fixture_root_cleanup, args.require_fixed_boundaries,
                            args.require_backfill_timelines, args.require_capacity_observations))
+            if cutover or args.binary_sha256 is not None:
+                check(expected["binary_sha256"] == args.binary_sha256,
+                      "candidate binary SHA-256 differs from the native build pin")
             if cutover:
                 check(platform.system() == "Linux" and native_arch == args.arch,
                       f"cutover must be validated on native Linux {args.arch}")
