@@ -94,7 +94,7 @@ func TestValidateNativeQueryQualification(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := validateQueryQualification(model, handlers, id); err != nil {
+	if err := errors.Join(validateQueryQualification(model, handlers, id), validateNativeQueryReplacement(model, id)); err != nil {
 		t.Fatal(err)
 	}
 }

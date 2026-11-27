@@ -247,10 +247,16 @@ These cover failed opening writes, capture slot reuse, retirement, shutdown
 while a resume is held, fitting pages, and refusal framing. The pinned query
 model also requires fitting pages at opening limits 1 and 10 in ordinary WAL
 and retained modes, replay in both modes, and listener startup tests. The
-model logs the full candidate revision and native binary SHA-256. The gate
-checks both values and retains the raw model, handler, and validation events.
-A retained candidate without opted-in loopback compaction reports a skipped
-retained case. Strict native qualification requires a pass in both modes.
+query tooling checkout also runs `TestPinnedQueryGenerationReplacement` in
+the same model invocation. It starts the pinned binary on a tail-only
+restore and checks fixed-budget paging across successive publications,
+terminal replay, and capture release. The gate checks the candidate revision
+and native binary SHA-256 and retains the raw model, handler, and validation
+events. When the paired parity probe explicitly reports missing loopback
+control or writable tail selection, the runner omits the replacement case
+and still runs the existing model and handler checks. Strict native
+qualification requires exactly one replacement pass and one matching
+identity in the model events.
 
 The workflow runs the pinned #70 production-client paging probe against the
 candidate binary and runs the candidate checkout's #53 Linux durability
