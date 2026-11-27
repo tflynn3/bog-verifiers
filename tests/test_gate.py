@@ -46,16 +46,19 @@ def buildable_candidate(root):
 
 class GateTest(unittest.TestCase):
     def test_cutover_requires_retirement_exit_and_cleanup_evidence(self):
-        retirement = dict(status="pass", release_http_status=204, pins_while_held=1, pins_after_release=0)
+        retirement = dict(status="pass", retire_http_status=204, terminal_page_retried=True,
+                          invalid_cursor_http_status=400, pins_while_held=1, pins_after_release=0)
         evidence = dict(retirement=retirement, continuation_replayed=True, fixture_removed=True,
-                        release_hidden_checks=2)
+                        retire_hidden_checks=2)
         processes = [dict(expected_ready=ready, exit_code=code)
                      for ready, code in ((True, 0), (True, -9), (False, 1), (True, 0))]
         case = dict(evidence=evidence, processes=processes)
         validate_cutover_control(case)
         for item, changes, reason in (
-            (retirement, {"status": "skip"}, "successful release"),
+            (retirement, {"status": "skip"}, "authenticated retirement"),
             (retirement, {"pins_after_release": None}, "positive-to-zero"),
+            (retirement, {"terminal_page_retried": False}, "terminal retry"),
+            (retirement, {"invalid_cursor_http_status": 204}, "authenticated retirement"),
             (processes[1], {"exit_code": 0}, "unexpected candidate exit"),
             (evidence, {"fixture_removed": False}, "fixture cleanup"),
         ):
@@ -64,7 +67,8 @@ class GateTest(unittest.TestCase):
                     validate_cutover_control(case)
 
         parity = dict(fixture_removed=True, corrupt_restore_exit=1, restore_metadata_preserved=True,
-                      held_restore_rows=6, replayed_restore_page=True)
+                      held_restore_rows=6, replayed_restore_page=True, legacy_restart_unpaged=True,
+                      restored_control_404_checks=6)
         validate_cutover_parity(parity)
         del parity["replayed_restore_page"]
         with self.assertRaisesRegex(verify.Rejected, "continuation replay"):
@@ -124,24 +128,34 @@ class GateTest(unittest.TestCase):
         scattered = timeline("scattered", seed, seed + 64, seed + 2048, 9 * seed // 16 - 3, 27)
         published = {"generation": 27}
         validate_backfill_timelines([scattered, clustered], seed, published)
+        with self.assertRaisesRegex(verify.Rejected, "timeline boundaries"):
+            validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
+
+        for trial in (clustered, scattered):
+            samples = trial["samples"]
+            final = samples[3]["status"]
+            samples[5:7] = [
+                dict(event=event, status=status, filesystem=dict(checkpoint_staging_apparent_bytes=0),
+                     candidate_status_metrics={"retired_generation_pins": pins})
+                for event, status, pins in (("terminal_retried", None, None), ("before_retirement", final, 1),
+                                            ("capture_retired", None, None), ("after_retirement", final, 0),
+                                            ("fresh_visible", None, None), ("fresh_walk_complete", None, None))
+            ]
+            for index, sample in enumerate(samples, 1):
+                sample.update(elapsed_ns=2 * index, request_sent_ns=2 * index - 1)
+            trial.update(terminal_page_retried=True, capture_retired=True, fresh_walk_exact=True,
+                         fresh_rows_checked=trial["expected_committed_rows"])
+            del trial["pin_drain"]["release_http_status"], trial["pin_drain"]["reclaimed_bytes"]
         validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
-        drain_samples = scattered["samples"]
-        drain_samples.insert(5, dict(drain_samples[5], candidate_status_metrics=None))
-        drain_samples[6]["event"] = "drain_poll"
-        validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
-        drain_samples.pop(5)
-        drain_samples[5]["event"] = "after_exhaustion"
-        for changes, diagnostic in (
-            ({"status": "unavailable", "reason": "old producer"}, "incomplete pin-drain evidence"),
-            ({"status": "pending", "reason": "observation window ended"}, "pin retirement pending"),
-            ({"release_http_status": 404}, "missing release or reclamation evidence"),
-            ({"reclaimed_bytes": 0}, "missing release or reclamation evidence"),
-        ):
-            with self.subTest(changes=changes), patch.dict(scattered["pin_drain"], changes):
-                with self.assertRaisesRegex(verify.Rejected, diagnostic):
-                    validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
-        with patch.dict(scattered["samples"][5]["candidate_status_metrics"], retired_generation_pins=1):
-            with self.assertRaisesRegex(verify.Rejected, "missing measured positive-to-zero predecessor pins"):
+
+        with patch.dict(scattered, terminal_page_retried=False):
+            with self.assertRaisesRegex(verify.Rejected, "missing terminal retry"):
+                validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
+        with patch.dict(scattered["samples"][8], request_sent_ns=1):
+            with self.assertRaisesRegex(verify.Rejected, "missing measured zero"):
+                validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
+        with patch.dict(scattered["samples"][8]["candidate_status_metrics"], retired_generation_pins=1):
+            with self.assertRaisesRegex(verify.Rejected, "missing measured zero"):
                 validate_backfill_timelines([clustered, scattered], seed, published, require_pin_retirement=True)
         with patch.dict(clustered["samples"][3]["status"], covered_rows=seed):
             with self.assertRaisesRegex(verify.Rejected, "invalid overlap or publication cutoff"):

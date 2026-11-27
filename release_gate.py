@@ -85,8 +85,10 @@ def validate_backfill_timelines(timelines, seed, published, *, require_pin_retir
         check(integer(lower, 0) and integer(publication.get("observed_lag_upper_bound_ns"), lower),
               f"{name}: invalid publication timing")
         samples = trial["samples"]
-        events = ("held_capture", "compaction_start", "overlap", "publication",
-                  "held_exhausted", "after_exhaustion", "fresh_visible")
+        current = require_pin_retirement or "terminal_page_retried" in trial
+        events = ("held_capture", "compaction_start", "overlap", "publication", "held_exhausted")
+        events += (("terminal_retried", "before_retirement", "capture_retired", "after_retirement",
+                    "fresh_visible", "fresh_walk_complete") if current else ("after_exhaustion", "fresh_visible"))
         boundaries = [sample for sample in samples if sample["event"] in events]
         check(tuple(sample["event"] for sample in boundaries) == events,
               f"{name}: missing or out-of-order timeline boundaries")
@@ -113,22 +115,41 @@ def validate_backfill_timelines(timelines, seed, published, *, require_pin_retir
         unavailable = drain["status"] == "unavailable" and isinstance(drain.get("reason"), str) and drain["reason"]
         check(observed or (not require_pin_retirement and unavailable),
               f"{name}: incomplete pin-drain evidence")
-        if require_pin_retirement:
-            check(integer(drain.get("release_http_status"), 200, 299) and
-                  integer(drain.get("reclaimed_bytes"), 1), f"{name}: missing release or reclamation evidence")
-
-            def pin_count(sample):
-                return (sample.get("candidate_status_metrics") or {}).get("retired_generation_pins")
-
-            start, exhausted, fresh = (samples.index(boundaries[i]) for i in (3, 4, 6))
-            held_counts = [pin_count(sample) for sample in samples[start:exhausted]]
-            drain_counts = [pin_count(sample) for sample in samples[exhausted + 1:fresh]
-                            if sample["event"] in ("after_exhaustion", "drain_poll") and
-                            integer(pin_count(sample), 0)]
-            check(drain["retired_pins_while_held"] in held_counts and drain_counts and drain_counts[-1] == 0,
-                  f"{name}: missing measured positive-to-zero predecessor pins")
+        if current:
+            check(trial.get("terminal_page_retried") is True and trial.get("capture_retired") is True and
+                  trial.get("fresh_walk_exact") is True and
+                  integer(trial.get("fresh_rows_checked"), final if pattern == "scattered" else rows + 1, final),
+                  f"{name}: missing terminal retry, capture retirement, or exact fresh walk evidence")
+            validate_retirement_samples(name, samples, boundaries, drain, publication["generation"], cutoff, final)
     check(generations[0] < generations[1] == published["generation"],
           f"{label}: inconsistent replacement generations")
+
+
+def validate_retirement_samples(label, samples, boundaries, drain, generation, cutoff, final):
+    retry, held, retired, after, fresh = boundaries[5:10]
+
+    def pins(sample):
+        return (sample.get("candidate_status_metrics") or {}).get("retired_generation_pins")
+
+    def measured_at_final(sample):
+        state = sample.get("status") or {}
+        return (not sample.get("status_error") and state.get("state") == "complete" and
+                state.get("generation") == generation and state.get("covered_rows") == cutoff and
+                state.get("committed_rows") == final)
+
+    check(all(integer(sample.get("elapsed_ns"), 0) for sample in samples) and
+          [sample["elapsed_ns"] for sample in samples] == sorted(sample["elapsed_ns"] for sample in samples),
+          f"{label}: invalid retirement timeline order")
+    check(not drain.get("reason") and measured_at_final(held) and integer(pins(held), 1) and
+          pins(held) == drain["retired_pins_while_held"] and
+          integer(held.get("request_sent_ns"), retry["elapsed_ns"], held["elapsed_ns"]),
+          f"{label}: missing positive predecessor pin measurement after terminal retry")
+    polling = [sample for sample in samples[samples.index(after):samples.index(fresh)]
+               if sample["event"] in ("after_retirement", "drain_poll")]
+    check(polling and all(integer(sample.get("request_sent_ns"), retired["elapsed_ns"], sample["elapsed_ns"])
+                          for sample in polling) and
+          measured_at_final(polling[-1]) and integer(pins(polling[-1]), 0, 0),
+          f"{label}: missing measured zero predecessor pins after capture retirement")
 
 
 def validate_capacity_observations(run, seed, label, cgroups):
@@ -208,7 +229,7 @@ def validate_capacity(evidence, *, require_backfill_timelines=False, require_cap
                   all(integer(value, 0) for value in counters.values()) for dev, counters in devices.items()),
               f"{label}: missing or invalid device I/O counters")
         # The broad walk sees three matching rows per four-row timestamp group.
-        # Only continuations that precede publication count toward the p99.
+        # The mixed walk leaves at least one continuation for after the overlap.
         broad_rows = 9 * seed // 16 - 3
         min_queries = (broad_rows - 510 + 508) // 509
         check(integer(run.get("backfill_query_samples"), min_queries, broad_rows - 1) and
@@ -306,7 +327,8 @@ def validate_parity(evidence, *, require_writable_restore=False):
     if require_writable_restore or "restore_status" in evidence:
         check(evidence.get("restore_status") == "pass", "parity: writable restore did not pass")
     if require_writable_restore or "restored_control_404_checks" in evidence:
-        check(integer(evidence.get("restored_control_404_checks"), 4, 4),
+        hidden = evidence.get("restored_control_404_checks")
+        check(integer(hidden, 4, 4) or integer(hidden, 6, 6),
               "parity: capacity control was not proven absent on restore and restart")
     point = evidence["verified_point"]
     generation = point["Generation"]
@@ -386,6 +408,9 @@ def record_fixture_root_cleanup(directory, expected, parent):
 
 
 def validate_cutover_parity(evidence):
+    check(evidence.get("legacy_restart_unpaged") is True and
+          integer(evidence.get("restored_control_404_checks"), 6, 6),
+          "parity: missing ordinary legacy restart or default-off restored control evidence")
     check(evidence.get("fixture_removed") is True, "parity: fixture cleanup did not complete")
     check(integer(evidence.get("corrupt_restore_exit"), 1, 1) and
           evidence.get("restore_metadata_preserved") is True,
@@ -397,14 +422,15 @@ def validate_cutover_parity(evidence):
 def validate_cutover_control(case):
     control = case["evidence"]
     retirement = control.get("retirement") or {}
-    check(retirement.get("status") == "pass" and
-          integer(retirement.get("release_http_status"), 200, 299) and
+    check(retirement.get("status") == "pass" and retirement.get("terminal_page_retried") is True and
+          integer(retirement.get("retire_http_status"), 204, 204) and
+          integer(retirement.get("invalid_cursor_http_status"), 400, 499) and
           integer(retirement.get("pins_while_held"), 1) and
           integer(retirement.get("pins_after_release"), 0, 0),
-          "control: missing successful release and positive-to-zero predecessor pin evidence")
+          "control: missing terminal retry, authenticated retirement, or positive-to-zero predecessor pin evidence")
     check(control.get("continuation_replayed") is True and control.get("fixture_removed") is True and
-          integer(control.get("release_hidden_checks"), 2, 2),
-          "control: missing continuation replay, disabled release, or fixture cleanup evidence")
+          integer(control.get("retire_hidden_checks"), 2, 2),
+          "control: missing continuation replay, disabled retirement, or fixture cleanup evidence")
     launches = ((True, 0), (True, -signal.SIGKILL), (False, 1), (True, 0))
     processes = case.get("processes")
     check(isinstance(processes, list) and len(processes) == len(launches) and

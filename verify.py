@@ -813,17 +813,17 @@ def capacity_control_suite(binary, directory):
     status_path = f"{CAPACITY_PATH}?action=status&cutoff={cutoff}"
     start_path = f"{CAPACITY_PATH}?action=start&cutoff={cutoff}"
     hidden_checks = 0
-    release_hidden_checks = 0
+    retire_hidden_checks = 0
 
     def hidden(bog):
-        nonlocal hidden_checks, release_hidden_checks
+        nonlocal hidden_checks, retire_hidden_checks
         for method, path in (("GET", status_path), ("POST", start_path)):
             status, _ = bog.request(method, path)
             check(status == 404, f"capacity control with opt-in off: {method} returned HTTP {status}")
             hidden_checks += 1
-        status, _ = bog.request("POST", f"{CAPACITY_PATH}?action=release&cutoff={cutoff}")
-        check(status == 404, f"capacity release with opt-in off returned HTTP {status}")
-        release_hidden_checks += 1
+        status, _ = bog.request("POST", f"{CAPACITY_PATH}?action=retire")
+        check(status == 404, f"capacity retirement with opt-in off returned HTTP {status}")
+        retire_hidden_checks += 1
 
     def state(bog, method, path, *, probe=False):
         status, body, _ = bog.checked_exchange(method, path)
@@ -880,7 +880,6 @@ def capacity_control_suite(binary, directory):
         held = state(bog, "GET", status_path)
         metrics = held.get("metrics", {})
         check(isinstance(metrics, dict), f"invalid compaction metrics: {metrics!r}")
-        pins = metrics.get("retired_generation_pins")
         check(all(held[key] == published[key] for key in ("state", "generation", "covered_rows", "committed_rows")),
               f"status did not retain the published cutoff: {held!r}")
 
@@ -890,28 +889,49 @@ def capacity_control_suite(binary, directory):
         expect_rows(decode_rows(body), expected[1:2], "first held continuation")
         expect_rows(decode_rows(repeated), expected[1:2], "replayed held continuation")
         check(next_cursor and replay_cursor, "held continuation lost its next page on replay")
-        expect_walk(bog, args, expected, (1,), "held cursor after compaction", position=2, cursor=next_cursor)
+        check(body == repeated, "held continuation changed response bytes on retry")
+        terminal = {**args, "cursor": next_cursor, "limit": 1}
+        terminal_body, terminal_cursor = bog.query_ndjson(terminal, exact_framing=True)
+        expect_rows(decode_rows(terminal_body), expected[2:], "terminal held page")
+        check(terminal_cursor is None, "terminal held page returned a continuation")
 
         if "retired_generation_pins" in metrics:
-            check(type(pins) is int and pins > 0, f"held cursor did not pin its predecessor: {pins!r}")
-            release_status, _ = bog.request("POST", f"{CAPACITY_PATH}?action=release&cutoff={cutoff}")
-            if release_status in (404, 405, 501):
-                retirement = {"status": "skip", "detail": f"release action returned HTTP {release_status}"}
+            # Capture the retry before requesting retirement. Older controls
+            # may support compaction and pin metrics without capture retirement.
+            retry_status, retry_body, retry_headers = bog.checked_exchange("GET", query_target(terminal))
+            retire_action = f"{CAPACITY_PATH}?action=retire"
+            invalid_status, _ = bog.request("POST", retire_action + "&cursor=invalid")
+            held = state(bog, "GET", status_path)
+            pins = (held.get("metrics") or {}).get("retired_generation_pins")
+            retire_path = retire_action + "&" + urllib.parse.urlencode({"cursor": next_cursor})
+            retire_status, retire_body = bog.request("POST", retire_path)
+            if retire_status in (404, 405, 501):
+                retirement = {"status": "skip", "detail": f"retire action returned HTTP {retire_status}"}
             else:
-                check(200 <= release_status < 300, f"release action returned HTTP {release_status}")
+                check(retire_status == 204 and not retire_body,
+                      f"capture retirement expected an empty HTTP 204, got HTTP {retire_status}")
+                check(retry_status == 200 and retry_body == terminal_body and
+                      retry_headers.get_all("Content-Length") == [str(len(terminal_body))] and
+                      retry_headers.get_content_type() == "application/x-ndjson" and
+                      all(retry_headers.get(header) is None for header in
+                          (NEXT_CURSOR, "Transfer-Encoding", "Trailer")),
+                      "terminal retry changed status, rows, framing, or exhaustion")
+                check(400 <= invalid_status < 500, f"invalid retirement token returned HTTP {invalid_status}")
+                check(type(pins) is int and pins > 0, f"terminal retry did not retain its predecessor pin: {pins!r}")
                 deadline = time.monotonic() + HTTP_TIMEOUT
                 while True:
                     drained = state(bog, "GET", status_path)
                     check(all(drained[key] == published[key] for key in
                               ("state", "generation", "covered_rows", "committed_rows")),
-                          f"release changed the published cutoff: {drained!r}")
+                          f"retirement changed the published cutoff: {drained!r}")
                     remaining = (drained.get("metrics") or {}).get("retired_generation_pins")
                     if type(remaining) is int and remaining == 0:
                         break
                     check(time.monotonic() < deadline, f"predecessor pins did not drain: {remaining!r}")
                     time.sleep(0.02)
-                retirement = {"status": "pass", "release_http_status": release_status,
-                              "pins_while_held": pins, "pins_after_release": remaining}
+                retirement = {"status": "pass", "retire_http_status": retire_status, "terminal_page_retried": True,
+                              "invalid_cursor_http_status": invalid_status, "pins_while_held": pins,
+                              "pins_after_release": remaining}
 
         expect_query(bog, augmented, 0, SECOND, label="ordinary query after compaction")
         expect_walk(bog, args, fresh, (1, 2), "fresh paged query after compaction")
@@ -933,7 +953,7 @@ def capacity_control_suite(binary, directory):
             "snapshot_rows": len(expected), "stale_cursor_rejected": True,
             "initial_generation": initial["generation"], "published": published,
             "continuation_replayed": True, "retirement": retirement,
-            "release_hidden_checks": release_hidden_checks,
+            "retire_hidden_checks": retire_hidden_checks,
             "fresh_rows": len(fresh), "restart_rows": len(fresh)}
 
 

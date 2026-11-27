@@ -259,12 +259,11 @@ dispatched revision so the capacity evidence owner supplies the launcher
 and observations. The workflow passes `-query-work-budget 134217728`.
 Each fixture records that value in `fixture.query_work_budget`,
 used for initial queries, continuations, and full restart walks, and the
-peak sampled checkpoint staging bytes. After each held walk exhausts,
-the producer uses the opt-in loopback release action. The gate requires
-the release HTTP status and observed reclaimed bytes in
-`pin_drain.release_http_status` and `pin_drain.reclaimed_bytes`, along with
-positive predecessor pin samples before release and zero afterward. Each
-fixture also requires an exact full walk after restart and successful
+peak sampled checkpoint staging bytes. After each held walk exhausts, the
+producer retries its terminal page, records the positive predecessor pin count,
+and retires the capture with the continuation token that fetched that page.
+Qualification requires an observed zero after retirement and an exact fresh
+walk. Each fixture also requires an exact full walk after restart and successful
 process, cgroup, and fixture root cleanup.
 
 The capacity producer handoff uses these additive fields in each schema v1 result.
@@ -280,10 +279,9 @@ The capacity producer handoff uses these additive fields in each schema v1 resul
   and the last observed checkpoint `generation`. Update each as acknowledgements
   and exact checkpoint publications arrive so an early exit preserves progress.
 - The capacity evidence owner keeps missing pin counters pending through the
-  applicable deadline. Poll within the fixture deadline and the 15-minute
-  capture lifetime plus release grace. An observed zero after exhaustion
-  completes the proof. An earlier observation window ending with a missing
-  counter preserves pending evidence for diagnosis.
+  drain deadline. An observed zero after explicit retirement completes the
+  proof. An observation window ending with a missing counter preserves
+  pending evidence for diagnosis.
 - The Linux Release owner supplies `diagnostics.candidates[].teardown_sigkill_sent`
   from the teardown path for the reaped candidate lifetime. Record attribution
   only when the verifier's own forced termination accounts for the wait result.
@@ -297,9 +295,9 @@ Historical schema v1 parsing remains available without the current evidence flag
 Restored parity checks legacy WAL replay, append, and restart, then removes the original data and
 bundle and starts the candidate on the verified v1 restore. Ordinary queries
 and framed cursor walks check restored rows, a durable append, and exact
-restart parity. Restored launches pass `-enable-capacity-control=false`.
-The parity report counts four HTTP 404 responses across status and start
-probes on restored startup and restart. When the operator CLI is available, a separate restored copy
+restart parity. Restored launches use the shipped control defaults.
+The parity report counts six HTTP 404 responses across status, start, and
+retirement probes on restored startup and restart. When the operator CLI is available, a separate restored copy
 serves the default backup comparison. If `compare -help` advertises `-max-pages`,
 the comparison must also finish at the exact page ceiling and report an
 incomplete comparison at a lower ceiling. The resource probe discovers `-retained-tail-max-bytes` in
@@ -327,11 +325,13 @@ Current cutover qualification also requires the corrupt v1 suffix to exit
 with status 1, unchanged backup metadata after writable restart, and exact
 replay of a byte-framed continuation across an acknowledged append. The
 short loopback fixture seeds a predecessor checkpoint before holding its
-cursor. It then checks exact continuation replay after replacement, the
-disabled release action, and positive predecessor pins followed by an
-observed zero after exhaustion and release. Missing retirement capability
-can skip that subprobe in Slipway. Cutover qualification requires it to
-pass and checks the small fixture's process exits and removal.
+cursor. It checks exact continuation replay after replacement, then retries
+the terminal page before retiring the capture with its continuation token.
+The default and wildcard listeners must hide the retirement action.
+Qualification requires rejection of a malformed token, a positive predecessor
+pin count after terminal retry, and an empty HTTP 204 for the issued token
+followed by an observed zero. Slipway allows the retirement subprobe to skip on older controls.
+The release gate also checks the small fixture's process exits and removal.
 
 The release gate checks the binary's ELF machine against the native runner
 and binds each mandatory report to that runner's binary digest, revision,
