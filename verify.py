@@ -327,6 +327,26 @@ class Bog:
     def query_ndjson(self, args, *, exact_framing=False):
         return query_response(self.checked_exchange("GET", query_target(args)), exact_framing=exact_framing)
 
+    def disconnect_after_cursor(self, args, content_length):
+        target = query_target(args)
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1", self.port, timeout=HTTP_TIMEOUT)) as conn:
+            try:
+                conn.request("GET", target)
+                with conn.getresponse() as response:
+                    check(response.status == 200, f"query before disconnect returned HTTP {response.status}")
+                    headers = response.headers
+                    check(headers.get_content_type() == "application/x-ndjson" and
+                          headers.get_all("Content-Length") == [str(content_length)] and
+                          headers.get("Transfer-Encoding") is None and headers.get("Trailer") is None,
+                          "query before disconnect did not deliver the expected page framing")
+                    cursors = headers.get_all(NEXT_CURSOR)
+                    check(cursors is not None and len(cursors) == 1 and bool(cursors[0].strip()),
+                          f"query before disconnect did not deliver a single {NEXT_CURSOR}")
+                    # Close the response and TCP connection with the body unread.
+                    return cursors[0]
+            except (OSError, http.client.HTTPException) as exc:
+                raise Rejected(f"query before disconnect failed: {exc}; {self.log_tail()}") from exc
+
 
 def query_response(response, *, exact_framing=False):
     status, body, headers = response
@@ -997,6 +1017,8 @@ def capacity_control_suite(binary, directory, *, require_replacement_restart=Fal
         expect_rows(decode_rows(repeated), expected[1:2], "replayed held continuation")
         check(next_cursor and replay_cursor, "held continuation lost its next page on replay")
         check(body == repeated, "held continuation changed response bytes on retry")
+        if strict_replay:
+            next_cursor = bog.disconnect_after_cursor(continuation, len(body))
         terminal = {**args, "cursor": next_cursor, "limit": 1}
         terminal_body, terminal_cursor = bog.query_ndjson(terminal, exact_framing=True)
         expect_rows(decode_rows(terminal_body), expected[2:], "terminal held page")
@@ -1135,6 +1157,8 @@ def fixed_budget_replay_suite(binary, directory):
                 actual.extend(page)
                 check((cursor is not None) == (offset + 1 < len(captured)),
                       f"continuation at budget {budget}, row {offset}: wrong exhaustion marker")
+                if offset == first_rows:
+                    cursor = bog.disconnect_after_cursor(continuation, len(body))
             # Append again before retrying the token that served the terminal page.
             bog.ingest([Row(1, "@after terminal")])
             retry, next_cursor = bog.query_ndjson(continuation, exact_framing=True)

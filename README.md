@@ -393,6 +393,10 @@ The release gate also checks the small fixture's process exits and removal.
 
 Both native jobs require the replacement and restart proof in `control.json`.
 The fixture holds a cursor at a fixed work budget across checkpoint replacement.
+The replacement and sparse fixed-budget probes each read a continuation
+token from the response headers, close the connection with the body unread,
+and use the delivered token on a new connection. Both check exact terminal
+replay after resuming the walk.
 Fresh ordinary and paged requests must match the full append-ledger order,
 including the duplicate rows and uncovered committed suffix, before and after
 reopening the same directory. The verifier checks framing and records ordered
