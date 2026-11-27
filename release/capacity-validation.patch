@@ -1,5 +1,39 @@
+diff --git a/bench/retained-history/cutover.go b/bench/retained-history/cutover.go
+index b964de1..fbee059 100644
+--- a/bench/retained-history/cutover.go
++++ b/bench/retained-history/cutover.go
+@@ -41,0 +42,19 @@ func validateCutoverFile(path string) (err error) {
++	// Scalar decoding can turn a JSON null counter into zero. Inspect the
++	// raw wire counter separately before accepting a strict report.
++	var raw struct {
++		Cases map[string]struct {
++			Evidence []struct {
++				Diagnostics struct {
++					MemoryEvents map[string]*uint64 `json:"cgroup_memory_events"`
++				} `json:"diagnostics"`
++			} `json:"evidence"`
++		} `json:"cases"`
++	}
++	if err := json.Unmarshal(data, &raw); err != nil {
++		return fmt.Errorf("decode raw capacity counters: %w", err)
++	}
++	for _, record := range raw.Cases[capacityCase].Evidence {
++		if oom := record.Diagnostics.MemoryEvents["oom_kill"]; oom == nil || *oom != 0 {
++			return errors.New("require an observed zero cgroup OOM-kill count")
++		}
++	}
+diff --git a/verify/release/capacity_cutover.go b/verify/release/capacity_cutover.go
+index 769ba43..ce9ecd2 100644
+--- a/verify/release/capacity_cutover.go
++++ b/verify/release/capacity_cutover.go
+@@ -82 +82 @@ func (r capacityEvidence) validateCutover() error {
+-	var memoryEvents map[string]uint64
++	var memoryEvents map[string]*uint64
+@@ -105 +105 @@ func (r capacityEvidence) validateCutover() error {
+-	if oom, observed := memoryEvents["oom_kill"]; !observed || oom != 0 || r.CgroupOOM == nil || *r.CgroupOOM != 0 {
++	if oom := memoryEvents["oom_kill"]; oom == nil || *oom != 0 || r.CgroupOOM == nil || *r.CgroupOOM != 0 {
 diff --git a/verify/release/capacity_cutover_test.go b/verify/release/capacity_cutover_test.go
-index 1b6814e..2846858 100644
+index 1b6814e..6ffd81d 100644
 --- a/verify/release/capacity_cutover_test.go
 +++ b/verify/release/capacity_cutover_test.go
 @@ -120,0 +121,5 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
@@ -8,17 +42,44 @@ index 1b6814e..2846858 100644
 +			memory(b, "overlap")["bytes"] = 128 << 20
 +			at(b, "live_memory_current")["max_bytes"] = 128 << 20
 +		}, true},
-@@ -179,2 +184,3 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
+@@ -158 +163,15 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
+-		{"reported OOM", func(r, _ object) { at(at(r, "diagnostics"), "cgroup_memory_events")["oom_kill"] = 1 }, true},
++		{"missing raw oom_kill", func(r, _ object) {
++			delete(at(at(r, "diagnostics"), "cgroup_memory_events"), "oom_kill")
++		}, true},
++		{"null raw oom_kill", func(r, _ object) {
++			at(at(r, "diagnostics"), "cgroup_memory_events")["oom_kill"] = nil
++		}, true},
++		{"nonzero raw oom_kill", func(r, _ object) {
++			at(at(r, "diagnostics"), "cgroup_memory_events")["oom_kill"] = 1
++		}, true},
++		{"decreasing elapsed time", func(_, b object) {
++			sample(b, "terminal_retried")["elapsed_ns"] = sample(b, "held_exhausted")["elapsed_ns"].(float64) - 1
++		}, true},
++		{"terminal replay before exhaustion", func(_, b object) {
++			sample(b, "terminal_retried")["event"], sample(b, "held_exhausted")["event"] = "held_exhausted", "terminal_retried"
++		}, true},
+@@ -179,2 +198,3 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
 -			if err := validateReportWithOptions(in, id, capacityCases, cutover); (err != nil) != tc.reject {
 -				t.Errorf("release validator error = %v, want rejection %t", err, tc.reject)
 +			releaseErr := validateFile(reportPath, id, capacityCases, cutover)
 +			if (releaseErr != nil) != tc.reject {
 +				t.Errorf("release validator error = %v, want rejection %t", releaseErr, tc.reject)
-@@ -187,0 +194,7 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
-+			if tc.name == "128 MiB overlap with 64 MiB final peak" {
-+				const diagnostic = "above-final-memory.peak memory.current bytes"
+@@ -187,0 +208,17 @@ func TestValidateCutoverCapacityProof(t *testing.T) {
++			var diagnostic string
++			switch tc.name {
++			case "128 MiB overlap with 64 MiB final peak":
++				diagnostic = "above-final-memory.peak memory.current bytes"
++			case "missing raw oom_kill", "null raw oom_kill", "nonzero raw oom_kill":
++				diagnostic = "observed zero cgroup OOM-kill count"
++			case "decreasing elapsed time":
++				diagnostic = "elapsed time order"
++			case "terminal replay before exhaustion":
++				diagnostic = "terminal page replay must follow held cursor exhaustion"
++			}
++			if diagnostic != "" {
 +				if releaseErr == nil || !strings.Contains(releaseErr.Error(), diagnostic) ||
 +					!strings.Contains(string(output), diagnostic) {
-+					t.Errorf("expected both peak diagnostics; release: %v; retained-history: %s", releaseErr, output)
++					t.Errorf("expected both diagnostics for %q; release: %v; retained-history: %s", diagnostic, releaseErr, output)
 +				}
 +			}

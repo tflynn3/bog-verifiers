@@ -288,8 +288,9 @@ The capacity producer handoff uses these additive fields in each schema v1 resul
   validators read the same producer report file. A timed
   `cgroup_memory_current.bytes` observation may equal the reported peak
   for its fixture cgroup. Both validators must accept the producer's passing
-  report and reject the same serialized fixture with a 128 MiB overlap
-  observation and a 64 MiB final peak.
+  report and reject the same serialized fixtures with missing, null, or nonzero
+  raw `oom_kill`, decreasing sample time, terminal replay before exhaustion,
+  or a 128 MiB overlap observation with a 64 MiB final peak.
 - `diagnostics.seed_progress` reports `acknowledged_rows`, `published_rows`,
   and the last observed checkpoint `generation`. Update each as acknowledgements
   and exact checkpoint publications arrive so an early exit preserves progress.
@@ -311,8 +312,8 @@ Historical schema v1 parsing remains available without the current evidence flag
 
 Restored parity checks legacy WAL replay, append, and restart, then removes the original data and
 bundle and starts the candidate on the verified v1 restore. Ordinary queries
-and framed cursor walks check restored rows, a durable append, and exact
-restart parity. Restored launches use the shipped control defaults.
+and framed cursor walks check restored rows and exact parity after SIGKILL,
+including a second acknowledged append made after reopening the restore. Restored launches use the shipped control defaults.
 The parity report counts six HTTP 404 responses across status, start, and
 retirement probes on restored startup and restart. When the operator CLI is available, a separate restored copy
 serves the default backup comparison. If `compare -help` advertises `-max-pages`,
@@ -331,13 +332,13 @@ ordinary and framed HTTP queries after replacement and restart. The
 schema v1 report identifies the store in its existing `live_replacement`
 object.
 
-Candidate help gates the writable restore probe. The capacity probes use
-`-enable-capacity-control` when advertised and otherwise try
-`BOG_CAPACITY_CONTROL=1` on loopback. An HTTP 404 from that fallback skips
-the capacity probe. The short Slipway suite checks the disabled default,
-opt-in loopback startup, wildcard bind rejection, the
-exact cutoff with an uncovered tail, held and fresh HTTP ordering, and
-restart parity. The manually dispatched release gate requires the
+Candidate help gates the writable restore probe. The short Slipway suite
+probes `BOG_CAPACITY_CONTROL=1` on loopback and falls back to the advertised
+legacy flag after HTTP 404. Candidates exposing neither capability skip the
+suite. The suite checks the disabled default, verifies HTTP 404 or startup
+refusal with wildcard opt-in, and verifies the exact generation and cutoff
+after SIGKILL. It also compares held and fresh HTTP walks with an uncovered
+tail and checks ordinary query parity after restart. The manually dispatched release gate requires the
 composed revision and passing evidence on both native architectures.
 
 Current cutover qualification also requires the corrupt v1 suffix to exit

@@ -48,10 +48,13 @@ class GateTest(unittest.TestCase):
     def test_cutover_requires_retirement_exit_and_cleanup_evidence(self):
         retirement = dict(status="pass", retire_http_status=204, terminal_page_retried=True,
                           invalid_cursor_http_status=400, pins_while_held=1, pins_after_release=0)
+        published = dict(state="complete", generation=2, covered_rows=4, committed_rows=5)
+        reopened = dict(published)
         evidence = dict(retirement=retirement, continuation_replayed=True, fixture_removed=True,
-                        retire_hidden_checks=2)
+                        retire_hidden_checks=2, environment_opt_in=True, published=published, reopened=reopened,
+                        wildcard_control_404_checks=3, wildcard_opt_in_exit=0)
         processes = [dict(expected_ready=ready, exit_code=code)
-                     for ready, code in ((True, 0), (True, -9), (False, 1), (True, 0))]
+                     for ready, code in ((True, 0), (True, -9), (True, -9), (True, 0), (None, 0), (True, 0))]
         case = dict(evidence=evidence, processes=processes)
         validate_cutover_control(case)
         for item, changes, reason in (
@@ -60,6 +63,10 @@ class GateTest(unittest.TestCase):
             (retirement, {"terminal_page_retried": False}, "terminal retry"),
             (retirement, {"invalid_cursor_http_status": 204}, "authenticated retirement"),
             (processes[1], {"exit_code": 0}, "unexpected candidate exit"),
+            (reopened, {"generation": 1}, "exact generation"),
+            (reopened, {"covered_rows": 5}, "exact generation"),
+            (evidence, {"wildcard_control_404_checks": 2}, "wildcard"),
+            (evidence, {"environment_opt_in": False}, "environment opt-in"),
             (evidence, {"fixture_removed": False}, "fixture cleanup"),
         ):
             with self.subTest(changes=changes), patch.dict(item, changes):
@@ -68,7 +75,8 @@ class GateTest(unittest.TestCase):
 
         parity = dict(fixture_removed=True, corrupt_restore_exit=1, restore_metadata_preserved=True,
                       held_restore_rows=6, replayed_restore_page=True, legacy_restart_unpaged=True,
-                      restored_control_404_checks=6)
+                      restored_control_404_checks=6, reopened_restore_append_status=204,
+                      reopened_restore_restart_rows=8)
         validate_cutover_parity(parity)
         del parity["replayed_restore_page"]
         with self.assertRaisesRegex(verify.Rejected, "continuation replay"):

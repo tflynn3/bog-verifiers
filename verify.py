@@ -221,7 +221,7 @@ class Bog:
         while time.monotonic() < deadline:
             code = self.process.poll()
             if code is not None:
-                check(not should_start and code > 0,
+                check(should_start is not True and code > 0,
                       f"Bog exited during startup (status {code}): {self.log_tail()}")
                 return None
             try:
@@ -229,7 +229,7 @@ class Bog:
             except (OSError, http.client.HTTPException):
                 ready = False
             if ready:
-                check(should_start, f"{self.directory_name}: Bog became ready when startup should have failed")
+                check(should_start is not False, f"{self.directory_name}: Bog became ready when startup should have failed")
                 check(self.process.poll() is None, f"Bog exited at readiness: {self.log_tail()}")
                 return time.monotonic() - self.started
             time.sleep(0.005)
@@ -360,7 +360,7 @@ def run_bog(binary, directory, *, ready=True, flags=(), host="127.0.0.1", capaci
         bog = Bog(binary, directory, path, flags=flags, host=host, capacity=capacity)
         try:
             bog.startup_seconds = bog.wait_startup(ready)
-            case["ready_ms"] = milliseconds(bog.startup_seconds) if ready else None
+            case["ready_ms"] = milliseconds(bog.startup_seconds) if bog.startup_seconds is not None else None
             yield bog
         finally:
             bog.close()
@@ -803,7 +803,7 @@ def advertised_flags(binary, directory):
 
 
 def capacity_control_suite(binary, directory):
-    flags = (CAPACITY_FLAG,) if CAPACITY_FLAG in advertised_flags(binary, directory) else ()
+    legacy_flag = CAPACITY_FLAG in advertised_flags(binary, directory)
     directory.mkdir()
     store = directory / "store"
     rows = [Row(2, "later"), Row(1, "duplicate"), Row(1, "duplicate")]
@@ -815,15 +815,15 @@ def capacity_control_suite(binary, directory):
     hidden_checks = 0
     retire_hidden_checks = 0
 
-    def hidden(bog):
+    def hidden(bog, label, *, count_default=True):
         nonlocal hidden_checks, retire_hidden_checks
         for method, path in (("GET", status_path), ("POST", start_path)):
             status, _ = bog.request(method, path)
-            check(status == 404, f"capacity control with opt-in off: {method} returned HTTP {status}")
-            hidden_checks += 1
+            check(status == 404, f"{label}: {method} returned HTTP {status}, expected 404")
+            hidden_checks += count_default
         status, _ = bog.request("POST", f"{CAPACITY_PATH}?action=retire")
-        check(status == 404, f"capacity retirement with opt-in off returned HTTP {status}")
-        retire_hidden_checks += 1
+        check(status == 404, f"{label}: retirement returned HTTP {status}, expected 404")
+        retire_hidden_checks += count_default
 
     def state(bog, method, path, *, probe=False):
         status, body, _ = bog.checked_exchange(method, path)
@@ -857,8 +857,15 @@ def capacity_control_suite(binary, directory):
               f"capacity control did not publish the requested cutoff: {published!r}")
         return published
 
+    def check_reopened(bog, published):
+        status = state(bog, "GET", f"{CAPACITY_PATH}?action=status&cutoff={published['covered_rows']}")
+        check(all(status[key] == published[key] for key in
+                  ("state", "generation", "covered_rows", "committed_rows")),
+              f"SIGKILL reopen lost the completed generation or exact cutoff: {status!r}")
+        return status
+
     with run_bog(binary, store, host="0.0.0.0") as bog:
-        hidden(bog)
+        hidden(bog, "wildcard with opt-in unset")
         bog.stop()
 
     args = query_args(0, SECOND)
@@ -866,13 +873,29 @@ def capacity_control_suite(binary, directory):
     augmented = [*rows, backfill, tail]
     fresh = oracle(augmented, 0, SECOND)
     retirement = {"status": "skip", "detail": "status omits retired_generation_pins"}
-    with run_bog(binary, store, flags=flags, capacity=not flags) as bog:
-        empty = state(bog, "GET", f"{CAPACITY_PATH}?action=status&cutoff=0", probe=not flags)
+    def seed_and_compact(bog, *, probe=False):
+        empty = state(bog, "GET", f"{CAPACITY_PATH}?action=status&cutoff=0", probe=probe)
         if empty is None:
             bog.stop()
-            return SuiteSkipped(f"candidate has no loopback compaction with {CAPACITY_ENV}=1")
+            return None
         bog.ingest(rows)
         initial = compact(bog, len(rows), empty, len(rows))
+        bog.kill()
+        return initial
+
+    with run_bog(binary, store, capacity=True) as bog:
+        initial = seed_and_compact(bog, probe=True)
+    flags = ()
+    if initial is None:
+        if not legacy_flag:
+            return SuiteSkipped(f"candidate has no loopback compaction with {CAPACITY_ENV}=1")
+        flags = (CAPACITY_FLAG,)
+        with run_bog(binary, store, flags=flags) as bog:
+            initial = seed_and_compact(bog)
+    launch = {"flags": flags, "capacity": not flags}
+    with run_bog(binary, store, **launch) as bog:
+        check_reopened(bog, initial)
+        expect_query(bog, rows, 0, SECOND, label="ordinary query after immediate compaction crash")
         cursor = expect_page(bog, args, expected, 0, 1, None, "first page before compaction")
         bog.ingest([backfill])
         bog.ingest([tail])
@@ -938,17 +961,27 @@ def capacity_control_suite(binary, directory):
         stale_cursor = expect_page(bog, args, fresh, 0, 1, None, "first page before restart")
         bog.kill()
 
-    with run_bog(binary, directory / "wildcard", host="0.0.0.0", ready=False,
-                 flags=flags, capacity=not flags) as bog:
+    with run_bog(binary, store, **launch) as bog:
+        reopened = check_reopened(bog, published)
+        bog.stop()
+    with run_bog(binary, directory / "wildcard", host="0.0.0.0", ready=None, **launch) as bog:
+        wildcard_checks = 0
+        if bog.startup_seconds is not None:
+            hidden(bog, "wildcard with opt-in enabled", count_default=False)
+            wildcard_checks = 3
+            bog.stop()
         wildcard_exit = bog.process.returncode
-        check(wildcard_exit == 1, f"capacity opt-in on wildcard exited with status {wildcard_exit}")
+        check(wildcard_exit == (0 if wildcard_checks else 1),
+              f"capacity opt-in on wildcard exited with status {wildcard_exit}")
     with run_bog(binary, store) as bog:
-        hidden(bog)
+        hidden(bog, "loopback restart with opt-in unset")
         expect_bad_query(bog, {**args, "cursor": stale_cursor}, "prior-process cursor after restart")
         expect_query(bog, augmented, 0, SECOND, label="ordinary query after compacted restart")
         expect_walk(bog, args, fresh, (1, 2), "paged query after compacted restart")
         bog.stop()
     return {"default_http_status": 404, "wildcard_opt_in_exit": wildcard_exit,
+            "wildcard_control_404_checks": wildcard_checks, "environment_opt_in": not flags,
+            "reopened": {key: reopened[key] for key in ("state", "generation", "covered_rows", "committed_rows")},
             "default_control_404_checks": hidden_checks,
             "snapshot_rows": len(expected), "stale_cursor_rejected": True,
             "initial_generation": initial["generation"], "published": published,

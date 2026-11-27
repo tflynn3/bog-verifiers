@@ -447,6 +447,9 @@ def validate_cutover_parity(evidence):
           "parity: missing fail-closed startup or immutable v1 backup metadata evidence")
     check(integer(evidence.get("held_restore_rows"), 6, 6) and evidence.get("replayed_restore_page") is True,
           "parity: missing framed restored continuation replay across append")
+    check(integer(evidence.get("reopened_restore_append_status"), 204, 204) and
+          integer(evidence.get("reopened_restore_restart_rows"), 8, 8),
+          "parity: missing durable append after writable restore reopen")
 
 
 def validate_cutover_control(case):
@@ -461,7 +464,18 @@ def validate_cutover_control(case):
     check(control.get("continuation_replayed") is True and control.get("fixture_removed") is True and
           integer(control.get("retire_hidden_checks"), 2, 2),
           "control: missing continuation replay, disabled retirement, or fixture cleanup evidence")
-    launches = ((True, 0), (True, -signal.SIGKILL), (False, 1), (True, 0))
+    published, reopened = control.get("published") or {}, control.get("reopened") or {}
+    check(control.get("environment_opt_in") is True and
+          published.get("state") == reopened.get("state") == "complete" and
+          all(type(reopened.get(key)) is int and type(published.get(key)) is int and reopened[key] == published[key]
+              for key in ("generation", "covered_rows", "committed_rows")),
+          "control: missing environment opt-in or exact generation after SIGKILL reopen")
+    wildcard_checks, wildcard_exit = control.get("wildcard_control_404_checks"), control.get("wildcard_opt_in_exit")
+    check(integer(wildcard_checks, 3, 3) and integer(wildcard_exit, 0, 0) or
+          integer(wildcard_checks, 0, 0) and integer(wildcard_exit, 1, 1),
+          "control: wildcard must hide the route or reject opt-in at startup")
+    launches = ((True, 0), (True, -signal.SIGKILL), (True, -signal.SIGKILL), (True, 0),
+                (None, wildcard_exit), (True, 0))
     processes = case.get("processes")
     check(isinstance(processes, list) and len(processes) == len(launches) and
           all(proc.get("expected_ready") is ready and integer(proc.get("exit_code"), code, code)
@@ -501,7 +515,10 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
               "control: missing default-off status and start probes")
     if expanded or require_backfill_timelines:
         check(integer(control.get("fresh_rows"), 5, 5), "control: incomplete fresh visibility evidence")
-    check(integer(control["default_http_status"], 404, 404) and integer(control["wildcard_opt_in_exit"], 1) and
+    check(integer(control["default_http_status"], 404, 404) and
+          (integer(control.get("wildcard_opt_in_exit"), 1, 1) or
+           integer(control.get("wildcard_opt_in_exit"), 0, 0) and
+           integer(control.get("wildcard_control_404_checks"), 3, 3)) and
           integer(control["initial_generation"], 0) and published["state"] == "complete" and
           integer(published["generation"], control["initial_generation"] + 1) and
           integer(published["covered_rows"], covered, covered) and
