@@ -319,27 +319,29 @@ Failed runs upload the producer report and logs when available. The workflow
 records the fixture-root check even when the producer exits with an error.
 Historical schema v1 parsing remains available without the current evidence flags.
 
-Both native jobs require an explicit passing `TestReleaseRestoredParity`
-event in `parity-events.jsonl` and a matching schema-v1 `parity.json`.
-The combined producer runs ordinary WAL reopen, held-cursor restore parity,
-and the ADR 0027 crash probe on independent fixtures. The crash case
-sends SIGKILL immediately on HTTP 204 and then verifies all eight rows
-through terminal exhaustion on restart. Strict validation also checks the
-checkpoint and nonempty WAL suffix, observed signal, process reaping, and
-fixture cleanup. Each native qualification records the crash gate checkout,
-candidate revision, fixture and candidate binary digest. The final job
-checks both crash verdicts and prints the checkout and both digests.
-Standard schema-v1 validation still accepts historical parity reports.
+Both native jobs run the combined parity producer and strict parity validator
+from Bog revision `447e996525352ef5dd44d5eae1de09b4cbd53d53`. They require
+passing Go test events in `parity-events.jsonl` and
+`parity-validation-events.jsonl` and matching schema-v1 `parity.json`
+evidence for ordinary WAL reopen, held-cursor restore, immediate
+post-acknowledgment SIGKILL, and `tail_only_two_cycle_parity`. The selected-tail
+case checks both generations' exact recovery points, consumed frame and
+suffix digests, and ordered walks after restart and after independent
+restore. The joint verdict requires both native binaries to qualify for
+the same candidate revision and parity gate revision, with the SHA-256 of
+each binary checked against its native build. Standard schema-v1 validation
+still accepts historical parity reports. HTTP 404 from the opted-in
+loopback capability probe skips the new tail-only cases. Native
+qualification requires them to pass.
+
 Strict native qualification also requires `writable_restore_cycles` in the
-combined parity report. The probe begins with a verified v1 checkpoint and
-suffix, advances the live candidate at two exact cutoffs, and exports and
-verifies a v2 image of each stopped generation through the backup fixture
-helper. It takes the source paths out of reach before writable startup,
-checks held and fresh framed walks and same-directory restart, and verifies
-an acknowledged append after the second independent restore through SIGKILL
-and replay. The first restore checks that `/ready` remains healthy after the
-configured directory symlink is retargeted to procfs. Candidates whose help
-omits `-retained-tail-max-bytes` record a skip for this case.
+combined report. This probe advances a verified v1 restore at two exact
+cutoffs, exports and verifies each v2 image, and checks held and fresh
+framed walks and same-directory restart. Each cycle measures positive
+predecessor pins while its cursor is held, explicitly retires the capture,
+and measures zero pins at the same published cutoff. The first restore
+checks `/ready` after the configured directory symlink is retargeted to
+procfs. The final restored append survives SIGKILL and replay.
 The shared proof and both strict consumers accept an acknowledgment at
 the fresh-visibility sample and reject one after that sample, even if it
 precedes the end of the full walk. Their fixtures cover the passing report
@@ -348,8 +350,7 @@ tests under the race detector before collecting live evidence and record
 the capacity validation revision with the qualification.
 Route capacity fixture failures to the existing Release Verification owner
 with the native architecture, checkout and candidate revisions, and the
-capacity report and runner log. The crash gate owner retains the producer
-checkout and immediate SIGKILL fixture.
+capacity report and runner log. Release Verification owns the pinned parity producer and immediate SIGKILL fixture.
 
 The supplemental parity report checks legacy WAL replay, append, and restart, then removes the original data and
 bundle and starts the candidate on the verified v1 restore. Ordinary queries

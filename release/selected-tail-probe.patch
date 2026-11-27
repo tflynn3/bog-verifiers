@@ -1,0 +1,20 @@
+--- a/verify/release/parity_linux_test.go
++++ b/verify/release/parity_linux_test.go
+@@ -71,0 +72 @@
++	var available bool
+@@ -74 +75 @@
+-		tailProof, err = tailOnlyParity(ctx, binary, root)
++		available, err = selectedTailAvailable(ctx, binary, root)
+@@ -76,0 +78,12 @@
++	if tailErr == nil && !available {
++		detail := "candidate has no opted-in loopback compaction"
++		results.Cases[tailOnlyParityCase] = outcome{Status: "skip", Detail: &detail}
++		return errors.Join(probeErr, ordinaryErr, crashErr, writeReport(path, results))
++	}
++	if tailErr == nil {
++		tailErr = withFixtureRoot(func(root string) error {
++			var err error
++			tailProof, err = tailOnlyParity(ctx, binary, root)
++			return err
++		})
++	}

@@ -5,9 +5,10 @@ import os
 import struct
 import subprocess
 import time
+from urllib.parse import urlencode
 
-from verify import (CAPACITY_PATH, RETAINED_TAIL_FLAG, SECOND, WAL_MAGIC, Row, SuiteSkipped,
-                    advertised_flags, check, commit_marker, encode_rows, expect_page, expect_query,
+from verify import (CAPACITY_PATH, RETAINED_TAIL_FLAG, SECOND, WAL_MAGIC, Row,
+                    advertised_flags, check, commit_marker, encode_rows, expect_page, expect_query, expect_query_error,
                     expect_walk, oracle, query_args, run_bog, unique_fields, wal_frame)
 
 
@@ -50,18 +51,29 @@ def ready_after_retarget(bog, link):
 
 
 def compaction(bog, cutoff, committed):
-    def request(method, action):
-        status, raw = bog.request(method, f"{CAPACITY_PATH}?action={action}&cutoff={cutoff}")
-        check(200 <= status < 300, f"compaction {action} returned HTTP {status}: {raw[:300]!r}")
-        return json.loads(raw, object_pairs_hook=unique_fields)
-
-    state = request("POST", "start")
+    state = compaction_status(bog, "POST", "start", cutoff)
     deadline = time.monotonic() + 5
     while state.get("state") == "running" and time.monotonic() < deadline:
         time.sleep(0.02)
-        state = request("GET", "status")
+        state = compaction_status(bog, "GET", "status", cutoff)
     check(state.get("state") == "complete" and state.get("covered_rows") == cutoff and
           state.get("committed_rows") == committed, f"compaction missed exact cutoff: {state!r}")
+    return state
+
+
+def compaction_status(bog, method, action, cutoff):
+    status, raw = bog.request(method, f"{CAPACITY_PATH}?action={action}&cutoff={cutoff}")
+    check(200 <= status < 300, f"compaction {action} returned HTTP {status}: {raw[:300]!r}")
+    return json.loads(raw, object_pairs_hook=unique_fields)
+
+
+def predecessor_pins(bog, publication):
+    state = compaction_status(bog, "GET", "status", publication["covered_rows"])
+    check(all(state.get(key) == publication[key] for key in ("state", "generation", "covered_rows", "committed_rows")),
+          f"pin observation changed compaction publication: {state!r}")
+    pins = (state.get("metrics") or {}).get("retired_generation_pins")
+    check(type(pins) is int and pins >= 0, f"missing predecessor pin observation: {pins!r}")
+    return pins
 
 
 def bundle_point(bundle, version, covered, next_ordinal, committed, suffix, predecessor=None):
@@ -88,9 +100,8 @@ def bundle_point(bundle, version, covered, next_ordinal, committed, suffix, pred
 
 
 def restore_cycles(binary, directory, helper):
-    if RETAINED_TAIL_FLAG not in advertised_flags(binary, directory):
-        return SuiteSkipped(f"candidate has no {RETAINED_TAIL_FLAG}")
-    check(helper.is_file(), "candidate advertises retained recovery but the backup fixture helper is missing")
+    check(helper.is_file(), "backup fixture helper is missing")
+    available = advertised_flags(binary, directory)
     directory.mkdir()
     seed, bundle, active = (directory / name for name in ("seed", "v1", "cycle-1"))
     rows = [Row(2, "checkpoint"), Row(1, "duplicate"), Row(1, "duplicate")]
@@ -111,7 +122,7 @@ def restore_cycles(binary, directory, helper):
     fixture_tool(helper, "restore", bundle, active)
     bundle.rename(bundle.with_suffix(".parked"))
     seed.rename(seed.with_suffix(".parked"))
-    flags = (f"{RETAINED_TAIL_FLAG}=65536",)
+    flags = (f"{RETAINED_TAIL_FLAG}=65536",) if RETAINED_TAIL_FLAG in available else ()
     args = query_args(0, SECOND)
 
     def walk(bog, expected, label):
@@ -136,9 +147,19 @@ def restore_cycles(binary, directory, helper):
                 readiness = ready_after_retarget(bog, launch)
             cursor = expect_page(bog, args, held, 0, 1, None, "initial retained page", exact_framing=True)
             bog.ingest(extra)
-            compaction(bog, len(rows), len(augmented))
+            publication = compaction(bog, len(rows), len(augmented))
+            pins_while_held = predecessor_pins(bog, publication)
+            check(pins_while_held > 0, "held cursor did not pin the predecessor")
             expect_walk(bog, args, held, (2, 1), "held retained walk after advance", position=1,
                         cursor=cursor, exact_framing=True)
+            retire = urlencode({"action": "retire", "cursor": cursor})
+            status, body = bog.request("POST", f"{CAPACITY_PATH}?{retire}")
+            check(status == 204 and not body, f"predecessor capture retirement returned HTTP {status}: {body!r}")
+            expect_query_error(bog, {**args, "cursor": cursor}, 410, "retired predecessor cursor")
+            deadline = time.monotonic() + 5
+            while (pins_after_release := predecessor_pins(bog, publication)) != 0:
+                check(time.monotonic() < deadline, f"predecessor pins did not drain: {pins_after_release}")
+                time.sleep(0.02)
             fresh = walk(bog, augmented, "fresh retained walk after advance")
             bog.stop()
 
@@ -180,7 +201,8 @@ def restore_cycles(binary, directory, helper):
                                        next_suffix, point), f"cycle {number}: source backup changed")
         cycles.append(dict(input=point, exported=exported, append_status=204, held_rows=len(held),
                            fresh_rows=fresh, restart_rows=restarted, restored_rows=restored_rows,
-                           default_control_status=hidden))
+                           default_control_status=hidden, pins_while_held=pins_while_held,
+                           pins_after_release=pins_after_release))
         active, point, rows = restored, exported, augmented
 
     with run_bog(binary, active, flags=flags) as bog:

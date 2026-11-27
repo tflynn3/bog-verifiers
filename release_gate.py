@@ -23,6 +23,7 @@ PRODUCERS = {"admission", "durability", "capacity", "parity"}
 FIXTURE_ROOT_CLEANUP = "fixture_root_cleanup"
 POST_RESTORE_ACK_CRASH = "post_restore_ack_crash"
 WRITABLE_RESTORE_CYCLES = "writable_restore_cycles"
+TAIL_ONLY_PARITY = "tail_only_two_cycle_parity"
 REPLACEMENT_RESTART = "replacement_restart"
 FIXED_BUDGET_REPLAY = "fixed_budget_replay"
 CONTROL_SCOPE = "control_scope"
@@ -501,6 +502,7 @@ def validate_combined_parity(directory, expected, *, require_restore_cycles=Fals
           f"{label}: expected both candidate processes reaped and fixture removed")
 
     if require_restore_cycles:
+        passing_case(report, "parity", TAIL_ONLY_PARITY)
         validate_restore_cycles(report)
 
 
@@ -538,6 +540,8 @@ def validate_restore_cycles(report):
             append_status=204, held_rows=held, fresh_rows=held + 3, restart_rows=held + 3,
             restored_rows=held + 3, default_control_status=404).items()),
             f"{label}: incomplete cycle {number} append, paging, restart or restore evidence")
+        check(integer(cycle.get("pins_while_held"), 1) and integer(cycle.get("pins_after_release"), 0, 0),
+              f"{label}: cycle {number} is missing measured predecessor pin drain")
         generations.add(exported["generation"])
         previous = exported
     check(evidence.get("fixture_removed") is True and
@@ -556,11 +560,13 @@ def record_restore_cycles(binary, directory, expected, helper):
     processes = []
     token = PROCESS_LOGS.set((logs, processes))
     try:
-        with tempfile.TemporaryDirectory(prefix="bog-release-restore-") as workspace:
-            evidence = restore_cycles(binary, Path(workspace) / "cycles", helper)
-        if isinstance(evidence, SuiteSkipped):
-            case.update(status="skip", detail=evidence.reason)
+        selected = report["cases"][TAIL_ONLY_PARITY]
+        if selected["status"] == "skip":
+            case.update(status="skip", detail=selected["detail"])
         else:
+            passing_case(report, "parity", TAIL_ONLY_PARITY)
+            with tempfile.TemporaryDirectory(prefix="bog-release-restore-") as workspace:
+                evidence = restore_cycles(binary, Path(workspace) / "cycles", helper)
             evidence["fixture_removed"] = not Path(workspace).exists()
             case.update(status="pass", evidence=evidence)
             validate_restore_cycles(report)
@@ -796,7 +802,7 @@ def main():
     parser.add_argument("directory", type=Path)
     parser.add_argument("--arch", choices=("amd64", "arm64"))
     parser.add_argument("--binary-sha256")
-    parser.add_argument("--gate-revision")
+    parser.add_argument("--parity-gate-revision", "--gate-revision")
     parser.add_argument("--verifier-revision")
     parser.add_argument("--capacity-validation-revision")
     parser.add_argument("--fixture-parent", type=Path)
@@ -845,7 +851,7 @@ def main():
             if cutover:
                 check(platform.system() == "Linux" and native_arch == args.arch,
                       f"cutover must be validated on native Linux {args.arch}")
-                check(re.fullmatch(r"[0-9a-f]{40}", args.gate_revision or ""), "invalid crash gate checkout revision")
+                check(re.fullmatch(r"[0-9a-f]{40}", args.parity_gate_revision or ""), "invalid parity gate checkout revision")
                 check(re.fullmatch(r"[0-9a-f]{40}", args.verifier_revision or ""), "invalid verifier checkout revision")
                 check(re.fullmatch(r"[0-9a-f]{40}", args.capacity_validation_revision or ""),
                       "invalid capacity validation checkout revision")
@@ -859,11 +865,12 @@ def main():
             qualification = {**expected, "arch": args.arch}
             if cutover:
                 qualification["current_observations"] = True
-                qualification["crash_gate_revision"] = args.gate_revision
+                qualification["parity_gate_revision"] = args.parity_gate_revision
                 qualification["verifier_revision"] = args.verifier_revision
                 qualification["capacity_validation_revision"] = args.capacity_validation_revision
                 qualification[POST_RESTORE_ACK_CRASH] = True
                 qualification[WRITABLE_RESTORE_CYCLES] = True
+                qualification[TAIL_ONLY_PARITY] = True
             if args.require_replacement_restart:
                 qualification[REPLACEMENT_RESTART] = True
             if args.require_control_scope:

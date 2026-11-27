@@ -123,8 +123,14 @@ class GateTest(unittest.TestCase):
                 validate_combined_parity(directory, identity)
 
             validate_report()
-            with self.assertRaisesRegex(verify.Rejected, "missing required case writable_restore_cycles"):
-                validate_combined_parity(directory, identity, require_restore_cycles=True)
+            for selected, reason in ((None, "missing required case tail_only_two_cycle_parity"),
+                                     ("skip", "tail_only_two_cycle_parity did not pass"),
+                                     ("pass", "missing required case writable_restore_cycles")):
+                if selected is not None:
+                    cases["tail_only_two_cycle_parity"] = {"status": selected}
+                (directory / "parity.json").write_text(json.dumps(report))
+                with self.assertRaisesRegex(verify.Rejected, reason):
+                    validate_combined_parity(directory, identity, require_restore_cycles=True)
             for target, changes, reason in (
                 (report, {"revision": "c" * 40}, "mismatched revision"),
                 (report, {"binary_sha256": "c" * 64}, "mismatched binary_sha256"),
@@ -152,11 +158,16 @@ class GateTest(unittest.TestCase):
                 validate_report()
 
     def test_restore_cycle_probe_skips_before_needing_new_fixture_helper(self):
-        from release_restore import restore_cycles
+        from release_gate import TAIL_ONLY_PARITY, WRITABLE_RESTORE_CYCLES, record_restore_cycles
 
-        with patch("release_restore.advertised_flags", return_value=set()):
-            self.assertIsInstance(restore_cycles(ROOT / "bog", ROOT / "unused", ROOT / "missing-helper"),
-                                  verify.SuiteSkipped)
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            parity = directory / "parity.json"
+            skipped = {"status": "skip", "detail": "no opted-in loopback compaction"}
+            parity.write_text(json.dumps({"cases": {TAIL_ONLY_PARITY: skipped}}))
+            record_restore_cycles(ROOT / "bog", directory, {}, directory / "missing-helper")
+            case = json.loads(parity.read_text())["cases"][WRITABLE_RESTORE_CYCLES]
+            self.assertEqual(case, dict(skipped, processes=[]))
 
     def test_strict_parity_requires_two_linked_writable_restore_cycles(self):
         from release_gate import WRITABLE_RESTORE_CYCLES, validate_restore_cycles
@@ -170,7 +181,7 @@ class GateTest(unittest.TestCase):
         initial, first, second = point(1, 100, 3, "a"), point(2, 200, 6, "b"), point(2, 300, 9, "c")
         cycles = [dict(input=source, exported=exported, held_rows=held,
                        fresh_rows=held + 3, restart_rows=held + 3, restored_rows=held + 3,
-                       append_status=204, default_control_status=404)
+                       append_status=204, default_control_status=404, pins_while_held=1, pins_after_release=0)
                   for source, exported, held in ((initial, first, 6), (first, second, 9))]
         evidence = dict(initial=initial, cycles=cycles, descriptor_ready_status=200, fixture_removed=True,
                         final_append_status=204, final_exit_signal=9, final_restart_rows=13)
@@ -188,6 +199,8 @@ class GateTest(unittest.TestCase):
             (evidence, {"descriptor_ready_status": 503}, "readiness"),
             (cycles[0], {"held_rows": True}, "incomplete cycle 1"),
             (cycles[1], {"restart_rows": 9}, "incomplete cycle 2"),
+            (cycles[0], {"pins_while_held": 0}, "cycle 1 is missing measured predecessor pin drain"),
+            (cycles[1], {"pins_after_release": 1}, "cycle 2 is missing measured predecessor pin drain"),
             (second, {"suffix_bytes": 99}, "recovery bounds"),
             (second, {"generation": first["generation"]}, "does not advance"),
             (second, {"covered_offset": 301, "committed_end": 401}, "does not advance"),
