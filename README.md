@@ -223,16 +223,14 @@ docker start -a "$container"
 
 Run harness regressions with `python3 -B -m unittest discover -s tests -v`.
 
-## Linux release qualification for #108
+## Linux release qualification for #108 and #116
 
 Storage owns writable recovery and checkpoint publication under #53.
 Query/HTTP owns the cursor progress contract under #70.
-Release Verification owns the native producers and validators.
-Core Architecture owns the registry and fitness companion.
-Release Verification owns the gate and uses the existing Query/HTTP owner's
-paging and framing coverage. Recheck the HTTP read lease and retained paging
-handoff before dispatching #104. Keep #81 behind the #108 writable recovery
-handoff.
+Release Verification owns the native gate, producers, and validators.
+Core Architecture owns the registry and fitness companion. Recheck the
+Storage and Query/HTTP leases and the selector and query delivery handoffs
+before dispatching the reviewed #108 and #116 revision.
 
 Dispatch **Linux release verification** from the verifier ref with the full
 composed Bog commit SHA. The workflow builds one clean Go 1.27.0 binary on
@@ -242,6 +240,17 @@ requires both architecture results for the dispatched revision and distinct
 binary digests. The `linux-release-evidence-amd64` and
 `linux-release-evidence-arm64` artifacts contain the reports, build metadata,
 digests, and logs.
+
+Both runners require explicit passing Go test events for all seven real-TCP
+query test groups and their required subtests in the candidate checkout.
+These cover failed opening writes, capture slot reuse, retirement, shutdown
+while a resume is held, fitting pages, and refusal framing. The pinned query
+model also requires fitting pages at opening limits 1 and 10 in ordinary WAL
+and retained modes, replay in both modes, and listener startup tests. The
+model logs the full candidate revision and native binary SHA-256. The gate
+checks both values and retains the raw model, handler, and validation events.
+A retained candidate without opted-in loopback compaction reports a skipped
+retained case. Strict native qualification requires a pass in both modes.
 
 The workflow runs the pinned #70 production-client paging probe against the
 candidate binary and runs the candidate checkout's #53 Linux durability
@@ -320,7 +329,7 @@ records the fixture-root check even when the producer exits with an error.
 Historical schema v1 parsing remains available without the current evidence flags.
 
 Both native jobs run the combined parity producer and strict parity validator
-from Bog revision `447e996525352ef5dd44d5eae1de09b4cbd53d53`. They require
+from Bog revision `dcbfa3fa98d75f9dca1dbff1b035d814f37fe438`. They require
 passing Go test events in `parity-events.jsonl` and
 `parity-validation-events.jsonl` and matching schema-v1 `parity.json`
 evidence for ordinary WAL reopen, held-cursor restore, immediate
@@ -331,8 +340,13 @@ restore. The joint verdict requires both native binaries to qualify for
 the same candidate revision and parity gate revision, with the SHA-256 of
 each binary checked against its native build. Standard schema-v1 validation
 still accepts historical parity reports. HTTP 404 from the opted-in
-loopback capability probe skips the new tail-only cases. Native
-qualification requires them to pass.
+loopback probe or an absent `bog.authority` after the first writable tail
+publication skips selected-tail parity. Ordinary WAL parity still runs.
+The selector reader follows ADR 0038's proposed v2 encoding. Storage
+confirmation is pending. The probe opens `bog.backup` through the same
+checked artifact opener and tests that FIFO metadata is rejected within
+the parity deadline. Native qualification requires selected-tail parity
+to pass.
 
 Strict native qualification also requires `writable_restore_cycles` in the
 combined report. This probe advances a verified v1 restore at two exact

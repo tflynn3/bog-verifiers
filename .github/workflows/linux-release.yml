@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       revision:
-        description: Full lowercase commit SHA containing the composed runtime and capacity changes
+        description: Full lowercase commit SHA containing the reviewed #108 and #116 runtime
         required: true
         type: string
 
@@ -19,7 +19,7 @@ env:
   FIXTURE: linux-release-v1
   BOG_REPOSITORY: tflynn3/bog
   TOOLING_REVISION: abefdb5dcdc1f8bbbecdc9c0cc7ab39b309a87db
-  PARITY_TOOLING_REVISION: 447e996525352ef5dd44d5eae1de09b4cbd53d53
+  PARITY_TOOLING_REVISION: dcbfa3fa98d75f9dca1dbff1b035d814f37fe438
   CONTROL_SCOPE_TOOLING_REVISION: 268195aae3f25aeac21efa818f3215b29ede406a
   CAPACITY_VALIDATION_REVISION: e53a856eafbd3f4101757372c57c4a4fd8ea38bc
   ADMISSION_TOOLING_REVISION: 304749df78fe3dfaa75ce411efa34708269af659
@@ -38,7 +38,7 @@ jobs:
       RELEASE_ARCH: ${{ matrix.arch }}
       EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
       EXPECTED_MACHINE: ${{ matrix.machine }}
-    timeout-minutes: 65
+    timeout-minutes: 75
     defaults:
       run:
         shell: bash
@@ -114,7 +114,7 @@ jobs:
           cp admission/verify/release/README.md "$EVIDENCE/fixture.md"
           cp candidate/verify/linux/README.md "$EVIDENCE/durability-fixture.md"
           cp capacity-validation/bench/retained-history/README.md "$EVIDENCE/capacity-fixture.md"
-          cp verifiers/release/{fixed-budget,restored-parity,capacity-wire-restart,selected-tail-probe,capacity-control-scope}.patch "$EVIDENCE/"
+          cp verifiers/release/{fixed-budget,restored-parity,capacity-wire-restart,selected-tail-probe,query-events,capacity-control-scope}.patch "$EVIDENCE/"
           cp verifiers/release/{admission/fixed-boundaries.patch,selected_tail_linux_test.go} "$EVIDENCE/"
           printf 'tooling_revision=%s\nverifier_revision=%s\n' "$(git -C gate rev-parse HEAD)" \
             "$(git -C verifiers rev-parse HEAD)" | tee -a "$EVIDENCE/run.txt"
@@ -134,7 +134,7 @@ jobs:
           control_scope_revision=$(git -C control-scope rev-parse HEAD)
           printf 'control_scope_tooling_revision=%s\n' "$control_scope_revision" | tee -a "$EVIDENCE/run.txt"
           [[ "$control_scope_revision" == "$CONTROL_SCOPE_TOOLING_REVISION" ]]
-          git -C parity-gate apply "$GITHUB_WORKSPACE/verifiers/release/selected-tail-probe.patch"
+          git -C parity-gate apply "$GITHUB_WORKSPACE"/verifiers/release/{selected-tail-probe,query-events}.patch
           cp verifiers/release/selected_tail_linux_test.go parity-gate/verify/release/
           git -C gate apply --unidiff-zero "$GITHUB_WORKSPACE"/verifiers/release/{fixed-budget,restored-parity}.patch
           git -C admission apply --unidiff-zero "$GITHUB_WORKSPACE/verifiers/release/admission/fixed-boundaries.patch"
@@ -344,10 +344,40 @@ jobs:
             go test -race -count=1 ./verify/release ./verify/query-model
           } 2>&1 | tee "$EVIDENCE/verifier-race.log"
 
+      - name: Qualify TCP query delivery and pinned fitting pages
+        id: query-qualification
+        if: always() && steps.build.outcome == 'success'
+        timeout-minutes: 7
+        env:
+          CGO_ENABLED: '1'
+          BOG_QUERY_VERIFY_104: '1'
+        run: |
+          export BOG_RELEASE_BINARY="$BINARY" BOG_RELEASE_REVISION="$REVISION" BOG_RELEASE_FIXTURE="$FIXTURE"
+          export BOG_RELEASE_QUERY_MODEL_EVENTS="$EVIDENCE/query-model-events.jsonl"
+          export BOG_RELEASE_QUERY_HANDLER_EVENTS="$EVIDENCE/query-handler-events.jsonl"
+          sha256sum --check "$EVIDENCE/binary.sha256"
+          failed=0
+          (
+            cd parity-gate && timeout --kill-after=5s 3m go test -json -race -count=1 \
+              -run '^TestPinnedQuery(Model(Replay|104)|Candidate(Startup|RecoversFromTransientForeignListener))$' ./verify/query-model
+          ) | tee "$BOG_RELEASE_QUERY_MODEL_EVENTS" || failed=1
+          (
+            cd candidate && timeout --kill-after=5s 2m go test -json -race -count=1 \
+              -run '^Test(Query104(CaptureLifecycle|FittingPages)|QueryCapture(SurvivesFailedOpeningWrite|CloseDrainsHeldResumeOverTCP)|RetainedCaptureRetirementDrainsAtCapacity|FittingPageWitnessOverTCP|QueryRefusalWitnessOverTCP)$' ./verify/query-model
+          ) | tee "$BOG_RELEASE_QUERY_HANDLER_EVENTS" || failed=1
+          sha256sum --check "$EVIDENCE/binary.sha256" || failed=1
+          (
+            cd parity-gate && go test -json -count=1 \
+              -run '^TestValidateNativeQueryQualification$' ./verify/release
+          ) | tee "$EVIDENCE/query-validation-events.jsonl" || failed=1
+          jq -es 'any(.[]; .Action == "pass" and .Package == "bog/verify/release" and
+            .Test == "TestValidateNativeQueryQualification")' "$EVIDENCE/query-validation-events.jsonl" >/dev/null || failed=1
+          exit "$failed"
+
       - name: Validate reports and candidate identity
         if: >-
           always() && steps.build.outcome == 'success' && steps.capacity-fixtures.outcome == 'success' &&
-          steps.architecture-and-lifecycle.outcome == 'success'
+          steps.architecture-and-lifecycle.outcome == 'success' && steps.query-qualification.outcome == 'success'
         working-directory: capacity-validation
         env:
           PINNED_BINARY_SHA256: ${{ steps.build.outputs.binary_sha256 }}

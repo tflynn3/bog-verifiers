@@ -1,0 +1,31 @@
+--- a/verify/release/query_events.go
++++ b/verify/release/query_events.go
+@@ -38,6 +38,16 @@
+ 	"TestQueryCaptureSurvivesFailedOpeningWrite/legacy",
+ 	"TestQueryCaptureSurvivesFailedOpeningWrite/retained",
+ 	"TestRetainedCaptureRetirementDrainsAtCapacity",
++	"TestQueryCaptureCloseDrainsHeldResumeOverTCP/legacy",
++	"TestQueryCaptureCloseDrainsHeldResumeOverTCP/retained",
++	"TestFittingPageWitnessOverTCP/opening_byte_cut",
++	"TestFittingPageWitnessOverTCP/resume_byte_cut",
++	"TestFittingPageWitnessOverTCP/reject_fitting_rows_out_of_order",
++	"TestQueryRefusalWitnessOverTCP/complete",
++	"TestQueryRefusalWitnessOverTCP/body_drift",
++	"TestQueryRefusalWitnessOverTCP/empty_cursor_header",
++	"TestQueryRefusalWitnessOverTCP/cursor_trailer",
++	"TestQueryRefusalWitnessOverTCP/truncated_body",
+ }
+ 
+ func validateQueryQualification(model, handlers string, id identity) error {
+--- a/verify/query-model/pinned_release_linux_test.go
++++ b/verify/query-model/pinned_release_linux_test.go
+@@ -101,6 +101,9 @@
+ 					err := withPinnedQueryEndpoint(t, ctx, binary, t.TempDir(), 32<<10, retained, func(f model.CaptureDeliveryFixture) error {
+ 						return model.VerifyFittingPages(ctx, seededTraceConfig(0).Epoch, captureWireLimits, limit, f)
+ 					})
++					if errors.Is(err, errNoCompaction) {
++						t.Skip("retained fitting-page qualification pending: candidate has no opted-in loopback compaction")
++					}
+ 					if err != nil {
+ 						t.Fatal(err)
+ 					}

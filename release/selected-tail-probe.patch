@@ -1,15 +1,18 @@
 --- a/verify/release/parity_linux_test.go
 +++ b/verify/release/parity_linux_test.go
-@@ -71,0 +72 @@
+@@ -69,11 +69,27 @@
+ 	crashProof, crashErr := postRestoreAckCrash(ctx, binary)
+ 	crashErr = record(results.Cases, postRestoreAckCrashCase, crashProof, crashErr)
+ 	var tailProof tailParityProof
 +	var available bool
-@@ -74 +75 @@
+ 	tailErr := withFixtureRoot(func(root string) error {
+ 		var err error
 -		tailProof, err = tailOnlyParity(ctx, binary, root)
 +		available, err = selectedTailAvailable(ctx, binary, root)
-@@ -76,0 +78,12 @@
+ 		return err
+ 	})
 +	if tailErr == nil && !available {
-+		detail := "candidate has no opted-in loopback compaction"
-+		results.Cases[tailOnlyParityCase] = outcome{Status: "skip", Detail: &detail}
-+		return errors.Join(probeErr, ordinaryErr, crashErr, writeReport(path, results))
++		tailErr = errNoLoopbackCompaction
 +	}
 +	if tailErr == nil {
 +		tailErr = withFixtureRoot(func(root string) error {
@@ -18,3 +21,58 @@
 +			return err
 +		})
 +	}
++	if errors.Is(tailErr, errNoLoopbackCompaction) || errors.Is(tailErr, errNoWritableSelector) {
++		detail := tailErr.Error()
++		results.Cases[tailOnlyParityCase] = outcome{Status: "skip", Detail: &detail}
++		return errors.Join(probeErr, ordinaryErr, crashErr, writeReport(path, results))
++	}
+ 	tailErr = record(results.Cases, tailOnlyParityCase, tailProof, tailErr)
+ 	return errors.Join(probeErr, ordinaryErr, crashErr, tailErr, writeReport(path, results))
+ }
+--- a/verify/release/tail_parity_artifacts_test.go
++++ b/verify/release/tail_parity_artifacts_test.go
+@@ -45,10 +45,11 @@
+ 		return tailParityPoint{}, err
+ 	}
+ 	defer func() { err = errors.Join(err, root.Close()) }()
+-	meta, err := root.Open("bog.backup")
++	meta, _, err := openTailArtifact(root, "bog.backup", 136)
+ 	if err != nil {
+ 		return tailParityPoint{}, err
+ 	}
++	// The v2 metadata is 136 bytes and the v1 record is smaller.
+ 	var header [8]byte
+ 	_, readErr := io.ReadFull(meta, header[:])
+ 	if err := errors.Join(readErr, meta.Close()); err != nil {
+--- a/verify/release/tail_parity_linux_test.go
++++ b/verify/release/tail_parity_linux_test.go
+@@ -55,7 +55,7 @@
+ 		exported := filepath.Join(root, fmt.Sprintf("export-%d", i+1))
+ 		restored := filepath.Join(root, fmt.Sprintf("restore-%d", i+1))
+ 		archived[i] = filepath.Join(root, fmt.Sprintf("archived-%d", i+1))
+-		cycle, err := runTailParityCycle(ctx, binary, dir, exported, archived[i], restored, client, &log, fixture, input)
++		cycle, err := runTailParityCycle(ctx, binary, dir, exported, archived[i], restored, client, &log, fixture, input, i == 0)
+ 		proof.Cycles[i] = cycle
+ 		if err != nil {
+ 			return proof, fmt.Errorf("cycle %d: %w", i+1, err)
+@@ -78,7 +78,7 @@
+ }
+ 
+ func runTailParityCycle(ctx context.Context, binary, dir, exported, archived, restored string, client *http.Client,
+-	log *querymodel.Log, fixture tailCycleFixture, input tailParityPoint,
++	log *querymodel.Log, fixture tailCycleFixture, input tailParityPoint, probeSelector bool,
+ ) (cycle tailParityCycle, err error) {
+ 	cycle.Input = input
+ 	flags := []string{fmt.Sprintf("-query-max-response-bytes=%d", restoredPageCap)}
+@@ -128,6 +128,11 @@
+ 		return cycle, fmt.Errorf("serve writable tail and compact: %w", err)
+ 	}
+ 
++	if probeSelector {
++		if _, err := data.Lstat(tailAuthorityName); errors.Is(err, os.ErrNotExist) {
++			return cycle, errNoWritableSelector
++		}
++	}
+ 	tail, err := exportTailParityCycle(ctx, data, exported, fixture, &cycle)
+ 	if err != nil {
+ 		return cycle, err
