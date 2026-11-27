@@ -848,6 +848,21 @@ def ordered_sha256(rows):
     return hashlib.sha256(encode_rows(rows)).hexdigest()
 
 
+def expect_export_walk(exporter, bog, args, expected, label):
+    result = subprocess.run(
+        [str(exporter), "-url", f"http://127.0.0.1:{bog.port}",
+         "-start", args["start"], "-end", args["end"], "-limit", "1",
+         "-max-pages", str(len(expected)), "-timeout", "5s"],
+        stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
+    )
+    check(result.returncode == 0, f"{label}: bog-export exited {result.returncode}: {result.stderr[:500]!r}")
+    check(result.stdout.endswith(b"\n") and result.stdout.count(b"\n") == len(expected),
+          f"{label}: bog-export did not emit exactly one NDJSON record per row")
+    actual = decode_rows(result.stdout)
+    expect_rows(actual, expected, f"{label}: bog-export continuation walk")
+    return ordered_sha256(actual)
+
+
 CONTROL_SCOPE_REQUESTS = (
     ("status", "GET", f"{CAPACITY_PATH}?action=status&cutoff=0"),
     ("start", "POST", f"{CAPACITY_PATH}?action=start&cutoff=2"),
@@ -894,7 +909,7 @@ def control_scope_suite(binary, directory):
     return evidence
 
 
-def capacity_control_suite(binary, directory, *, require_replacement_restart=False):
+def capacity_control_suite(binary, directory, *, require_replacement_restart=False, exporter=None):
     available = advertised_flags(binary, directory)
     legacy_flag = CAPACITY_FLAG in available
     strict_replay = require_replacement_restart or RETAINED_TAIL_FLAG in available
@@ -1070,6 +1085,8 @@ def capacity_control_suite(binary, directory, *, require_replacement_restart=Fal
                     retirement["resume_after_retire_http_status"] = refused["status"]
 
         fresh_digest = fresh_parity(bog, "after replacement")
+        if exporter is not None:
+            fresh_export_digest = expect_export_walk(exporter, bog, args, fresh, "after replacement")
         stale_cursor = expect_page(bog, args, fresh, 0, 1, None, "first page before restart")
         bog.kill()
 
@@ -1089,6 +1106,8 @@ def capacity_control_suite(binary, directory, *, require_replacement_restart=Fal
         hidden(bog, "loopback restart with opt-in unset")
         expect_bad_query(bog, {**args, "cursor": stale_cursor}, "prior-process cursor after restart")
         restart_digest = fresh_parity(bog, "same-directory restart")
+        if exporter is not None:
+            restart_export_digest = expect_export_walk(exporter, bog, args, fresh, "same-directory restart")
         bog.stop()
     return {"default_http_status": 404, "wildcard_opt_in_exit": wildcard_exit,
             "wildcard_control_404_checks": wildcard_checks, "environment_opt_in": not flags,
@@ -1104,6 +1123,8 @@ def capacity_control_suite(binary, directory, *, require_replacement_restart=Fal
                 "fresh_ordered_sha256": fresh_digest, "restart_ordered_sha256": restart_digest,
                 "terminal_sha256": hashlib.sha256(terminal_body).hexdigest(),
                 "terminal_retry_sha256": hashlib.sha256(retry[1]).hexdigest(),
+                **({"export_fresh_ordered_sha256": fresh_export_digest,
+                    "export_restart_ordered_sha256": restart_export_digest} if exporter is not None else {}),
             }} if strict_replay else {})}
 
 

@@ -479,6 +479,10 @@ row digests and the raw terminal response and retry digests. A separate sparse,
 byte-trimmed fixture verifies exhaustion with a smaller continuation limit at
 the issuing budget. The low-budget opening may cleanly refuse the request
 before issuing a cursor. The higher-budget walk must issue and exhaust.
+Strict served-runtime validation also requires `bog-export` from the same
+candidate checkout to walk one row per page after replacement and after restart.
+Both walks must exhaust within the exact page budget and match the ordered
+ledger digest in `control.json`, including duplicate rows and the committed suffix.
 Qualification also requires the architecture and lifecycle tests to pass.
 Historical report validation remains available without
 `--require-replacement-restart` and `--require-control-scope`.

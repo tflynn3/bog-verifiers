@@ -710,13 +710,17 @@ def validate_terminal_replay(evidence, label):
           f"{label}: missing byte-identical terminal replay")
 
 
-def validate_replacement_restart(report, control):
+def validate_replacement_restart(report, control, *, require_export_walk=False):
     replay = control.get("replacement_replay") or {}
     rows, backfill, suffix = replacement_fixture()
     ordered = ordered_sha256(oracle([*rows, backfill, suffix], 0, SECOND))
     check(integer(replay.get("work_budget"), REPLACEMENT_WORK_BUDGET, REPLACEMENT_WORK_BUDGET) and
           replay.get("fresh_ordered_sha256") == replay.get("restart_ordered_sha256") == ordered,
           "replacement restart: missing exact ordered replay of the checkpoint and committed suffix")
+    export_keys = ("export_fresh_ordered_sha256", "export_restart_ordered_sha256")
+    if require_export_walk or any(key in replay for key in export_keys):
+        check(all(replay.get(key) == ordered for key in export_keys),
+              "replacement restart: missing exact bog-export continuation walks before and after restart")
     validate_terminal_replay(replay, "replacement restart")
 
     case = passing_case(report, "control", FIXED_BUDGET_REPLAY)
@@ -772,8 +776,8 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
         check(parity.get("corrupt_restore_preserved") is True,
               "parity: missing corrupt restore file preservation evidence")
         validate_cutover_control(control_case)
-    if require_replacement_restart:
-        validate_replacement_restart(control_report, control)
+    if require_replacement_restart or require_served_runtime:
+        validate_replacement_restart(control_report, control, require_export_walk=require_served_runtime)
     if require_control_scope:
         validate_control_scope(control_report)
     published = control["published"]
@@ -798,9 +802,11 @@ def validate(directory, expected, *, require_fixture_root_cleanup=False, require
               "control: incomplete cursor evidence across compaction and restart")
 
 
-def produce_control(binary, directory, expected, *, require_replacement_restart=False, require_control_scope=False):
+def produce_control(binary, directory, expected, *, require_replacement_restart=False, require_control_scope=False,
+                    exporter=None):
     suites = [("capacity_control", partial(capacity_control_suite,
-                                          require_replacement_restart=require_replacement_restart))]
+                                          require_replacement_restart=require_replacement_restart,
+                                          exporter=exporter))]
     if require_replacement_restart:
         suites.append((FIXED_BUDGET_REPLAY, fixed_budget_replay_suite))
     if require_control_scope:
@@ -852,6 +858,7 @@ def main():
     parser.add_argument("--require-replacement-restart", action="store_true")
     parser.add_argument("--require-control-scope", action="store_true")
     parser.add_argument("--require-served-runtime", action="store_true")
+    parser.add_argument("--exporter", type=Path, help="candidate bog-export executable for the control fixture")
     parser.add_argument("--restore-helper", type=Path)
     args = parser.parse_args()
     try:
@@ -860,9 +867,12 @@ def main():
         expected = identity(binary, args.revision, args.fixture)
         native_arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
         if args.action == "control":
+            check(args.exporter is None or args.require_replacement_restart,
+                  "bog-export requires the replacement restart control fixture")
             produce_control(binary, directory, {**expected, "arch": native_arch},
                             require_replacement_restart=args.require_replacement_restart,
-                            require_control_scope=args.require_control_scope)
+                            require_control_scope=args.require_control_scope,
+                            exporter=args.exporter.resolve() if args.exporter else None)
         elif args.action == "record-cleanup":
             check(args.fixture_parent is not None, "durability fixture parent is required")
             record_fixture_root_cleanup(directory, expected, args.fixture_parent)

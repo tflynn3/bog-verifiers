@@ -261,11 +261,17 @@ class GateTest(unittest.TestCase):
                   processes=[dict(expected_ready=True, exit_code=0) for _ in range(2)])}}
         control = {"replacement_replay": replay}
         validate_replacement_restart(report, control)
+        with self.assertRaisesRegex(verify.Rejected, "bog-export continuation walks"):
+            validate_replacement_restart(report, control, require_export_walk=True)
+        replay.update(export_fresh_ordered_sha256=digest, export_restart_ordered_sha256=digest)
+        validate_replacement_restart(report, control, require_export_walk=True)
         for target, changes, reason in (
             (replay, {"restart_ordered_sha256": verify.ordered_sha256(expected[:-2] + expected[-1:])},
              "committed suffix"),
             (replay, {"fresh_ordered_sha256": verify.ordered_sha256(expected[1:])}, "ordered replay"),
             (replay, {"terminal_retry_sha256": "b" * 64}, "byte-identical"),
+            (replay, {"export_fresh_ordered_sha256": None}, "bog-export continuation walks"),
+            (replay, {"export_restart_ordered_sha256": "b" * 64}, "bog-export continuation walks"),
             (low, {"next_cursor": True}, "partial opening response"),
             (high, {"outcome": "clean_rejection"}, "incomplete ordered walk"),
             (high, {"terminal_retry_sha256": None}, "byte-identical"),

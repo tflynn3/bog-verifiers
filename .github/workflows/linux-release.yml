@@ -224,8 +224,10 @@ jobs:
           )
           capacity() (
             capacity_control_scope 2>&1 | tee "$EVIDENCE/capacity_control_scope.log" || exit
+            local exporter="$RUNNER_TEMP/bog-release-exporter"
+            (cd candidate && go build -trimpath -o "$exporter" ./cmd/bog-export) || exit
             python3 -B verifiers/release_gate.py control "$BINARY" "$REVISION" "$FIXTURE" "$EVIDENCE" \
-              --require-replacement-restart --require-control-scope \
+              --require-replacement-restart --require-control-scope --exporter "$exporter" \
               2>&1 | tee "$EVIDENCE/control.log" || exit
             case "$(jq -er '.cases.capacity_control.status' "$EVIDENCE/control.json")" in
               skip) echo "The composed runtime requires loopback compaction control. See control.json."; exit 1 ;;
