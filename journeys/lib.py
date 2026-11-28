@@ -19,6 +19,7 @@ and 2 for a harness error. The data directory lives under the per-journey work d
 """
 
 import argparse
+import http.client
 import json
 import os
 import signal
@@ -26,9 +27,7 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 
@@ -63,25 +62,28 @@ class Bog:
         return f"http://127.0.0.1:{self.port}"
 
     def start(self, timeout=30):
-        self.data_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(self.data_dir, 0o700)
-        log = self.log_path.open("ab")
-        self.proc = subprocess.Popen(
-            [self.binary, "-data-dir", str(self.data_dir), "-addr", f"127.0.0.1:{self.port}", *self.extra_args],
-            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        if self.proc is None:
+            self.data_dir.mkdir(mode=0o700, parents=True)
+            os.chmod(self.data_dir, 0o700)
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        with self.log_path.open("ab") as log:
+            self.proc = subprocess.Popen(
+                [self.binary, "-data-dir", str(self.data_dir), "-addr", f"127.0.0.1:{self.port}", *self.extra_args],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        expected = f"GET /healthz to return 200 within {timeout}s of launch"
+        observed = "no healthy response"
+        while (remaining := deadline - time.monotonic()) > 0:
             if self.proc.poll() is not None:
-                raise JourneyFailed(f"expected bog to start and serve /healthz; observed exit {self.proc.returncode}: "
-                                    f"{self.log_tail()}")
+                expect(False, expected, f"process exit {self.proc.returncode} ({self.log_tail()})")
             try:
-                status, _, _ = self.request("GET", "/healthz", timeout=2)
-                if status == 200:
+                status, _, _ = self.request("GET", "/healthz", timeout=min(3, remaining))
+                if status == 200 and time.monotonic() <= deadline:
                     return self
-            except OSError:
-                pass
-            time.sleep(0.2)
-        raise JourneyFailed(f"expected /healthz to return 200 within {timeout}s; observed no healthy response")
+                observed = f"last response HTTP {status} with no timely 200"
+            except JourneyFailed as exc:
+                observed = str(exc).partition("; observed ")[2]
+            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+        expect(False, expected, observed)
 
     def log_tail(self, size=400):
         try:
@@ -92,16 +94,19 @@ class Bog:
     def stop(self, sig=signal.SIGTERM, timeout=20):
         if self.proc is None or self.proc.poll() is not None:
             return None
+        deadline = time.monotonic() + timeout
+        expected = f"process to exit and be reaped within {timeout}s of {sig.name}"
         self.proc.send_signal(sig)
         try:
-            return self.proc.wait(timeout=timeout)
+            code = self.proc.wait(timeout=max(0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
-            self.proc.kill()
-            return self.proc.wait(timeout=10)
+            expect(False, expected, "process still running at the deadline")
+        expect(time.monotonic() <= deadline, expected, f"process reaped after the deadline with status {code}")
+        return code
 
-    def kill(self):
-        """Crash the server (SIGKILL), as a power loss or OOM kill would."""
-        return self.stop(signal.SIGKILL)
+    def kill(self, timeout=5):
+        """Crash the server with SIGKILL and reap it."""
+        return self.stop(signal.SIGKILL, timeout)
 
     def restart(self, timeout=30):
         self.stop()
@@ -110,21 +115,34 @@ class Bog:
 
     def request(self, method, path, body=None, headers=None, timeout=30):
         data = body.encode() if isinstance(body, str) else body
-        req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers or {})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.status, dict(resp.headers), resp.read()
-        except urllib.error.HTTPError as err:
-            return err.code, dict(err.headers or {}), err.read()
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        expected = f"{method} {path} to complete within {timeout:g}s"
 
-    def ingest(self, rows):
+        def expire(signum, frame):
+            raise TimeoutError("request deadline expired")
+
+        # Socket timeouts bound individual reads. The alarm bounds the entire exchange.
+        previous_handler = signal.signal(signal.SIGALRM, expire)
+        signal.setitimer(signal.ITIMER_REAL, timeout)
+        try:
+            connection.request(method, path, body=data, headers=headers or {})
+            with connection.getresponse() as response:
+                return response.status, dict(response.getheaders()), response.read()
+        except (OSError, http.client.HTTPException, OverflowError) as exc:
+            expect(False, expected, repr(exc))
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            connection.close()
+
+    def ingest(self, rows, timeout=30):
         """POST NDJSON rows ({"ts": ..., "line": ...}); returns the HTTP status."""
-        body = "".join(json.dumps(row) + "\n" for row in rows)
-        status, _, _ = self.request("POST", "/ingest", body, {"Content-Type": "application/x-ndjson"})
+        body = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+        status, _, _ = self.request("POST", "/ingest", body, {"Content-Type": "application/x-ndjson"}, timeout)
         return status
 
-    def query(self, start, end, contains=None, limit=None, page=None, cursor=None):
-        """GET /query; returns (status, rows, headers)."""
+    def query_response(self, start, end, contains=None, limit=None, page=None, cursor=None, timeout=30):
+        """GET /query; returns (status, headers, raw body)."""
         params = {"start": start, "end": end}
         if contains is not None:
             params["contains"] = contains
@@ -134,11 +152,32 @@ class Bog:
             params["page"] = str(page)
         if cursor is not None:
             params["cursor"] = cursor
-        status, headers, body = self.request("GET", "/query?" + urllib.parse.urlencode(params))
+        return self.request("GET", "/query?" + urllib.parse.urlencode(params, safe=":"), timeout=timeout)
+
+    def query(self, start, end, contains=None, limit=None, page=None, cursor=None):
+        """GET /query; returns (status, rows, headers)."""
+        status, headers, body = self.query_response(start, end, contains, limit, page, cursor)
         rows = []
         if status == 200:
             rows = [json.loads(line) for line in body.decode().splitlines() if line.strip()]
         return status, rows, headers
+
+    def expect_query(self, start, end, rows, *, limit, contains=None):
+        """Check the status, media type and ordered NDJSON records of a release query."""
+        query = f"query (contains={contains!r}, limit={limit})"
+        status, headers, body = self.query_response(start, end, contains, limit, timeout=3)
+        expect(status == 200, f"{query} to return HTTP 200", f"HTTP {status}")
+        content_type = next((value for name, value in headers.items() if name.lower() == "content-type"), "")
+        expect(content_type.partition(";")[0].strip().lower() == "application/x-ndjson",
+               f"{query} to return application/x-ndjson", f"Content-Type {content_type!r}")
+        if not rows:
+            expect(body == b"", f"{query} to return an empty body", repr(body[:200]))
+            return
+        try:
+            actual = [json.loads(line.decode("utf-8")) for line in body.splitlines()]
+        except (ValueError, RecursionError) as exc:
+            expect(False, f"{query} to return UTF-8 NDJSON records", repr(exc))
+        expect(actual == rows, f"{query} to return {rows!r} in order", repr(actual))
 
     def query_all(self, start, end, contains=None, limit=500, max_pages=10000):
         """Walk a stable snapshot with page=1 and Bog-Next-Cursor; returns every row."""
@@ -163,22 +202,31 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def run(journey, argv=None):
+def run(journey, argv=None, *, timeout=None):
+    started = time.monotonic()
     args = parse_args(argv)
     bog = Bog(args.bog, args.workdir)
     code = 0
     try:
         journey(args, bog)
-        print("passed")
+        elapsed = time.monotonic() - started
+        if timeout is not None:
+            expect(elapsed <= timeout, f"journey to finish within {timeout}s", f"{elapsed:.3f}s elapsed")
+        message = "passed"
     except JourneyFailed as exc:
-        print(str(exc))
+        message = str(exc)
         code = 1
     except Exception as exc:  # harness problem, not a product failure
-        print(f"harness error: {exc!r}")
+        message = f"harness error: {exc!r}"
         code = 2
     finally:
         try:
-            bog.stop()
-        except Exception:
-            pass
+            bog.kill()
+        except Exception as exc:
+            if code == 0:
+                message = f"harness error during cleanup: {exc!r}"
+                code = 2
+            else:
+                message += f" (cleanup failed: {exc!r})"
+    print(message)
     sys.exit(code)
