@@ -33,3 +33,9 @@ SLIPWAY_PARAM_BRANCH=main SLIPWAY_PARAM_COMMIT=<sha> /verifier/verify.sh
 
 A failure reports `<journey ID>: expected ...; observed ...` and never test source. bog-conductor
 turns that into the outcome's status and the builders' brief.
+
+The 0.2 journeys require Linux and have a 120-second budget each. For O1/J1, use local storage for
+the journey work directory and delegate a writable cgroup v2 parent with the memory controller
+enabled for its children. Set `SLIPWAY_PARAM_JOURNEY_CGROUP_PARENT` if the delegated parent is
+outside the verifier's current cgroup ancestry. For O2/J1, the verifier needs mount privileges in
+its mount namespace so it can mount and unmount a private 8 MiB tmpfs under the work directory.

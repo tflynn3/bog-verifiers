@@ -61,7 +61,7 @@ class Bog:
     def base(self):
         return f"http://127.0.0.1:{self.port}"
 
-    def start(self, timeout=30):
+    def start(self, timeout=30, *, request_timeout=3, preexec_fn=None):
         if self.proc is None:
             self.data_dir.mkdir(mode=0o700, parents=True)
             os.chmod(self.data_dir, 0o700)
@@ -69,14 +69,14 @@ class Bog:
         with self.log_path.open("ab") as log:
             self.proc = subprocess.Popen(
                 [self.binary, "-data-dir", str(self.data_dir), "-addr", f"127.0.0.1:{self.port}", *self.extra_args],
-                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
-        expected = f"GET /healthz to return 200 within {timeout}s of launch"
+                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, preexec_fn=preexec_fn)
+        expected = f"GET /healthz to return 200 within {timeout:g}s of launch"
         observed = "no healthy response"
         while (remaining := deadline - time.monotonic()) > 0:
             if self.proc.poll() is not None:
                 expect(False, expected, f"process exit {self.proc.returncode} ({self.log_tail()})")
             try:
-                status, _, _ = self.request("GET", "/healthz", timeout=min(3, remaining))
+                status, _, _ = self.request("GET", "/healthz", timeout=min(request_timeout, remaining))
                 if status == 200 and time.monotonic() <= deadline:
                     return self
                 observed = f"last response HTTP {status} with no timely 200"
@@ -137,9 +137,13 @@ class Bog:
 
     def ingest(self, rows, timeout=30):
         """POST NDJSON rows ({"ts": ..., "line": ...}); returns the HTTP status."""
-        body = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
-        status, _, _ = self.request("POST", "/ingest", body, {"Content-Type": "application/x-ndjson"}, timeout)
+        status, _, _ = self.ingest_response(rows, timeout)
         return status
+
+    def ingest_response(self, rows, timeout=30):
+        """POST NDJSON rows; returns (status, headers, raw body)."""
+        body = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+        return self.request("POST", "/ingest", body, {"Content-Type": "application/x-ndjson"}, timeout)
 
     def query_response(self, start, end, contains=None, limit=None, page=None, cursor=None, timeout=30):
         """GET /query; returns (status, headers, raw body)."""
@@ -162,10 +166,10 @@ class Bog:
             rows = [json.loads(line) for line in body.decode().splitlines() if line.strip()]
         return status, rows, headers
 
-    def expect_query(self, start, end, rows, *, limit, contains=None):
+    def expect_query(self, start, end, rows, *, limit, contains=None, timeout=3):
         """Check the status, media type and ordered NDJSON records of a release query."""
-        query = f"query (contains={contains!r}, limit={limit})"
-        status, headers, body = self.query_response(start, end, contains, limit, timeout=3)
+        query = f"query from {start} to {end} (contains={contains!r}, limit={limit})"
+        status, headers, body = self.query_response(start, end, contains, limit, timeout=timeout)
         expect(status == 200, f"{query} to return HTTP 200", f"HTTP {status}")
         content_type = next((value for name, value in headers.items() if name.lower() == "content-type"), "")
         expect(content_type.partition(";")[0].strip().lower() == "application/x-ndjson",
@@ -177,7 +181,11 @@ class Bog:
             actual = [json.loads(line.decode("utf-8")) for line in body.splitlines()]
         except (ValueError, RecursionError) as exc:
             expect(False, f"{query} to return UTF-8 NDJSON records", repr(exc))
-        expect(actual == rows, f"{query} to return {rows!r} in order", repr(actual))
+        expect(len(actual) == len(rows), f"{query} to return {len(rows)} rows", f"{len(actual)} rows")
+        for index, (wanted, got) in enumerate(zip(rows, actual), 1):
+            if wanted != got:
+                expected = f"{query} row {index} to match the original timestamp and line"
+                expect(False, expected, query_difference(wanted, got))
 
     def query_all(self, start, end, contains=None, limit=500, max_pages=10000):
         """Walk a stable snapshot with page=1 and Bog-Next-Cursor; returns every row."""
@@ -193,6 +201,20 @@ class Bog:
         return out
 
 
+def query_difference(wanted, got):
+    if not isinstance(got, dict) or got.keys() != wanted.keys():
+        return f"invalid row {repr(got)[:100]}"
+    if wanted["ts"] != got["ts"]:
+        return f"timestamp {repr(got['ts'])[:75]} instead of {wanted['ts']!r}"
+    if not isinstance(got["line"], str):
+        return f"line of type {type(got['line']).__name__} instead of a string"
+    line, original = got["line"], wanted["line"]
+    if len(line) != len(original):
+        return f"line with {len(line)} characters instead of {len(original)}"
+    offset = next(i for i, (left, right) in enumerate(zip(line, original)) if left != right)
+    return f"character {line[offset]!r} at offset {offset} instead of {original[offset]!r}"
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--bog", required=True)
@@ -202,9 +224,10 @@ def parse_args(argv=None):
     return parser.parse_args(argv)
 
 
-def run(journey, argv=None, *, timeout=None):
+def run(journey, argv=None, *, timeout=None, cleanup=True):
     started = time.monotonic()
     args = parse_args(argv)
+    args.deadline = None if timeout is None else started + timeout
     bog = Bog(args.bog, args.workdir)
     code = 0
     try:
@@ -221,7 +244,8 @@ def run(journey, argv=None, *, timeout=None):
         code = 2
     finally:
         try:
-            bog.kill()
+            if cleanup:
+                bog.kill()
         except Exception as exc:
             if code == 0:
                 message = f"harness error during cleanup: {exc!r}"
