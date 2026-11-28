@@ -19,6 +19,11 @@ image digest is pinned for the release. They change again only for the next rele
 - Test only behavior a user can observe through the documented CLI and HTTP API. Never read Bog's
   source or rely on internal files other than the documented data-directory layout.
 - Each journey must finish within 180 seconds (`SLIPWAY_PARAM_JOURNEY_TIMEOUT`).
+- **Unprivileged container sandbox (strict)**: Slipway runs verifier Pods as non-root `65532:65532` with
+  `Capabilities.Drop: ["ALL"]`, `AllowPrivilegeEscalation: false`, read-only `/sys/fs/cgroup`, and a `1 GiB`
+  pod memory limit. Never call `mount(2)`, `umount(2)`, `chroot`, `sudo`, or write to `/sys/fs/cgroup`.
+  - For full-disk (`ENOSPC`) journeys, create a `TemporaryDirectory` on `os.environ.get("SLIPWAY_PARAM_ENOSPC_MOUNT") or "/dev/shm"` (a private writable `tmpfs` mount already present in every verifier Pod) and fill a sibling filler file until `write()` returns `errno.ENOSPC`.
+  - For memory-budget journeys, read `/proc/<pid>/status` (`VmHWM` / `VmRSS`) continuously during ingest and queries so an unbounded binary is rejected (`exit 1`) as soon as it crosses the target ceiling rather than OOMKilling the `1 GiB` verifier Pod.
 
 ## Running
 

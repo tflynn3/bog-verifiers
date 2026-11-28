@@ -18,6 +18,7 @@ PADDING = "x" * 10240
 BATCH_SIZE = 256
 BATCH_COUNT = 128
 WINDOWS = (0, 16384, 32764)
+MAX_RSS_BYTES = 268_435_456  # 256 MiB
 
 
 def timestamp(i):
@@ -69,6 +70,34 @@ def live_query(bog, deadline):
             worker.close()
 
 
+def proc_peak_rss_bytes(pid):
+    """Read kernel-tracked peak (VmHWM) and current (VmRSS) resident set size from /proc/<pid>/status.
+    Works unprivileged as UID 65532 inside Slipway verifier pods without cgroup delegation."""
+    status_path = Path(f"/proc/{pid}/status")
+    peak_kib = 0
+    try:
+        for line in status_path.read_text().splitlines():
+            if line.startswith(("VmHWM:", "VmRSS:")):
+                parts = line.split()
+                if len(parts) >= 2:
+                    peak_kib = max(peak_kib, int(parts[1]))
+    except OSError:
+        return 0
+    return peak_kib * 1024
+
+
+def check_memory_budget(bog, stage):
+    if bog.proc is None:
+        return
+    if bog.proc.poll() is not None:
+        expect(False, f"Bog to remain running within 256 MiB during {stage}",
+               f"process exited with status {bog.proc.returncode} ({bog.log_tail()})")
+    peak = proc_peak_rss_bytes(bog.proc.pid)
+    expect(peak <= MAX_RSS_BYTES,
+           "Bog peak resident memory (VmHWM) <= 268435456 bytes (256 MiB)",
+           f"VmHWM={peak} bytes ({peak / (1024 * 1024):.1f} MiB) during {stage}")
+
+
 def ingest_batch(bog, batch, deadline):
     first = batch * BATCH_SIZE
     rows = [row(i) for i in range(first, first + BATCH_SIZE)]
@@ -76,29 +105,23 @@ def ingest_batch(bog, batch, deadline):
     status = bog.ingest(rows, timeout=budget(deadline, 2, expected))
     expect(status == 204 and time.monotonic() <= deadline, expected,
            f"HTTP {status}" if status != 204 else "HTTP 204 after the ingest deadline")
+    # Enforce the 256 MiB cap continuously so an unbounded binary fails cleanly at 256 MiB
+    # instead of growing to the verifier container's 1 GiB pod limit.
+    check_memory_budget(bog, f"batch {batch + 1}")
 
 
-def new_cgroup():
+def optional_delegated_cgroup():
+    """Use delegated cgroup v2 when explicitly supplied; otherwise run unprivileged via /proc VmHWM."""
     supplied = os.environ.get("SLIPWAY_PARAM_JOURNEY_CGROUP_PARENT")
-    if supplied:
-        parents = [Path(supplied)]
-    else:
-        root = Path("/sys/fs/cgroup")
-        membership = next((line[3:] for line in Path("/proc/self/cgroup").read_text().splitlines()
-                           if line.startswith("0::/")), None)
-        if membership is None:
-            raise RuntimeError("no cgroup v2 membership")
-        current = (root / membership.lstrip("/")).resolve()
-        parents = [p for p in (current, *current.parents) if p.is_relative_to(root)]
-    for parent in parents:
-        try:
-            controllers = (parent / "cgroup.subtree_control").read_text().split()
-            if "memory" in controllers:
-                return Path(tempfile.mkdtemp(prefix="bog-journey-", dir=parent))
-        except OSError:
-            continue
-    raise RuntimeError("no writable cgroup v2 delegation with memory enabled; "
-                       "set SLIPWAY_PARAM_JOURNEY_CGROUP_PARENT")
+    if not supplied:
+        return None
+    parent = Path(supplied)
+    try:
+        if "memory" in (parent / "cgroup.subtree_control").read_text().split():
+            return Path(tempfile.mkdtemp(prefix="bog-journey-", dir=parent))
+    except OSError:
+        return None
+    return None
 
 
 def oom_counts(group):
@@ -109,14 +132,17 @@ def oom_counts(group):
 def journey(args, bog: Bog):
     active_deadline = args.deadline - 10
     require_linux()
-    group = new_cgroup()
+    group = optional_delegated_cgroup()
+    initial = None
+    enter_cgroup = None
     try:
-        (group / "memory.max").write_text("268435456\n")
-        (group / "memory.swap.max").write_text("0\n")
-        initial = oom_counts(group)
+        if group is not None:
+            (group / "memory.max").write_text(f"{MAX_RSS_BYTES}\n")
+            (group / "memory.swap.max").write_text("0\n")
+            initial = oom_counts(group)
 
-        def enter_cgroup():
-            (group / "cgroup.procs").write_text("0\n")
+            def enter_cgroup():
+                (group / "cgroup.procs").write_text("0\n")
 
         try:
             with serving(bog, active_deadline, 15, preexec_fn=enter_cgroup):
@@ -128,15 +154,23 @@ def journey(args, bog: Bog):
                         ingest_batch(bog, batch, ingest_deadline)
                 for k in WINDOWS:
                     query(bog, k, active_deadline)
+                check_memory_budget(bog, "post-ingest queries")
             with serving(bog, active_deadline, 15, preexec_fn=enter_cgroup):
+                check_memory_budget(bog, "restart startup")
                 for k in WINDOWS:
                     query(bog, k, active_deadline)
+                check_memory_budget(bog, "post-restart queries")
         finally:
-            final = oom_counts(group)
-            expect(final == initial, "zero increases in cgroup oom and oom_kill counters",
-                   ", ".join(f"{name} increased by {final[name] - initial[name]}" for name in initial))
+            if group is not None and initial is not None:
+                final = oom_counts(group)
+                expect(final == initial, "zero increases in cgroup oom and oom_kill counters",
+                       ", ".join(f"{name} increased by {final[name] - initial[name]}" for name in initial))
     finally:
-        group.rmdir()
+        if group is not None:
+            try:
+                group.rmdir()
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":
